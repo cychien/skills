@@ -11,7 +11,7 @@ Work through the sections below as a loop:
 
 1. Capture intent.
 2. Write the skill.
-3. Test it, and improve it until the runs pass your own review.
+3. Test it, and improve it until the eval recommends promoting it.
 4. Show the user the output.
 5. Revise on their feedback and return to step 3, until the user is happy or you stop making progress.
 
@@ -99,15 +99,15 @@ When the user reviews the result, end the `SKILL.md` with an `## Output` section
 
 ## Test
 
-1. Write two or three test prompts that sound like something a real user would type, with concrete details: file names, a bit of backstory, casual phrasing. For an update, write prompts that exercise the change, because existing prompts rarely touch a new rule.
-2. For checkable output, write two to four assertions per prompt: concrete statements that are true only when the skill did its job ("the CSV has a header row", "the summary names the root cause, not the symptom"). An assertion that a wrong output would also pass is worthless. Skip assertions for output judged by taste.
-3. Run each prompt twice, in the same turn:
-   - **With the skill.** A fresh subagent gets the skill path and the prompt, and saves its outputs to a scratch directory. Fresh context matters, because you wrote the skill and would otherwise fill its gaps from memory.
-   - **Baseline.** Another fresh subagent gets the same prompt with no skill, or with the snapshot when you are updating. Without it you cannot tell whether the skill adds anything.
+Test with the `eval-skill` skill. It runs only on explicit invocation, so read its `SKILL.md` and follow it directly. Run every round in full, judge included: you wrote the skill, so your own grading alone is not a test. Each round ends with eval-skill's report and recommendation. Promote means the test passed; Revise or Reject means it failed. If eval-skill is not installed, tell the user the skill cannot be tested and stop. The eval checks what the skill makes agents do, not when they load it, so it does not replace the trigger test below; run both.
 
-   Without subagents, follow the `SKILL.md` yourself, one prompt at a time, and skip the baseline. Less rigorous, still useful.
-4. When there are assertions, have a fresh subagent grade each run from its real outputs and transcript, never from the run's own summary. It marks every assertion pass or fail with evidence, and flags assertions that passed too easily or outcomes nothing checked.
-5. Review the runs yourself before the user sees anything. Read every output and transcript against the intent and the baseline. When a run misses the intent, fails an assertion, or is no better than the baseline, improve the skill and return to step 3. If a rule keeps failing, reframe it or change the working pattern instead of making it stricter. If a transcript shows the agent doing unproductive work, cut the part of the skill that causes it. The user's time goes to judgment calls, not to catching failures you could have caught.
+A failed test means the skill does not work yet, so revise it and run the eval again:
+
+- Change only the skill's own files. Making runs pass by editing anything else, such as the project the skill works on, proves nothing about the skill and ships changes nobody asked for. Propose such changes to the user instead.
+- When runs never opened the skill, the problem is triggering, not the instructions. Revise the description once, per the trigger test below. If a model still does not load the skill, report that as a finding and stop; never plant the skill's rules, or pointers to it, anywhere else to get around it, because the eval would then measure the copy instead of the skill.
+- If a rule keeps failing, reframe it or change the working pattern instead of making it stricter. If a transcript shows the agent doing unproductive work, cut the part of the skill that causes it.
+- Keep the prompt and criteria the same in every round, so each round measures the same thing. Changing them mid-loop moves the goalposts; do it only with the user's agreement.
+- Stop when the eval promotes, or when a revision no longer improves the result, and report the latter as a finding. A disagreement the experiment could not settle is a call for the user.
 
 ### Trigger test
 
@@ -120,9 +120,9 @@ Run this whenever the description is new or changed. An agent sees only the name
 
 ## Output
 
-Once the runs pass your own review, or you are stuck on a call only the user can make, show the user:
+Once the eval recommends promoting the skill, or you are stuck on a call only the user can make, show the user:
 
-- The test prompts and the outputs side by side, with grades when there are any. For an update, point at where the change made a difference.
+- The final round's eval-skill report, with its recommendation. For an update, point at where the change made a difference.
 - What you already fixed along the way.
 - Any step you skipped, and why.
 - Any call only the user can make.

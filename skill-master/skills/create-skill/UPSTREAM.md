@@ -11,7 +11,7 @@ Derived from Anthropic's `skill-creator` skill.
 
 - Renamed to `create-skill`.
 - Rewrote `SKILL.md` as a lightweight loop: capture intent, draft, try on a few prompts, review with the user, improve.
-- Kept the testing method without its tooling: with-skill and baseline runs, assertions graded by a fresh subagent, and a real trigger test. Removed the benchmark statistics, timing capture, blind comparison, description optimization loop, eval viewer, analyzer agent, JSON schemas, packaging, and the platform-specific sections. The `agents/`, `assets/`, `eval-viewer/`, `references/`, and `scripts/` directories were dropped with them.
+- Replaced the testing method with the `eval-skill` skill (blind multi-model runs through `salvo`, a blinded judge, and a promote-or-revise loop), keeping the trigger test. Removed the benchmark statistics, timing capture, description optimization loop, eval viewer, analyzer agent, JSON schemas, packaging, and the platform-specific sections. The `agents/`, `assets/`, `eval-viewer/`, `references/`, and `scripts/` directories were dropped with them.
 - Added house rules: every skill artifact is written in English, plain dashes only, concise and to the point.
 
 ## Checking for upstream changes
