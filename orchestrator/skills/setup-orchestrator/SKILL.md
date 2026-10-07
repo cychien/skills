@@ -65,7 +65,17 @@ Talk to the user in plain terms: which models work, their budget, and what each 
 
       Older generations rank below the current one in the same tier. Map effort names per agent: "max" is the level named `max`, never a level above it that delegates to subagents (Codex `ultra`), because the orchestrator does its own delegation. When a model lacks a level, use its nearest lower one.
    3. Fill the roles. The executor takes options at the budget level. The planner takes options one level higher (unlimited stays unlimited). Within the allowed options, prefer the models from step 2, then diversity across agents and families, then newer models. When fewer than three options fit a role, go outside the budget freely to reach three and note which entries did.
-   4. Ask with the structured question tool whether to keep the proposal or change it, and to which models. Put the whole proposal in every option's `preview` (in `AskUserQuestion`), so it stays visible while the user decides what to change: one table per role with agent, model, effort, and a short why that cites the user's sessions when step 2 drove the pick. Text written right before a question tool call is often condensed to a one-line status, so a proposal anywhere else can vanish. Without a question tool, end your message with the tables and ask in plain text.
+   4. Ask with the structured question tool whether to keep the proposal or change it, and to which models. Put the whole proposal in every option's `preview` (in `AskUserQuestion`), so it stays visible while the user decides what to change. Text written right before a question tool call is often condensed to a one-line status, so a proposal anywhere else can vanish. Without a question tool, end your message with the proposal and ask in plain text. Write it as a plain list, not a table, in the user's language:
+
+      ```
+      Planner
+      1. <model> · <effort>
+         <agent> - <short why, citing the user's sessions when step 2 drove the pick>
+
+      Executor
+      1. <model> · <effort>
+         <agent> - <short why>
+      ```
 4. **Verify.** Run `scripts/verify.py` on every entry exactly as it will be written, effort included. If any fails, stop and ask the user for a replacement from the verified candidates, with the failing entry and its error in the question itself. Repeat until every entry passes. Never write an entry that has not passed.
 5. **Write.** Run `python3 scripts/write_config.py <path> --budget <level> --planner <agent>:<model>[:<effort>] ... --executor ...` with the verified entries in order, plus `--gitignore` for a project-level file. It overwrites the whole file in one fixed format, so the same answers always produce the same file.
 6. **Confirm.** Tell the user the config path, that the settings apply to new sessions, and that rerunning this skill updates them.
