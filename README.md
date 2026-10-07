@@ -6,6 +6,7 @@ Agent skills, grouped by discipline. Each group keeps its skills under `<group>/
 - [design](./design/) - product and visual design
 - [writing](./writing/) - prose, docs, and communication
 - [skill-master](./skill-master/) - authoring and improving skills
+- [orchestrator](./orchestrator/) - coordinating multiple agents across a task
 
 ## Install
 
