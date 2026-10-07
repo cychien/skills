@@ -5,28 +5,32 @@ description: Create a new skill or improve an existing one. Use this whenever th
 
 # Create skill
 
-A skill is a folder with a `SKILL.md` that teaches an agent how to do one kind of task well. This skill walks through making one and making it better.
+A skill is a folder with a `SKILL.md` that teaches an agent how to do one kind of task well.
 
-The loop is short:
+Work through the sections below as a loop:
 
-1. Figure out what the skill should do and when it should fire.
-2. Draft the `SKILL.md`.
-3. Try it on two or three realistic prompts.
-4. Review the results yourself. Improve and rerun until they pass your own review.
-5. Show the user the results and ask what is off.
-6. Improve the skill on their feedback, then repeat from step 3 until the user is happy.
+1. Capture intent.
+2. Write the skill.
+3. Test it, and improve it until the runs pass your own review.
+4. Show the user the output.
+5. Revise on their feedback and return to step 3, until the user is happy or you stop making progress.
 
-Find out where the user is in this loop and jump in there. "I want a skill for X" starts at step 1. "Here is my draft, is it any good?" starts at step 3. "Add a rule to my skill" is still the whole loop, scaled to the change, because an untested rule is a guess about agent behavior. Skip the testing only when the user says so.
+Start where the user is. "I want a skill for X" starts at step 1. "Is my draft any good?" starts at step 3. A change to an existing skill, however small, runs the whole loop at the scale of the change, because an untested rule is a guess about agent behavior. Skip testing only when the user says so.
 
 ## House rules
 
-- **Write every skill artifact in English.** The `SKILL.md`, its references, scripts, comments, and examples are all English, even when the conversation with the user is in another language.
-- **Be concise and to the point.** Every sentence must change what the agent does. Cut the rest. When the user dictates a rule, understand the intent, then write the shortest version that carries it. Never transcribe their wording.
-- **Use a plain dash, never an em dash.** Write `-` where you would reach for `—`.
-- **Keep `SKILL.md` under about 500 lines.** When it grows past that, move detail into `references/` and point to it.
-- **Lean away from examples.** State the rule and the reason. Add an example only when the rule is hard to grasp from prose alone and you believe the agent would get it wrong without one. Examples cost lines and tempt the agent to match the case instead of the rule.
+These apply to everything you write into a skill.
+
+- **Write in English.** The `SKILL.md`, its references, scripts, comments, and examples are all English, even when the conversation with the user is in another language.
+- **Be concise.** Every sentence must change what the agent does. Cut the rest.
+- **Write the intent, not the words.** When the user dictates a rule or gives terse feedback, work out what they actually need, then write the shortest version that carries it. Never transcribe their wording.
+- **Write for the whole class of task.** The skill will meet prompts nobody has seen, so do not tune it to the example or test prompts in front of you.
 - **Explain why, not just what.** A sentence that says why a step matters lets the agent handle cases the skill never anticipated. All-caps `ALWAYS` and `NEVER` are a yellow flag that the reasoning is missing.
+- **Lean away from examples.** State the rule and the reason. Add an example only when you believe the agent would get the rule wrong without one. Examples cost lines and tempt the agent to match the case instead of the rule.
 - **Use the imperative.** Tell the agent what to do, not what should be done.
+- **Number the steps.** When the agent must do things in order, write a numbered list with one action per item, so it can track where it is and skip nothing.
+- **Use a plain dash, never an em dash.** Write `-` where you would reach for `—`.
+- **Match the description.** A skill does what its description says. Do not build skills that mislead, exfiltrate data, or facilitate unauthorized access. Role-play skills are fine.
 
 ## Communicating with the user
 
@@ -34,33 +38,29 @@ People who make skills range from engineers to someone who just opened a termina
 
 ## Capture intent
 
-The current conversation may already contain the workflow the user wants to capture, for example when they say "turn this into a skill". Mine it first: the tools used, the order of steps, corrections the user made, the input and output formats you saw. Then fill the gaps with the user and confirm before drafting.
-
-Four questions to settle:
-
-1. What should this skill let the agent do?
-2. When should it trigger? Which phrases, file types, or situations?
-3. What does the output look like?
-4. Is the output objectively checkable (file transforms, data extraction, fixed workflows) or subjective (writing style, design taste)? Checkable outputs are worth a couple of concrete test prompts. Subjective ones are judged by eye.
-
-Ask about edge cases, example inputs, and dependencies now, before writing anything. If MCPs or search are available, use them to look up prior art and best practices so the user carries less of the burden.
+1. Mine the current conversation first. It may already contain the workflow, for example when the user says "turn this into a skill": the tools used, the order of steps, corrections the user made, the input and output formats you saw.
+2. Settle four questions:
+   - What should this skill let the agent do?
+   - When should it trigger? Which phrases, file types, or situations?
+   - What does the output look like, and does the user review it?
+   - Is the output objectively checkable (file transforms, data extraction, fixed workflows) or a matter of taste (writing style, design)?
+3. Ask about edge cases, example inputs, and dependencies. If MCPs or search are available, use them to look up prior art so the user carries less of the burden.
+4. Confirm the intent with the user before drafting.
 
 ## Where the skill lives
 
-Skills follow the Agent Skills open standard, and most agents read a vendor-neutral directory. Claude Code is the main exception. Put the real folder where most agents find it, and give the exceptions a symlink, so one copy serves every agent in the project.
+Skills follow the Agent Skills open standard. Codex, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Amp, and Cline read `.agents/skills/`. Claude Code reads only `.claude/skills/` but supports symlinks, so one copy can serve every agent. A folder that lives only under `.claude/skills/` is invisible to every other agent on the team.
 
-| Scope | Real folder | Symlink for Claude Code |
-|---|---|---|
-| Project | `.agents/skills/<name>/` | `.claude/skills/<name>` -> `../../.agents/skills/<name>` |
-| User | `~/.agents/skills/<name>/` | `~/.claude/skills/<name>` -> `../../.agents/skills/<name>` |
+1. Create the real folder at `.agents/skills/<name>/`, or `~/.agents/skills/<name>/` for a user-level skill.
+2. Link `.claude/skills/<name>` (or `~/.claude/skills/<name>`) to `../../.agents/skills/<name>`. A relative link keeps the repo working from any checkout path.
+3. Add a `.windsurf/skills/` link only when the project uses Windsurf.
+4. Commit both the folder and the symlink.
 
-Codex, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Amp, and Cline read `.agents/skills/` natively. Claude Code reads only `.claude/skills/` but documents symlink support, so the link is the official path, not a hack. Windsurf reads only `.windsurf/skills/`; add a link there only when the project actually uses Windsurf. Commit both the folder and the symlink. Use a relative link so the repo works from any checkout path.
-
-Never create the real folder under `.claude/skills/`. A skill that lives only there is invisible to every other agent on the team.
-
-When the user asks for a project skill, default to this layout and say so. Ask only when the project already has skills in a different place and moving them is a separate decision.
+When the project already keeps skills elsewhere, ask before moving them, because that is a separate decision.
 
 ## Write the SKILL.md
+
+When updating an existing skill, first copy it to a scratch directory as the baseline for testing, and keep its folder name and `name` field.
 
 ### Anatomy
 
@@ -74,104 +74,58 @@ skill-name/
 └── assets/           files used in the output: templates, icons, fonts
 ```
 
+Every file the body references must exist. When every test run writes the same helper or takes the same multi-step detour, write it once in `scripts/` and tell the skill to run it.
+
 ### Frontmatter
 
 - **name**: the skill's identifier, kebab-case, matching the folder name.
-- **description**: what the skill does and when to trigger. This is the main triggering mechanism, so every "when to use" fact lives here, not in the body. Agents tend to undertrigger skills, so make the description a little pushy. Instead of "How to build a dashboard for internal metrics", write "How to build a dashboard for internal metrics. Use this whenever the user mentions dashboards, charts, metrics, or wants to display company data, even if they never say 'dashboard'."
-
-    Leave the rest out (ex. internal workflow). Those belong in the body.
+- **description**: what the skill does and when to trigger. This is the main triggering mechanism, so every "when to use" fact lives here, and the internal workflow does not. Agents tend to undertrigger skills, so make it a little pushy. Instead of "How to build a dashboard for internal metrics", write "How to build a dashboard for internal metrics. Use this whenever the user mentions dashboards, charts, metrics, or wants to display company data, even if they never say 'dashboard'."
 
 ### Progressive disclosure
 
 Skills load in three levels:
 
 1. **Metadata** (name and description) is always in context. About 100 words.
-2. **The `SKILL.md` body** loads when the skill triggers. Aim for under 500 lines.
+2. **The `SKILL.md` body** loads when the skill triggers. Keep it under about 500 lines.
 3. **Bundled resources** load on demand. Scripts can run without ever being read.
 
-So put the workflow and the decisions in `SKILL.md`, and push long reference material into `references/` with a clear note on when to read each file. A reference file over 300 lines gets a table of contents. When a skill covers several variants (say, AWS, GCP, and Azure), keep the selection logic in `SKILL.md` and give each variant its own reference file so the agent reads only the one it needs.
+So put the workflow and the decisions in `SKILL.md`, and push long reference material into `references/` with a note on when to read each file. A reference file over 300 lines gets a table of contents. When a skill covers several variants (say, AWS, GCP, and Azure), keep the selection logic in `SKILL.md` and give each variant its own reference file so the agent reads only the one it needs.
 
-### Writing patterns
+### Output format
 
-Define output formats with a template:
+When the output has a fixed shape, give the agent a template to fill instead of describing the shape in prose.
 
-```markdown
-## Report structure
-Use this exact template:
-# [Title]
-## Summary
-## Findings
-## Recommendations
-```
+When the user reviews the result, end the `SKILL.md` with an `## Output` section that says what the agent returns when it finishes: which artifacts, in what form, and what to flag for review, such as judgment calls, open questions, or skipped steps. Without it, agents either narrate their process or bury the result, and the reviewer has to dig. Leave it out when nobody reviews the result directly.
 
-Show examples as input and output pairs:
+## Test
 
-```markdown
-## Commit message format
-Input: Added user authentication with JWT tokens
-Output: feat(auth): implement JWT-based authentication
-```
+1. Write two or three test prompts that sound like something a real user would type, with concrete details: file names, a bit of backstory, casual phrasing. For an update, write prompts that exercise the change, because existing prompts rarely touch a new rule.
+2. For checkable output, write two to four assertions per prompt: concrete statements that are true only when the skill did its job ("the CSV has a header row", "the summary names the root cause, not the symptom"). An assertion that a wrong output would also pass is worthless. Skip assertions for output judged by taste.
+3. Run each prompt twice, in the same turn:
+   - **With the skill.** A fresh subagent gets the skill path and the prompt, and saves its outputs to a scratch directory. Fresh context matters, because you wrote the skill and would otherwise fill its gaps from memory.
+   - **Baseline.** Another fresh subagent gets the same prompt with no skill, or with the snapshot when you are updating. Without it you cannot tell whether the skill adds anything.
 
-### Writing style
+   Without subagents, follow the `SKILL.md` yourself, one prompt at a time, and skip the baseline. Less rigorous, still useful.
+4. When there are assertions, have a fresh subagent grade each run from its real outputs and transcript, never from the run's own summary. It marks every assertion pass or fail with evidence, and flags assertions that passed too easily or outcomes nothing checked.
+5. Review the runs yourself before the user sees anything. Read every output and transcript against the intent and the baseline. When a run misses the intent, fails an assertion, or is no better than the baseline, improve the skill and return to step 3. If a rule keeps failing, reframe it or change the working pattern instead of making it stricter. If a transcript shows the agent doing unproductive work, cut the part of the skill that causes it. The user's time goes to judgment calls, not to catching failures you could have caught.
 
-Write a draft, then reread it with fresh eyes and cut. Keep the skill general rather than tuned to the one example in front of you. Prefer a short reason over a rigid rule. Delete sentences that do not change what the agent would do.
+### Trigger test
 
-### Principle of lack of surprise
+Run this whenever the description is new or changed. An agent sees only the name and description when deciding whether to consult a skill, and it consults skills mainly for tasks it cannot handle in one step, so a simple "read this PDF" may never trigger a PDF skill.
 
-A skill's contents should match what its description says. Do not build skills that mislead, exfiltrate data, or facilitate unauthorized access. A "role-play as X" skill is fine.
+1. Write six to ten realistic queries: half that should trigger, half that should not. The valuable negatives are near-misses that share keywords but need something else.
+2. Run each query two or three times in a fresh session with the skill installed (`claude -p "<query>"` works in Claude Code), because triggering is not deterministic.
+3. Check each transcript for whether the skill was read.
+4. Fix misses by changing the description, not the body, and rerun.
 
-## Try it out
+## Output
 
-After the draft, write two or three test prompts that sound like something a real user would type, with concrete details: file names, a bit of backstory, casual phrasing. Show them to the user and ask if they look right or if they want to add one.
+Once the runs pass your own review, or you are stuck on a call only the user can make, show the user:
 
-For a skill with checkable output, also write two to four assertions per prompt: concrete statements about the output that are true only when the skill did its job ("the CSV has a header row", "the summary names the root cause, not the symptom"). An assertion that a wrong output would also pass is worthless. Skip assertions for subjective skills.
+- The test prompts and the outputs side by side, with grades when there are any. For an update, point at where the change made a difference.
+- What you already fixed along the way.
+- Any step you skipped, and why.
+- Any call only the user can make.
+- Paths to any file the user needs to open.
 
-Then run each prompt twice, in the same turn:
-
-- **With the skill.** A fresh subagent gets the skill path and the prompt, and saves its outputs to a scratch directory. Fresh context matters, because you wrote the skill and would otherwise fill its gaps from memory.
-- **Without the skill.** Another fresh subagent gets the same prompt and no skill path. When improving an existing skill, give it a snapshot of the old version instead. This is the baseline. Without it you cannot tell whether the skill adds anything or the model would have done the same on its own.
-
-Without subagents, read the `SKILL.md` and follow it yourself, one prompt at a time, and skip the baseline. Less rigorous, still useful.
-
-When the runs finish, grade them if there are assertions: a fresh subagent reads each run's outputs and transcript, marks every assertion pass or fail with the evidence it found, and flags assertions that passed too easily or outcomes nothing checked. Grade from the real output, never from the run's own summary.
-
-Then review the runs yourself before the user sees anything. Read every output and transcript against the intent you captured and against the baseline. When a run misses the intent, fails an assertion, or is no better than the baseline, improve the skill and rerun. The user's time goes to judgment calls, not to catching failures you could have caught.
-
-Show the user once the runs pass your own review, or once you are stuck on a call only they can make. Present the outputs side by side, with the grades when there are any, and say what you already fixed. For files the user needs to open, save them and give the path. Ask inline: "How does this look? What would you change?" Empty feedback means fine.
-
-## Improve the skill
-
-1. **Generalize from the feedback.** The skill will run on prompts nobody has seen yet. A fix that only works for the three test prompts is overfitting. If an issue is stubborn, try a different framing or a different working pattern rather than adding a stricter rule.
-2. **Keep it lean.** Read the transcripts, not just the final outputs. If the skill makes the agent do unproductive work, cut the part that causes it and see what happens.
-3. **Explain the why.** If the user's feedback is terse, work out what they actually need and write that reasoning into the skill so the agent can apply it to new cases.
-4. **Bundle repeated work.** If every test run wrote the same helper script or took the same multi-step detour, write that script once, put it in `scripts/`, and tell the skill to use it.
-
-Then rerun the test prompts, review them yourself, and show the user again. Stop when the user is happy, the feedback is all empty, or you are no longer making progress.
-
-## Make it trigger
-
-An agent sees only the name and description when deciding whether to consult a skill, and it consults skills mainly for tasks it cannot handle in one step. A simple "read this PDF" may never trigger a PDF skill no matter how good the description is.
-
-Write six to ten realistic queries: half that should trigger, half that should not. The valuable negatives are near-misses that share keywords but need something else. Then test them instead of guessing: run each query in a fresh session that has the skill installed (`claude -p "<query>"` works in Claude Code) and check the transcript for whether the skill was read. Two or three runs per query, because triggering is not deterministic. Fix misses by changing the description, not the body, and rerun.
-
-## Update an existing skill
-
-Every change to an existing skill, however small, runs the same loop as creating a skill. The only difference is scale and baseline.
-
-1. Keep the original folder name and `name` field.
-2. Snapshot the current version to a scratch directory before editing. The snapshot is the baseline for this round.
-3. Make the edit.
-4. Write one to three test prompts that exercise the change specifically. The existing test prompts catch regressions but rarely touch the new rule, so do not rely on them alone.
-5. Run each prompt with the new version and with the snapshot, in the same turn, exactly as in "Try it out". Grade with assertions when the change is checkable.
-6. Review the outputs yourself. Check that the change shows up and nothing else broke. If the outputs match the snapshot, the rule is not doing anything yet. Improve and rerun until it does, or until you are sure it cannot.
-7. Show the user both outputs side by side, point at where the change made a difference, and say what you fixed along the way. Repeat from step 3 on their feedback.
-
-## Before you hand it over
-
-- The real folder is under `.agents/skills/` (or `~/.agents/skills/`), with a `.claude/skills/` symlink pointing at it.
-- Frontmatter has `name` and `description`, and `name` matches the folder.
-- Every file the body references exists.
-- Everything is in English, with plain dashes.
-- `SKILL.md` is under about 500 lines.
-- The description says when to use the skill, and sounds a little pushy.
-- The test prompts ran with and without the skill, and the user saw both.
+Then ask: "How does this look? What would you change?" Empty feedback means fine.
