@@ -7,6 +7,7 @@ Agent skills, grouped by discipline. Each group keeps its skills under `<group>/
 - [writing](./writing/) - prose, docs, and communication
 - [skill-master](./skill-master/) - authoring and improving skills
 - [orchestrator](./orchestrator/) - coordinating multiple agents across a task
+- [everyday](./everyday/) - general skills anyone uses daily, often called by other skills
 
 ## Install
 

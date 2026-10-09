@@ -210,7 +210,7 @@ def run_salvo(args):
     prompt_task = sys.stdin.read().strip()
     if not prompt_task:
         sys.exit("task text is empty; pipe it on stdin")
-    unsupported = [s for s in args.specs if s.partition(":")[0] not in AGENTS or not s.partition(":")[2]]
+    unsupported = [s for s in args.specs if not re.fullmatch(r"[^:\s]+:[^:\s]+(:[^:\s]+)?", s) or s.partition(":")[0] not in AGENTS]
     if unsupported:
         sys.exit(f"unsupported specs {unsupported}; expected agent:model[:effort] with agent in {AGENTS}")
     out = os.path.abspath(args.out)
