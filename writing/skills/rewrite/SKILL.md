@@ -5,9 +5,19 @@ description: Rewrite an existing draft so it is clear, succinct, and worth readi
 
 # Rewrite
 
-A first draft is written for the author. The rewrite is written for the reader. Run the draft through four passes in order. Each pass has one job, and mixing them produces timid edits.
+A first draft is written for the author. The rewrite is written for the reader. Map the key terms first, then run the draft through four passes in order. Each pass has one job, and mixing them produces timid edits.
 
 Keep the text in its original language. Keep the author's voice, their claims, and every nuance. The job is to make what they meant land, not to say something else.
+
+## Before the passes: map the key terms
+
+Readers assume two different words name two different things, and one word means the same thing every time. Drafts break both: the author swaps synonyms for variety, or lets one word drift between two concepts. The reader then cannot tell whether "rule", "skill", and "workflow" are three things, one thing, or parts of each other.
+
+1. List the terms the argument rests on: the nouns a reader must keep apart to follow it.
+2. For each, work out what it refers to and how it relates to the others: the same thing, a part of, a kind of, or unrelated. Derive this from every place the author uses it and from its meaning in the subject's field, never from one sentence or one convenient example.
+3. A term is open when the draft never states its meaning or relationship and more than one reading would change what the reader believes, such as who does what or how many steps a process has. Two names that sit side by side without a stated link are open, however likely one reading feels. If any term is open, reply with the question and no rewrite, even when you cannot wait for the answer: the author reads the reply either way, so a question costs one round trip, while a guessed rewrite silently changes their argument and reads too fluently to catch. Ask only about open terms, and show the map you inferred for the rest, so one reply confirms everything.
+4. During the passes, give each concept one term and each term one concept. Keep the author's own word, not a synonym you prefer.
+5. Where the reader cannot infer a term's relationship to its neighbours, define it in a short clause where the term first appears. State only relationships the author stated; never add one to make the text flow.
 
 ## Pass 1: clarity
 
@@ -73,6 +83,6 @@ Apply these on top of the four passes whenever the text is Chinese or mixes Chin
 
 ## Output
 
-Return the full rewritten text. When a pass changed the structure (cut a section, moved the hook, replaced the ending), add three to five short bullets under "What changed" so the author can object. Skip the bullets for sentence-level edits. Never explain the passes to the user unless they ask.
+If a key term is open, return only the questions and the inferred term map. Otherwise return the full rewritten text. When a pass changed the structure (cut a section, moved the hook, replaced the ending), add three to five short bullets under "What changed" so the author can object. When you unified or defined terms, list each one with the meaning you gave it, so the author can correct the map. Skip the bullets for sentence-level edits. Never explain the passes to the user unless they ask.
 
-Done when the author's meaning survives intact, no sentence can lose a word without losing information, and the opening, peak, and ending are each in place or the user has been told which one is missing.
+Done when the author's meaning survives intact, every key term names one concept, no sentence can lose a word without losing information, and the opening, peak, and ending are each in place or the user has been told which one is missing.
