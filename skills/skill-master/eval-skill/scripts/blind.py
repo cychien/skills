@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pool salvo runs from one or more arms into a blinded packet for a judge.
 
-usage: blind.py --packet <dir> --key <file> --skill <name> <arm>=<salvo out dir> ...
+usage: blind.py --packet <dir> --key <file> --skill <name> [--skill <name> ...] <arm>=<salvo out dir> ...
 
 Every successful run gets a shuffled label (A, B, ...) shared across arms, so the
 judge cannot tell runs, models, or arms apart. Each label holds result.md, the
@@ -9,7 +9,7 @@ workspace changes, and a transcript.md with model identifiers removed. The key t
 maps labels back to arm and model goes to --key, which must stay out of the packet.
 Failed runs are left out of the packet and listed in the key as dropouts.
 It refuses arms that are still running, and arms whose projects differ anywhere
-outside the skill's own folders, since then the arms test more than the skill.
+outside the folders of the skills under test, since then the arms test more than those skills.
 """
 import argparse
 import json
@@ -114,13 +114,13 @@ def write_label(run, dest):
         shutil.copytree(run["work"], os.path.join(dest, "files"), symlinks=True)
 
 
-def project_files(manifest, skill):
-    """Path -> blob of the arm's starting project, minus the skill under test."""
+def project_files(manifest, skills):
+    """Path -> blob of the arm's starting project, minus the skills under test."""
     if not manifest.get("repo"):
         return None
     listing = subprocess.run(["git", "-C", manifest["repo"], "ls-tree", "-r", manifest["base_tree"]],
                              capture_output=True, text=True, check=True).stdout
-    skill_dirs = tuple(f"{root}/skills/{skill}" for root in (".agents", ".claude"))
+    skill_dirs = tuple(f"{root}/skills/{skill}" for root in (".agents", ".claude") for skill in skills)
     files = {}
     for line in listing.splitlines():
         meta, path = line.split("\t", 1)
@@ -133,7 +133,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--packet", required=True)
     parser.add_argument("--key", required=True)
-    parser.add_argument("--skill", required=True, help="name of the skill under test")
+    parser.add_argument("--skill", required=True, action="append", help="name of a skill under test; repeat for skills tested together")
     parser.add_argument("arms", nargs="+", help="<arm>=<salvo out dir>")
     args = parser.parse_args()
     packet, key_path = os.path.abspath(args.packet), os.path.abspath(args.key)
@@ -159,7 +159,7 @@ def main():
     for arm, files in projects.items():
         if files != first:
             differing = sorted(p for p in set(files or {}) | set(first or {}) if (files or {}).get(p) != (first or {}).get(p))
-            sys.exit(f"arms '{first_arm}' and '{arm}' differ outside the skill: {differing[:10]}")
+            sys.exit(f"arms '{first_arm}' and '{arm}' differ outside the skills under test: {differing[:10]}")
     random.SystemRandom().shuffle(runs)
     if len(runs) > 26:
         sys.exit("more than 26 runs; split the packet")
