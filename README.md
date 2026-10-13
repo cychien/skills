@@ -30,6 +30,8 @@ npx skills add cychien/skills -g --skill '*'
 
 This installs every skill for each agent it finds on your machine. Install the whole set, because some skills load others (`feynman` loads `teach`, `eval-skill` drives `salvo`). Drop `-g` to install into the current project instead.
 
+`autorun` also needs its hooks registered once per machine (they also run `guard`'s rules): `python3 ~/.agents/skills/autorun/scripts/autorun.py install` (the path of wherever the skill was installed).
+
 ## Update
 
 Rerun the install command. It updates every skill and adds new ones. `npx skills update -g` updates installed skills only.
@@ -42,4 +44,4 @@ Installers drop the category folder, so:
 - A skill reaches an auto-invocable skill by name ("load the `teach` skill"). It reaches a manual-only skill, which agents cannot see, by its path beside it once installed ("read `../how/SKILL.md`").
 - A manual-only skill also needs `agents/openai.yaml` setting `policy.allow_implicit_invocation: false`, so Codex treats it as manual-only too.
 
-`python3 scripts/validate.py` checks all of this and runs in CI.
+`python3 scripts/validate.py` checks all of this, and `python3 -m unittest discover -s tests` runs the script tests. Both run in CI.

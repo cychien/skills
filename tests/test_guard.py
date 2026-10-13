@@ -1,0 +1,251 @@
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+HOOK = ROOT / "skills" / "orchestrator" / "autorun" / "scripts" / "autorun.py"
+GUARD = ROOT / "skills" / "orchestrator" / "guard" / "scripts" / "guard.py"
+
+
+class Guard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self.tmp.name)
+        self.skills = base / "skills"
+        self.write_skill("demo", """\
+            ---
+            name: demo
+            description: a demo playbook
+            ---
+
+            # Demo
+
+            1. Gather the facts. Read everything first.
+            2. Hand it off. Mandatory: no skip.
+               This continues step two.
+            3. Report back.
+            4. Read every principle file it indexes.
+
+            ## Notes
+
+            1. Not a step.
+            """)
+        self.write_skill("open-pr", "---\nname: open-pr\ndescription: x\n---\n\n# Open a PR\n")
+        self.write_skill("principles", "---\nname: principles\ndescription: x\n---\n\n# Principles\n")
+        principles = self.skills / "principles" / "references" / "principles"
+        principles.mkdir(parents=True)
+        (principles / "fix-root-causes.md").write_text("# Fix Root Causes\n\nReproduce first.\n")
+        (principles / "prove-it-works.md").write_text("# Prove It Works\n\nCheck the real thing.\n")
+        self.env = {**os.environ, "AUTORUN_HOME": str(base / "autorun"), "GUARD_HOME": str(base / "guard"), "GUARD_SKILL_ROOTS": str(self.skills)}
+        for k in ("AUTORUN_RUN", "AUTORUN_DISABLE", "CURSOR_VERSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+            self.env.pop(k, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_skill(self, name, text):
+        d = self.skills / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(textwrap.dedent(text))
+
+    def hook(self, event, payload, agent="claude"):
+        payload = {"session_id": "s1", "cwd": self.tmp.name, **payload}
+        r = subprocess.run([sys.executable, str(HOOK), "hook", agent, event], input=json.dumps(payload), capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        errors = pathlib.Path(self.env["AUTORUN_HOME"]) / "errors.log"
+        self.assertFalse(errors.exists(), errors.read_text() if errors.exists() else "")
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def step(self, *args, ok=True):
+        r = subprocess.run([sys.executable, str(GUARD), "todo", *args, "--session", "claude:s1"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout + r.stderr
+
+    def stop(self, message, **extra):
+        return self.hook("Stop", {"last_assistant_message": message, **extra})
+
+    def test_em_dash_is_sent_back_outside_code(self):
+        self.assertEqual(self.stop("Done — all green.")["decision"], "block")
+        self.assertIsNone(self.stop("Done. The flag is `a—b` in code."))
+        self.assertIsNone(self.stop("Done, all green."))
+
+    def todo(self, *args, ok=True):
+        return self.step(*args, ok=ok)
+
+    def test_a_slash_skill_holds_tools_until_the_todo_is_decided(self):
+        hint = self.hook("UserPromptSubmit", {"prompt": "/demo build the thing"})["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("todo from demo", hint)
+        bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.hook("PreToolUse", {**bash, "agent_id": "a1"}))
+        for allowed in (f"python3 {GUARD} todo none --reason x; ls", f"python3 {HOOK} mode interactive --reason x", f"cat {self.skills}/demo/SKILL.md"):
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": allowed}}), allowed)
+        self.todo("none", "--reason", "one-line change")
+        self.assertIsNone(self.hook("PreToolUse", bash))
+        self.assertIsNone(self.stop("Done."))
+
+    def test_a_router_without_steps_defers_the_todo_decision_to_the_skill_it_reaches(self):
+        self.write_skill("router", "---\nname: router\ndescription: x\n---\n\n# Router\n\n- **Demo.** Uses `../demo/SKILL.md`.\n")
+        self.assertIsNone(self.hook("UserPromptSubmit", {"prompt": "/router teach me something"}))
+        bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        self.assertIsNone(self.hook("PreToolUse", bash))
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
+        out = self.hook("PreToolUse", bash)["hookSpecificOutput"]
+        self.assertIn("demo skill you are about to follow has steps", out["permissionDecisionReason"])
+        self.todo("from", "demo")
+        self.assertIsNone(self.hook("PreToolUse", bash))
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
+        self.assertIsNone(self.hook("PreToolUse", bash))
+
+    def test_todo_from_copies_steps_and_every_item_must_resolve(self):
+        self.hook("UserPromptSubmit", {"prompt": "/demo build the thing"})
+        out = self.todo("from", "demo")
+        self.assertIn("1. Gather the facts.", out)
+        self.assertNotIn("Not a step", out)
+        self.assertIn("looks like a flag", self.todo("add", "Update the changelog", "--session claude:x", ok=False))
+        self.todo("add", "Update the changelog")
+        blocked = self.stop("Started the work.")
+        self.assertIn("5. Update the changelog", blocked["reason"])
+        self.assertIsNone(self.stop("Which output format do you want?"))
+        self.assertIn("mandatory", self.todo("skip", "2", "--reason", "small", ok=False))
+        self.todo("done", "1", "2", "--note", "did both")
+        self.todo("skip", "3", "--reason", "nothing to report")
+        self.assertIn("fix-root-causes.md", self.todo("done", "4", ok=False))
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cat {self.skills}/principles/references/principles/*.md"}})
+        self.todo("done", "4")
+        self.assertIn("Every item is resolved", self.todo("done", "5"))
+        self.assertIsNone(self.stop("All done."))
+        self.assertIn("1. Next task", self.todo("add", "Next task"))
+
+    def test_skipping_an_item_that_runs_a_skill_skips_that_skills_items(self):
+        self.write_skill("outer", """\
+            ---
+            name: outer
+            description: x
+            ---
+
+            1. Start.
+            2. Run the demo skill (`../demo/SKILL.md`).
+            3. Finish.
+            """)
+        self.todo("from", "outer")
+        self.todo("from", "demo")
+        self.todo("done", "1")
+        self.assertIn("Also skipped 4 item(s) from demo", self.todo("skip", "2", "--reason", "too small"))
+        self.todo("done", "3")
+        self.assertIsNone(self.stop("Done."))
+
+    def test_todo_from_recognizes_each_shape_of_steps(self):
+        sys.path.insert(0, str(GUARD.parent))
+        from guard_lib.skills import steps
+        cases = {
+            "section": ("# S\n\n## Steps\n\n### First part\n\n1. **Read.** x\n2. Ask.\n\n### Second part\n\n3. Build.\n\n## Notes\n\n1. Not a step.\n", ["Read.", "Ask.", "Build."]),
+            "headings": ("# S\n\n## Phase A: Frame\n\n1. sub\n\n## Phase B: Fan out\n\ntext\n\n## Output\n", ["Frame", "Fan out"]),
+            "numbered": ("# S\n\n## 1. Assess\n\n## 2. Present\n", ["Assess", "Present"]),
+            "rules": ("# S\n\nIntro.\n\n## Work the run\n\n1. Set it.\n2. Do it.\n", []),
+        }
+        for name, (body, expected) in cases.items():
+            f = self.skills / name / "SKILL.md"
+            f.parent.mkdir(parents=True)
+            f.write_text("---\nname: x\ndescription: x\n---\n\n" + body)
+            self.assertEqual([t for _, t, _, _ in steps(f)], expected, name)
+        self.assertIn("todo add", self.todo("from", "rules", ok=False))
+
+    def test_principle_citations_need_a_read(self):
+        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
+        out = self.stop("Applied Fix Root Causes: reproduced first.")
+        self.assertIn("fix-root-causes.md", out["reason"])
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "principles/references/principles/fix-root-causes.md")}})
+        self.assertIsNone(self.stop("Applied Fix Root Causes: reproduced first."))
+
+
+    def test_shell_variables_in_read_paths_are_expanded(self):
+        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
+        d = self.skills / "principles" / "references" / "principles"
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"D={d}; cat $D/fix-root-causes.md; echo ---; cat ${{D}}/prove-it-works.md"}})
+        self.assertIsNone(self.stop("Applied Fix Root Causes, then Prove It Works."))
+
+    def test_reads_inside_a_for_loop_count(self):
+        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
+        d = self.skills / "principles" / "references" / "principles"
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f'for f in {d}/*.md; do echo "== $f"; cat "$f"; done'}})
+        self.assertIsNone(self.stop("Applied Fix Root Causes, then Prove It Works."))
+
+    def test_principle_rule_stays_off_without_eng_principles(self):
+        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "open-pr"}})
+        self.assertIsNone(self.stop("I want to prove it works."))
+
+    def test_pr_rules_apply_after_open_pr_is_used(self):
+        bad = {"tool_name": "Bash", "tool_input": {"command": "gh pr create --title 'Add export.' --draft --body 'stuff'"}}
+        self.assertIsNone(self.hook("PreToolUse", bad))
+        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "open-pr"}})
+        out = self.hook("PreToolUse", bad)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        for fragment in ("Conventional Commits", "--draft", "## Scope"):
+            self.assertIn(fragment, out["permissionDecisionReason"])
+        good = textwrap.dedent("""\
+            gh pr create --title 'feat(cli): add export command' --body "$(cat <<'EOF'
+            ## Why
+            Users want their notes out.
+
+            ## Scope
+            JSON only.
+
+            ## Verification
+            - Ran export on 23 notes.
+            EOF
+            )\"""")
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": good}}))
+        misordered = "gh pr create --title 'fix: x' --body '## Scope\nx\n\n## Why\ny'"
+        self.assertIn("order", self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": misordered}})["hookSpecificOutput"]["permissionDecisionReason"])
+
+
+    def test_an_item_naming_a_skill_needs_it_read_and_the_reply_skill_is_enforced(self):
+        self.write_skill("reply", "---\nname: reply\ndescription: x\n---\n\n# Writing the reply\n")
+        self.write_skill("helper", "---\nname: helper\ndescription: x\n---\n\n# Helper\n")
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Use the helper skill (`../helper/SKILL.md`).\n\n**Reply:** per the reply skill (`../reply/SKILL.md`).\n")
+        self.todo("from", "flow")
+        self.assertIn("../helper/SKILL.md", self.todo("done", "1", ok=False))
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "helper" / "SKILL.md")}})
+        self.todo("done", "1")
+        self.assertIn("reply", self.stop("All done.")["reason"])
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "reply" / "SKILL.md")}})
+        self.assertIsNone(self.stop("All done."))
+
+    def test_waiting_on_background_work_may_end_the_turn(self):
+        self.todo("add", "Implement it")
+        self.assertIsNone(self.stop("Delegated; waiting.", background_tasks=[{"id": "t"}]))
+
+    def test_stuck_lists_are_released_after_three_idle_stops(self):
+        self.todo("add", "Implement it")
+        for _ in range(3):
+            self.assertEqual(self.stop("Still working.")["decision"], "block")
+        self.assertIsNone(self.stop("Still working."))
+
+    def test_editing_a_skill_file_does_not_count_as_reading_it(self):
+        principles = self.skills / "principles" / "SKILL.md"
+        for command in [f"python3 - <<'EOF'\nopen('{principles}').read()\nEOF", f"grep -n x {principles}", f"sed -i '' 's/a/b/' {principles}"]:
+            self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+        self.assertIsNone(self.stop("Applied Fix Root Causes."))
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd /tmp && sed -n '1,80p' {principles}"}})
+        self.assertEqual(self.stop("Applied Fix Root Causes.")["decision"], "block")
+
+    def test_subagent_stops_are_not_checked(self):
+        self.todo("add", "Implement it")
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a1", "last_assistant_message": "done \u2014 ok"}))
+
+    def test_autonomous_and_guard_blocks_combine(self):
+        self.hook("UserPromptSubmit", {"prompt": "going to bed, build it"})
+        out = self.stop("Working \u2014 more to do.")
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("em dash", out["reason"])
+        self.assertIn("done condition", out["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()
