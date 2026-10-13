@@ -1,11 +1,14 @@
 ---
 name: create-skill
 description: Create a new skill or improve an existing one. Use this whenever the user wants to write, edit, restructure, or tighten a skill, turn a workflow from the current conversation into a skill.
+disable-model-invocation: true
 ---
 
 # Create skill
 
 A skill is a folder with a `SKILL.md` that teaches an agent how to do one kind of task well.
+
+Paths like `../salvo/SKILL.md` point to skills installed beside this one, relative to this file's folder.
 
 Work through the sections below as a loop:
 
@@ -99,7 +102,7 @@ When the user reviews the result, end the `SKILL.md` with an `## Output` section
 
 ## Test
 
-Test with the `eval-skill` skill: load it and follow it directly. Run every round in full, judge included: you wrote the skill, so your own grading alone is not a test. Each round ends with eval-skill's report and recommendation. Promote means the test passed; Revise or Reject means it failed. If eval-skill is not installed, tell the user the skill cannot be tested and stop. The eval checks what the skill makes agents do, not when they load it, so it does not replace the trigger test below; run both.
+Test with the **eval-skill** skill (`../eval-skill/SKILL.md`): load it and follow it directly. Run every round in full, judge included: you wrote the skill, so your own grading alone is not a test. Each round ends with eval-skill's report and recommendation. Promote means the test passed; Revise or Reject means it failed. If eval-skill is not installed, tell the user the skill cannot be tested and stop. The eval checks what the skill makes agents do, not when they load it, so it does not replace the trigger test below; run both.
 
 A failed test means the skill does not work yet, so revise it and run the eval again:
 

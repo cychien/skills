@@ -1,6 +1,7 @@
 ---
 name: unslop
 description: "Cut AI tells from writing so it reads like a person wrote it, in English or Chinese. Use for /unslop, or when another skill asks to run its text through unslop."
+disable-model-invocation: true
 ---
 
 # Unslop

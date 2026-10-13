@@ -1,6 +1,7 @@
 ---
 name: setup-orchestrator
 description: Choose which agent, model, and reasoning effort each orchestrator role uses, and save it as the config the orchestrator skills read. Use this whenever the user wants to set up or reconfigure the orchestrator, pick or change models for planning or execution, set a model budget, or when an orchestrator skill reports a missing model config.
+disable-model-invocation: true
 ---
 
 # Setup orchestrator

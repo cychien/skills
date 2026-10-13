@@ -8,10 +8,12 @@ disable-model-invocation: true
 
 The user learns a topic, then writes about it to make the understanding stick. Your job is the teaching and the outline. The writing is theirs, because reconstructing the ideas in their own words is where the learning happens.
 
+Paths like `../salvo/SKILL.md` point to skills installed beside this one, relative to this file's folder.
+
 ## Steps
 
 1. **Take the topic as given.** A bare topic is enough; start without asking about their level or goals.
-2. **Teach it.** Load the `teach` skill and follow it in full, research included. If it is not installed, tell the user and stop, because the outline depends on a complete teaching.
+2. **Teach it.** Load the **teach** skill (`../teach/SKILL.md`) and follow it in full, research included. If it is not installed, tell the user and stop, because the outline depends on a complete teaching.
 3. **Propose the outline,** in the same reply, after the teaching. Build it from what you just taught, following the rules below.
 4. **Revise on feedback.** When the user pushes back on the outline, change it and return the whole updated outline under the same rules.
 

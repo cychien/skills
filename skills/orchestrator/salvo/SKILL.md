@@ -1,11 +1,14 @@
 ---
 name: salvo
 description: "Run one task on several different models in parallel, each in its own workspace, and report every model's result without ranking or merging them. Use for /salvo, 'salvo this', or when the user wants several models to each take a shot at the same task."
+disable-model-invocation: true
 ---
 
 # Salvo
 
 Fire one task at several models at once. Each runs on its own, in its own workspace, and you report what each produced. Salvo does not judge, pick, or merge. Deciding what to do with the results belongs to the user, or to whatever skill invoked salvo.
+
+Paths like `../salvo/SKILL.md` point to skills installed beside this one, relative to this file's folder.
 
 ## Steps
 
@@ -14,7 +17,7 @@ Fire one task at several models at once. Each runs on its own, in its own worksp
    1. Read `<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`.
    2. Pick the role: `planner` for planning and design tasks (plans, specs, architecture, choosing an approach), `executor` for everything else.
    3. If the user named models, use exactly those. For each, take the effort the user gave, else the effort that role lists for the model, else none.
-   4. Otherwise use every entry in that role, once per distinct model, keeping the first effort listed for it. If there is no config, stop and ask the user to run the `setup-orchestrator` skill or to name the models.
+   4. Otherwise use every entry in that role, once per distinct model, keeping the first effort listed for it. If there is no config, stop and ask the user to run the **setup-orchestrator** skill (`../setup-orchestrator/SKILL.md`) or to name the models.
 3. **Launch.** From the directory the task is about, run:
 
    ```

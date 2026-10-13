@@ -1,6 +1,7 @@
 ---
 name: rewrite
 description: Rewrite an existing draft so it is clear, succinct, and worth reading to the end, while keeping the author's meaning and voice. Handles English, Chinese, and mixed Chinese-English text. Use this whenever the user pastes or points at prose and asks to rewrite, tighten, polish, simplify, shorten, or improve it, in any language, including 改寫, 潤稿, 精簡, 修一下, or "make this read better".
+disable-model-invocation: true
 ---
 
 # Rewrite

@@ -2,11 +2,14 @@
 name: teach
 description: "Explain a body of work plainly so a person actually understands it: a topic, a field, a paper, a documentation site, a YouTube or Bilibili video, a codebase, a diff. Covers what it is, how it works, and why it is built that way, presented as a web page when one can be shown. Use only when the user asks to be taught, as in /teach, 'teach me X', or 'help me really understand X', or when another skill asks for it. Not for routine requests to explain code or answer a question."
 compatibility: "Reading videos needs yt-dlp, and ffmpeg to extract frames."
+disable-model-invocation: true
 ---
 
 # Teach
 
 Explain a body of work so the person understands what it is, how it works, and why it is built that way. Understanding is the only goal, so change nothing: no edits, no fixes, no refactors, even when you spot a problem. Mention the problem instead.
+
+Paths like `../salvo/SKILL.md` point to skills installed beside this one, relative to this file's folder.
 
 The work has three parts. First settle what the person wants to learn. Then understand that domain yourself, completely and as it stands today. Then explain it to them in terms they already have. Keep the last two apart, because research done with the explanation in mind finds only what you already planned to say.
 
@@ -73,7 +76,7 @@ Match the medium to the idea, and use both when both help:
 
 Talk the way you would explain it to a colleague: plain, natural, tight but never so terse it gets hard to follow. Keep everything the person needs to understand.
 
-Before writing the explanation, load the `unslop` skill and apply it to everything the person will read, the page included.
+Before writing the explanation, load the **unslop** skill (`../unslop/SKILL.md`) and apply it to everything the person will read, the page included.
 
 ## Reply
 
