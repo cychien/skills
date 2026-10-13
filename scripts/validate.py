@@ -3,8 +3,10 @@
 
 usage: validate.py [repo root]
 
-Skills live at skills/<category>/<name>/. Installers drop the category, so a skill
-reaches another by name, never by path, and names are unique across categories.
+Skills live at skills/<category>/<name>/. Installers drop the category, so names are
+unique across categories and every installed skill sits beside the others. A skill
+reaches an auto-invocable skill by name, and a manual-only one, which agents cannot
+see, by its sibling path ../<name>/SKILL.md.
 """
 import json
 import pathlib
@@ -13,7 +15,7 @@ import sys
 
 NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 NAME_REF = re.compile(r"`([a-z0-9-]+)` skill")
-PATH_REF = re.compile(r"\.\./([a-z0-9-]+)/")
+PATH_REF = re.compile(r"\.\./([a-z0-9-]+)/SKILL\.md")
 CODEX_MANUAL_ONLY = re.compile(r"^policy:\n\s+allow_implicit_invocation:\s*false\s*$", re.M)
 
 
@@ -22,7 +24,19 @@ def frontmatter(text):
     if lines[0] != "---" or "---" not in lines[1:]:
         raise ValueError("missing frontmatter")
     fields = {}
+    nested = None
     for line in lines[1 : lines.index("---", 1)]:
+        if nested is not None and line.startswith("  "):
+            key, sep, value = line.strip().partition(": ")
+            if not sep or not re.fullmatch(r"[a-z-]+", key):
+                raise ValueError(f"unsupported frontmatter line: {line!r}")
+            fields[nested][key] = value.strip().strip('"')
+            continue
+        nested = None
+        if line == "metadata:":
+            nested = "metadata"
+            fields["metadata"] = {}
+            continue
         key, sep, value = line.partition(": ")
         if not sep or not re.fullmatch(r"[a-z-]+", key):
             raise ValueError(f"unsupported frontmatter line: {line!r}")
@@ -50,13 +64,16 @@ def check_skill(skill_dir, fields, body, skills):
         errors.append("description must be 1-1024 characters")
     if len(fields.get("compatibility", "")) > 500:
         errors.append("compatibility must be at most 500 characters")
-    for ref in set(PATH_REF.findall(body)) & skills.keys():
-        errors.append(f"reaches ../{ref}/ by path; write 'the `{ref}` skill' instead")
+    for ref in set(PATH_REF.findall(body)) - {name}:
+        if ref not in skills:
+            errors.append(f"reaches missing skill ../{ref}/SKILL.md")
+        elif not is_manual_only(skills[ref]):
+            errors.append(f"reaches ../{ref}/SKILL.md by path; {ref!r} is auto-invocable, so write 'the `{ref}` skill' instead")
     for ref in set(NAME_REF.findall(body)) - {name}:
         if ref not in skills:
             errors.append(f"references missing skill {ref!r}")
         elif is_manual_only(skills[ref]):
-            errors.append(f"references {ref!r}, which is manual-only, so agents cannot load it")
+            errors.append(f"references {ref!r} by name, but it is manual-only and agents cannot see it; reach it by path ../{ref}/SKILL.md")
     if is_manual_only(fields):
         openai_yaml = skill_dir / "agents" / "openai.yaml"
         if not openai_yaml.is_file() or not CODEX_MANUAL_ONLY.search(openai_yaml.read_text()):

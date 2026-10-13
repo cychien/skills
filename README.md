@@ -39,7 +39,7 @@ Rerun the install command. It updates every skill and adds new ones. `npx skills
 Installers drop the category folder, so:
 
 - Skill names are unique across categories.
-- A skill reaches another by name ("load the `teach` skill"), never by path. The skill it loads must not set `disable-model-invocation`, because agents cannot see manual-only skills.
+- A skill reaches an auto-invocable skill by name ("load the `teach` skill"). It reaches a manual-only skill, which agents cannot see, by its path beside it once installed ("read `../how/SKILL.md`").
 - A manual-only skill also needs `agents/openai.yaml` setting `policy.allow_implicit_invocation: false`, so Codex treats it as manual-only too.
 
 `python3 scripts/validate.py` checks all of this and runs in CI.
