@@ -1,7 +1,6 @@
 ---
 name: salvo
 description: "Run one task on several different models in parallel, each in its own workspace, and report every model's result without ranking or merging them. Use for /salvo, 'salvo this', or when the user wants several models to each take a shot at the same task."
-disable-model-invocation: true
 ---
 
 # Salvo

@@ -11,7 +11,7 @@ The user learns a topic, then writes about it to make the understanding stick. Y
 ## Steps
 
 1. **Take the topic as given.** A bare topic is enough; start without asking about their level or goals.
-2. **Teach it.** Find the `teach` skill's `SKILL.md` in the skills directory this skill was loaded from (such as `~/.claude/skills/` or `.agents/skills/`), read it, and follow it in full, research included. It cannot be invoked as a skill, so read the file. If it is missing, tell the user and stop, because the outline depends on a complete teaching.
+2. **Teach it.** Load the `teach` skill and follow it in full, research included. If it is not installed, tell the user and stop, because the outline depends on a complete teaching.
 3. **Propose the outline,** in the same reply, after the teaching. Build it from what you just taught, following the rules below.
 4. **Revise on feedback.** When the user pushes back on the outline, change it and return the whole updated outline under the same rules.
 

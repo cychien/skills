@@ -1,7 +1,6 @@
 ---
 name: teach
-description: "Explain a body of work plainly so a person actually understands it: a topic, a field, a paper, a codebase, a diff. Covers what it is, how it works, and why it is built that way, presented as a web page when one can be shown. Use for 'teach me this', 'help me really understand X', 'explain this to me', 'walk me through how X works', or when another skill needs to teach the user something."
-disable-model-invocation: true
+description: "Explain a body of work plainly so a person actually understands it: a topic, a field, a paper, a codebase, a diff. Covers what it is, how it works, and why it is built that way, presented as a web page when one can be shown. Use only when the user asks to be taught, as in /teach, 'teach me X', or 'help me really understand X', or when another skill asks for it. Not for routine requests to explain code or answer a question."
 ---
 
 # Teach
@@ -60,7 +59,7 @@ Match the medium to the idea, and use both when both help:
 
 Talk the way you would explain it to a colleague: plain, natural, tight but never so terse it gets hard to follow. Keep everything the person needs to understand.
 
-Before writing the explanation, read the `unslop` skill's `SKILL.md`, in the folder next to this skill's, and apply it to everything the person will read, the page included. It cannot be invoked as a skill, so read the file.
+Before writing the explanation, load the `unslop` skill and apply it to everything the person will read, the page included.
 
 ## Reply
 

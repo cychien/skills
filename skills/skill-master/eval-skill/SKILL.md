@@ -1,14 +1,13 @@
 ---
 name: eval-skill
 description: "Find out whether a new or changed skill actually changes agent behavior, with a blind experiment: an organic task run in parallel on several models through salvo, a blinded judge on a different model, and your own grading, reconciled into a promote-or-not recommendation. Use for /eval-skill, 'eval this skill', or when the user wants evidence that a skill works before shipping it."
-disable-model-invocation: true
 ---
 
 # Eval skill
 
 You own the experiment design. The question is always whether the variant makes agents behave the way it promises on a task where nothing tells them they are being watched. A run that knows it is observed performs for the grader, and a judge that knows which output came from the variant grades its own expectations. Either way you learn about the experiment, not the skill.
 
-This skill drives the `salvo` skill from the orchestrator group. Read salvo's `SKILL.md` for how it picks models, and run its `scripts/salvo.py`. If salvo is not installed, stop and tell the user.
+This skill drives the `salvo` skill. Load it for how it picks models, and run `scripts/salvo.py` from salvo's folder. If salvo is not installed, stop and tell the user.
 
 ## Blinding
 

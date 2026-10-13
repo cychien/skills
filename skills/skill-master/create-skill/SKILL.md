@@ -99,7 +99,7 @@ When the user reviews the result, end the `SKILL.md` with an `## Output` section
 
 ## Test
 
-Test with the `eval-skill` skill. It runs only on explicit invocation, so read its `SKILL.md` and follow it directly. Run every round in full, judge included: you wrote the skill, so your own grading alone is not a test. Each round ends with eval-skill's report and recommendation. Promote means the test passed; Revise or Reject means it failed. If eval-skill is not installed, tell the user the skill cannot be tested and stop. The eval checks what the skill makes agents do, not when they load it, so it does not replace the trigger test below; run both.
+Test with the `eval-skill` skill: load it and follow it directly. Run every round in full, judge included: you wrote the skill, so your own grading alone is not a test. Each round ends with eval-skill's report and recommendation. Promote means the test passed; Revise or Reject means it failed. If eval-skill is not installed, tell the user the skill cannot be tested and stop. The eval checks what the skill makes agents do, not when they load it, so it does not replace the trigger test below; run both.
 
 A failed test means the skill does not work yet, so revise it and run the eval again:
 
