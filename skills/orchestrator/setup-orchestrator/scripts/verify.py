@@ -37,7 +37,7 @@ def probe(spec, cwd):
         return {"spec": spec, "ok": False, "error": str(e)}
     if r.returncode == 0 and r.stdout.strip():
         return {"spec": spec, "ok": True, "error": None}
-    lines = [l for l in (r.stderr + r.stdout).splitlines() if l.strip()]
+    lines = [line for line in (r.stderr + r.stdout).splitlines() if line.strip()]
     return {"spec": spec, "ok": False, "error": "\n".join(lines[-3:]) or f"exit code {r.returncode}"}
 
 

@@ -22,7 +22,6 @@ outranks a project skill of the same name. Codex keeps its real home and has tho
 skills disabled by path.
 """
 import argparse
-import glob
 import json
 import os
 import re
@@ -199,7 +198,7 @@ def execute(run, prompt, manifest, timeout, hidden):
     if timed_out:
         run["error"] = f"timed out after {timeout}s"
     elif not ok:
-        tail = [l for l in open(err_path, errors="ignore").read().splitlines() if l.strip()][-5:]
+        tail = [line for line in open(err_path, errors="ignore").read().splitlines() if line.strip()][-5:]
         run["error"] = run.pop("agent_error", None) or "\n".join(tail) or f"exit code {code}"
     run["ok"] = ok
     print(f"finished {run['label']} {'ok' if ok else 'FAILED'} in {run['duration_s']}s", flush=True)

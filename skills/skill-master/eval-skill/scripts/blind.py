@@ -166,7 +166,9 @@ def main():
 
     os.makedirs(packet)
     key = {"labels": {}, "dropouts": [{"arm": r["arm"], "spec": r["spec"], "error": r.get("error")} for r in dropouts]}
-    for letter, run in zip(string.ascii_uppercase, runs):
+    if len(runs) > len(string.ascii_uppercase):
+        sys.exit(f"{len(runs)} runs exceed the {len(string.ascii_uppercase)} labels A-Z; split them across packets")
+    for letter, run in zip(string.ascii_uppercase, runs, strict=False):
         write_label(run, os.path.join(packet, letter))
         key["labels"][letter] = {"arm": run["arm"], "spec": run["spec"], "run_dir": run["dir"]}
     os.makedirs(os.path.dirname(key_path), exist_ok=True)

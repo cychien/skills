@@ -96,7 +96,7 @@ def parse_cues(text):
     previous = None
     for block in re.split(r"\n\s*\n", text.replace("\r", "")):
         lines = block.strip().split("\n")
-        timing = next((i for i, l in enumerate(lines) if "-->" in l), None)
+        timing = next((i for i, line in enumerate(lines) if "-->" in line), None)
         if timing is None:
             continue
         start = parse_timestamp(lines[timing].split("-->")[0].strip())
