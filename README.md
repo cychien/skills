@@ -45,7 +45,8 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 **[orchestrator](./skills/orchestrator/)** - coordinating multiple agents across a task
 
 - [orchestrator-do](./skills/orchestrator/orchestrator-do/) - the orchestration switchboard: model roles, the model config, and orchestration playbooks
-- [setup-orchestrator](./skills/orchestrator/setup-orchestrator/) - choose the agent, model, and effort for each role
+- [setup-orchestrator](./skills/orchestrator/setup-orchestrator/) - choose the agent, model, and effort for each role from the user's subscriptions
+- [update-orchestrator](./skills/orchestrator/update-orchestrator/) - move the model config onto newly released models, keeping subscriptions and role shape
 - [salvo](./skills/orchestrator/salvo/) - run one task on several models in parallel
 - [arena](./skills/orchestrator/arena/) - several candidates at one task, a cross-judge, then pick a base and graft
 - [guard](./skills/orchestrator/guard/) - hard rules that enforce skill conventions through hooks: playbook steps, principle citations, no em dash, PR rules
