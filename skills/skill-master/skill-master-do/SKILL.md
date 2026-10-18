@@ -10,3 +10,4 @@ Paths like `../salvo/SKILL.md` point to skills installed beside this one, relati
 
 - **Creating a skill, or changing an existing one** however slightly, uses the **create-skill** skill (`../create-skill/SKILL.md`).
 - **Testing whether a skill changes agent behavior** uses the **eval-skill** skill (`../eval-skill/SKILL.md`).
+- **Learning from a finished session**, when the user says "reflect" or wants the skills improved from what just happened, uses the **reflect** skill (`../reflect/SKILL.md`).

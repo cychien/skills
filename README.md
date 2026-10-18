@@ -19,6 +19,7 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [how](./skills/eng/how/) - explain how a subsystem works
 - [why](./skills/eng/why/) - find the rationale behind code from history, tickets, docs, and chat
 - [architect](./skills/eng/architect/) - sketch types and module structure across several models before writing code
+- [prototype](./skills/eng/prototype/) - settle a design or behavioral decision with throwaway variants observed on the real surface
 - [interrogate](./skills/eng/interrogate/) - adversarial review of changes by several models
 - [verify](./skills/eng/verify/) - prove a change works: a plan of checkable predicates, an independent verifier on the real surface, an evidence audit
 - [create-verification-skill](./skills/eng/create-verification-skill/) - generate a project-local `verify-<app>` skill that launches and drives the app
@@ -55,6 +56,7 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [skill-master-do](./skills/skill-master/skill-master-do/) - the skill-authoring switchboard
 - [create-skill](./skills/skill-master/create-skill/) - create a new skill or improve an existing one
 - [eval-skill](./skills/skill-master/eval-skill/) - test whether a skill changes agent behavior with a blind experiment
+- [reflect](./skills/skill-master/reflect/) - turn a finished session into approved skill edits, plus a backlog of rules that need a hard check
 
 ## Install
 

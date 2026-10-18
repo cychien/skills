@@ -94,6 +94,16 @@ Skills load in three levels:
 
 So put the workflow and the decisions in `SKILL.md`, and push long reference material into `references/` with a note on when to read each file. A reference file over 300 lines gets a table of contents. When a skill covers several variants (say, AWS, GCP, and Azure), keep the selection logic in `SKILL.md` and give each variant its own reference file so the agent reads only the one it needs.
 
+### Check what a script can check
+
+An agent can skip a sentence and cannot skip a failing check, so a rule that lives only in prose fails silently. For every rule you write, ask whether a script could verify it from files, command output, or git state.
+
+1. If it could, put the check in `scripts/` and add a numbered step that runs it, naming the script in backticks by its sibling path with any arguments as lowercase words, as in `` `../<name>/scripts/check.py ready` ``. The `guard` skill closes such a step only when the script exits 0. Where guard is absent, the step says not to continue until it passes. Mark the step Mandatory when skipping it would defeat its purpose, because guard allows no skip on those.
+2. Print one line per violation that names the file or value and the fix, because the agent acts on that line directly.
+3. Prove the check fails on a real past mistake before you rely on it, because a check that has never failed guards nothing.
+4. When no check can be built now, because the thing to check lives in another repo or costs more than the rule is worth today, still state the rule in one line and name the check that should replace it in your Output. Until a check exists, that line is all that stands.
+5. Keep prose for judgment no script can verify, and say why the rule matters.
+
 ### Output format
 
 When the output has a fixed shape, give the agent a template to fill instead of describing the shape in prose.
@@ -108,7 +118,7 @@ A failed test means the skill does not work yet, so revise it and run the eval a
 
 - Change only the skill's own files. Making runs pass by editing anything else, such as the project the skill works on, proves nothing about the skill and ships changes nobody asked for. Propose such changes to the user instead.
 - When runs never opened the skill, the problem is triggering, not the instructions. Revise the description once, per the trigger test below. If a model still does not load the skill, report that as a finding and stop; never plant the skill's rules, or pointers to it, anywhere else to get around it, because the eval would then measure the copy instead of the skill.
-- If a rule keeps failing, reframe it or change the working pattern instead of making it stricter. If a transcript shows the agent doing unproductive work, cut the part of the skill that causes it.
+- If a rule keeps failing, first ask whether a script could check it, per "Check what a script can check". Otherwise reframe it or change the working pattern instead of making it stricter. If a transcript shows the agent doing unproductive work, cut the part of the skill that causes it.
 - Keep the prompt and criteria the same in every round, so each round measures the same thing. Changing them mid-loop moves the goalposts; do it only with the user's agreement.
 - Stop when the eval promotes, or when a revision no longer improves the result, and report the latter as a finding. A disagreement the experiment could not settle is a call for the user.
 
@@ -129,6 +139,7 @@ Once the eval recommends promoting the skill, or you are stuck on a call only th
 - What you already fixed along the way.
 - Any step you skipped, and why.
 - Any call only the user can make.
+- Any rule left as prose that a script could check, and the check that should replace it.
 - Paths to any file the user needs to open.
 
 Then ask: "How does this look? What would you change?" Empty feedback means fine.
