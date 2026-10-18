@@ -16,6 +16,7 @@ import sys
 NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 NAME_REF = re.compile(r"`([a-z0-9-]+)` skill")
 PATH_REF = re.compile(r"\.\./([a-z0-9-]+)/SKILL\.md")
+GATE_REF = re.compile(r"`\.\./([a-z0-9-]+)/scripts/([A-Za-z0-9_-]+\.py)")
 CODEX_MANUAL_ONLY = re.compile(r"^policy:\n\s+allow_implicit_invocation:\s*false\s*$", re.M)
 
 
@@ -74,6 +75,11 @@ def check_skill(skill_dir, fields, body, skills):
             errors.append(f"references missing skill {ref!r}")
         elif is_manual_only(skills[ref]):
             errors.append(f"references {ref!r} by name, but it is manual-only and agents cannot see it; reach it by path ../{ref}/SKILL.md")
+    for ref, script in set(GATE_REF.findall(body)):
+        if ref in skills and not any(skill_dir.parent.parent.glob(f"*/{ref}/scripts/{script}")):
+            errors.append(f"names gate ../{ref}/scripts/{script}, which does not exist")
+        elif ref not in skills:
+            errors.append(f"names gate ../{ref}/scripts/{script} in missing skill {ref!r}")
     if is_manual_only(fields):
         openai_yaml = skill_dir / "agents" / "openai.yaml"
         if not openai_yaml.is_file() or not CODEX_MANUAL_ONLY.search(openai_yaml.read_text()):

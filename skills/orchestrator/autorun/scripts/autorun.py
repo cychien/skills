@@ -99,7 +99,10 @@ def cmd_start(args):
     host, host_session, proc = store.host_agent(table)
     agent, session = cli_session(args.session) if args.session else (host, host_session)
     store.clear_undecided(agent, session)
-    run = store.resolve_cli(args.run) if args.run else (store.lookup(agent, session)[0] or store.resolve_cli(None))
+    bound, role = store.lookup(agent, session)
+    run = store.resolve_cli(args.run) if args.run else (bound or store.resolve_cli(None))
+    if run:
+        refuse_delegate(run, (agent, session), "sets the done condition")
     if not run:
         cwd = (proc and store.proc_cwd(proc["pid"])) or os.getcwd()
         run = store.create_run(agent, session, cwd, "start command", args.goal, proc)
@@ -159,6 +162,7 @@ def cmd_done(args):
     from autorun_lib import review
 
     run = _active_run(args.run)
+    refuse_delegate(run, None, "declares the run done")
     data = run.data()
     if not data.get("done"):
         sys.exit("NOT DONE: no done condition is set. Set one with start first.")
@@ -215,6 +219,17 @@ def report(run):
     lines += [f"- {g['id']} [{g['status']}] {g['question']}" + (f" -> {g['answer']}" if g.get("answer") else "") for g in gates] or ["- none"]
     lines += ["", f"Files: {run.dir}"]
     return "\n".join(lines)
+
+
+def refuse_delegate(run, caller, action):
+    """Only the run's root session may change its done condition or finish it."""
+    if caller is None:
+        agent, session, _ = store.host_agent(store.processes())
+        caller = (agent, session)
+    bound, role = store.lookup(*caller) if caller[1] else (None, None)
+    if bound and bound.id == run.id and role != "root":
+        sys.exit(f"autorun: this session works inside run {run.id} as a {role}, and only its root {action}. "
+                 "Finish your task and state in your final message what done means for it.")
 
 
 def _active_run(run_id):

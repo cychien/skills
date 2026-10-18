@@ -1,0 +1,32 @@
+---
+name: hillclimb
+description: "Improve one measurable thing against a target in a scientific loop: a frozen, vetted harness, one hypothesis per iteration, keep or revert on the measurement, and a decision log. Use for /hillclimb, 'make X N% faster', 'keep improving this metric', or any sustained optimization run, attended or unattended."
+disable-model-invocation: true
+---
+
+# Hillclimb
+
+**You own the metric and the experiment's integrity. Supervise and review. Delegate the attempts.** A one-off fix belongs to the **bug-fix** skill (`../bug-fix/SKILL.md`) or the **perf-issue** skill (`../perf-issue/SKILL.md`). This is the loop.
+
+Paths like `../how/SKILL.md` point to skills installed beside this one, relative to this file's folder.
+
+Core discipline: one change, one measurement, keep or revert. Never stack untested changes, and never claim a win from reading code, per the Prove It Works principle (`../principles/references/principles/prove-it-works.md`).
+
+Open a todolist whose first items are the steps below, copied in verbatim, before any task-specific todos. The `guard` skill's `todo from hillclimb` does this; without guard, use your agent's todo tool. A step you choose not to do stays in the list with a one-line `skip: <reason>`, so the user sees what was skipped and why.
+
+1. Read the **principles** skill (`../principles/SKILL.md`) and every principle file it indexes. Mandatory: no skip-with-reason escape, because the principles shape every later step and a citation is only honest when its file was read.
+2. Ground the workload before choosing the metric. Run the **how** skill (`../how/SKILL.md`) over the target, name the realistic workload dimensions that move the result (data size, history, state, concurrency), and pick a case that reproduces the user's complaint. If no case reproduces it, fix the repro instead of climbing. Then fix one metric, the direction that counts as better, and a checkable stop predicate that pairs a target with a floor on attempts, so a lucky early win cannot end the run ("at least 50% better than baseline and at least 10 iterations"). Use the user's numbers when given, otherwise agree them.
+3. Build the measurement harness, prove its sensitivity, then freeze it, per the Build the Lever principle (`../principles/references/principles/build-the-lever.md`). Run contrasting realistic workloads and confirm the target case shows the symptom while easier cases separate as expected. If the harness cannot tell them apart, revise the workload or metric. Measure where the **benchmark-checklist** skill's "Where to measure" section says (`../benchmark-checklist/SKILL.md`), vet the harness with that checklist, and make it print its error count and a count of the work done. Once frozen, one repeatable command emits the metric as a median of enough runs to clear the noise. Record the baseline and a green run of the regression gate (the tests that must keep passing) before any change. Mandatory: no skip-with-reason escape, because every later keep-or-revert trusts this harness.
+4. Open the decision log as `decision.tsv` in the verification directory that `python3 ../verify/scripts/verify.py where` prints, outside the tree, with the header `id	hypothesis	change	before	after	delta	gate	verdict	note`. One row per attempt, kept or reverted. Read it before each attempt.
+5. Ground each hypothesis in the model from step 2, so it names a mechanism ("defer X off the boot path because it blocks first paint"), not "try memoizing something". For a perf metric, order hypotheses by the performance mantras in step 5 of the perf-issue skill. Borrow their order, not their stop rule.
+6. Loop, one hypothesis per iteration:
+   - Hand the change to a subagent on the executor model from the orchestrator config (`<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`) with a tight scope, and review its diff instead of typing it, per the Guard the Context Window principle (`../principles/references/principles/guard-the-context-window.md`). When several independent hypotheses are live, fan them to parallel subagents, each in its own worktree, per the Separate Before Serializing Shared State principle (`../principles/references/principles/separate-before-serializing-shared-state.md`).
+   - Measure before and after with the frozen harness, and run the regression gate.
+   - Keep the change only when the metric moves past noise and the gate stays green. Otherwise revert it in full. A tweak that "might help" is not kept.
+   - Make one commit per kept change, staging only the files it touched (`git add <files>`, never `-A`). Log the row either way.
+7. Push past the first plateau. After several rejects in a row, pivot category, combine near-misses, re-read the source, or try something more radical before concluding the hill is climbed. Correctness and simplicity outrank the number: revert a win that breaks behavior, and keep a simplification that holds the number, per the Laziness Protocol principle (`../principles/references/principles/laziness-protocol.md`).
+8. Stop when the predicate holds, or when the remaining ideas are marginal and not worth their cost. Never relax the predicate to meet it, and never quit while cheap untried hypotheses remain. If stuck, surface it instead of spinning. Close this step only when `../verify/scripts/verify.py decisions` passes, so every attempt is logged as kept or reverted. For an unattended run, start it with the `autorun` skill, with the stop predicate as `--done` and the frozen harness as `--check`.
+9. Prove the final head with the **verify** skill (`../verify/SKILL.md`), with the stop predicate as the plan's perf rule. Mandatory: no skip-with-reason escape, because the loop's own measurements were taken by the author. Close this step only when `../verify/scripts/verify.py report` passes. On a FAIL, delegate the fix to the executor at its root cause, then run the verify skill again for the checks the fix could touch, with a fresh verifier.
+10. Run the **open-pr** skill (`../open-pr/SKILL.md`) with the kept commits stacked in the order they landed.
+
+**Reply:** the metric and target, baseline to final with the percent delta, iterations run (kept and reverted), each kept change on one line, the `decision.tsv` path, and the best idea to try next. Write it per the **reply** skill (`../reply/SKILL.md`).

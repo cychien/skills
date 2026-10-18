@@ -109,13 +109,15 @@ def codex_sandbox_advice():
 
     config = HOME / ".codex" / "config.toml"
     text = config.read_text() if config.exists() else ""
-    if str(store.HOME) in text and "network_access = true" in text:
+    # Codex refuses a writable root with a symlink in its path, so name the resolved directory.
+    root = os.path.realpath(store.HOME)
+    if f'"{root}"' in text and "network_access = true" in text:
         return
     print(f"""   Under Codex's workspace-write sandbox, autorun cannot save run state or reach the reviewer.
    For unattended runs, either start Codex with full access, or add this to {config}:
 
    [sandbox_workspace_write]
-   writable_roots = ["{store.HOME}"]
+   writable_roots = ["{root}"]
    network_access = true
 """)
 

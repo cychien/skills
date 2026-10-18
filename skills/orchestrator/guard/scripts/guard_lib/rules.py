@@ -3,6 +3,7 @@ import glob
 import os
 import re
 import shlex
+import subprocess
 
 from . import pr, skills, state
 
@@ -25,6 +26,29 @@ def expand(text, variables):
 CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 QUESTION_END = re.compile(r"[?？]\s*\**\s*$")
 IDLE_LIMIT = 3
+HEADLESS = re.compile(r"(^|/)claude\b.*\s(-p|--print)\b|(^|/)codex\s+exec\b")
+
+
+def headless():
+    """Whether this hook runs under a non-interactive agent, where ending the turn ends the process and its background work."""
+    if os.environ.get("GUARD_HEADLESS"):
+        return os.environ["GUARD_HEADLESS"] == "1"
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2])
+    pid, seen = os.getppid(), set()
+    while pid in table and pid not in seen and pid > 1:
+        seen.add(pid)
+        if HEADLESS.search(table[pid][1]):
+            return True
+        pid = table[pid][0]
+    return False
 
 
 def cli(session_ref):
@@ -127,7 +151,7 @@ def on_post_tool(event):
     if event.tool and event.tool.lower() == "skill" and isinstance(event.tool_input, dict) and event.tool_input.get("skill"):
         loaded.append(event.tool_input["skill"].split(":")[-1])
     for path in files_read(event):
-        if m := SKILL_FILE.search(path):
+        if (m := SKILL_FILE.search(path)) and skills.followed(path, event.cwd):
             loaded.append(m.group(1))
         if m := PRINCIPLE_FILE.search(path):
             read.append(m.group(1))
@@ -211,7 +235,11 @@ def on_stop(event):
     if needs_reply and data["todo"] and not state.open_items(data) and "reply" not in data["skills"]:
         problems.append(f"The `{needs_reply[0]}` skill asks for its reply per the reply skill. Read `../reply/SKILL.md` beside it and write the reply that way.")
     items = state.open_items(data)
+    mandatory = [i for i in items if i["mandatory"]]
     asking = bool(QUESTION_END.search(CODE.sub("", message).strip()))
+    if items and not problems and event.waiting_on_background and headless():
+        problems.append("This session is non-interactive, so ending the turn ends the process and kills the background work "
+                        "it is waiting on. Wait for that work in the foreground, finish the open items, then end the turn.")
     if items and not problems and (asking or event.waiting_on_background):
         return PASS
     if items:
@@ -220,8 +248,12 @@ def on_stop(event):
             d["idle_blocks"] = d.get("idle_blocks", 0) + 1 if idle else 0
             d["activity_at_block"] = d.get("activity", 0)
             idle_blocks = d["idle_blocks"]
-        if idle_blocks < IDLE_LIMIT:
+        if idle_blocks < IDLE_LIMIT or mandatory:
             cmd, sess = cli(session_ref(event))
             lines = ["The todo list has open items:"] + [f"   {i['n']}. {i['title']}" for i in items]
             problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> {sess}`, or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. End the turn only to ask the user a question.")
+        if idle_blocks >= IDLE_LIMIT and mandatory:
+            problems.append("Item(s) {} are mandatory, so stopping repeatedly does not release them. If something outside your control "
+                            "keeps one from closing, ask the user a question that names the item and what blocks it.".format(
+                                ", ".join(str(i["n"]) for i in mandatory)))
     return ("block", "\n\n".join(problems)) if problems else PASS

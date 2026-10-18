@@ -2,6 +2,7 @@
 import os
 import pathlib
 import re
+import subprocess
 
 STEP = re.compile(r"^(\d+)\. (.+)$")
 STEP_HEADING = re.compile(r"^(?:(?:Step|Phase|Pass)\s+)?(?:\d+|[A-Z])[.,:)]\s*(.+)$")
@@ -14,6 +15,25 @@ def roots(cwd):
     home = pathlib.Path.home()
     base = pathlib.Path(cwd or ".")
     return [base / ".claude/skills", base / ".agents/skills", home / ".claude/skills", home / ".agents/skills", home / ".codex/skills"]
+
+
+def followed(path, cwd):
+    """Whether reading this SKILL.md means following the skill: it sits under a skill root, or outside the
+    working tree. A skill's own source inside the working tree is being authored, not followed."""
+    base = os.path.abspath(cwd or ".")
+    target = os.path.abspath(os.path.join(base, os.path.expanduser(path)))
+    under = lambda t, root: os.path.commonpath([t, root]) == root
+    if any(under(target, os.path.abspath(root)) for root in roots(cwd)):
+        return True
+    return not under(os.path.realpath(target), os.path.realpath(worktree(base)))
+
+
+def worktree(cwd):
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return cwd
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else cwd
 
 
 def find(name, cwd):

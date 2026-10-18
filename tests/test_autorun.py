@@ -16,6 +16,7 @@ class Harness(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = pathlib.Path(self.tmp.name)
         self.env = {**os.environ, "AUTORUN_HOME": str(self.home), "GUARD_HOME": str(self.home / "guard"), "GUARD_SKILL_ROOTS": str(self.home / "no-skills"), "AUTORUN_SKILL_ROOTS": str(self.home / "skills")}
+        self.env["GUARD_HEADLESS"] = "0"
         for key in ("AUTORUN_RUN", "AUTORUN_DISABLE", "CURSOR_VERSION"):
             self.env.pop(key, None)
         (self.home / "config.json").parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +202,32 @@ class AutorunFlow(Harness):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         pointer = json.loads((self.home / "sessions" / "codex-s-child").read_text())
         self.assertEqual(pointer, {"run": run, "role": "delegate"})
+
+    def child_hook(self, extra_env=""):
+        child = textwrap.dedent(f"""
+            import json, os, subprocess, sys
+            {extra_env}
+            r = subprocess.run([sys.executable, {str(SCRIPT)!r}, "hook", "codex", "PreToolUse"],
+                               input=json.dumps({{"session_id": "s-child", "tool_name": "request_user_input", "tool_input": {{}}}}),
+                               capture_output=True, text=True)
+            print(r.stdout)
+        """)
+        return subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, env=self.env).stdout.strip()
+
+    def test_a_child_behind_a_launch_boundary_stays_out_of_the_run(self):
+        self.start_run()
+        self.assertEqual(self.child_hook("os.environ['AUTORUN_BOUNDARY_PID'] = str(os.getpid())"), "")
+        self.assertFalse((self.home / "sessions" / "codex-s-child").exists())
+
+    def test_a_delegate_cannot_replace_the_root_done_condition(self):
+        run = self.start_run()
+        self.cli("start", "--run", run, "--done", "the root's condition")
+        self.child_hook()
+        out = self.cli("start", "--session", "codex:s-child", "--done", "the delegate's condition", ok=False)
+        self.assertIn("only its root sets the done condition", out)
+        out = self.cli("start", "--run", run, "--session", "codex:s-child", "--done", "the delegate's condition", ok=False)
+        self.assertIn("only its root sets the done condition", out)
+        self.assertEqual(json.loads((self.home / "runs" / run / "run.json").read_text())["done"], "the root's condition")
 
     def test_unrelated_session_in_same_process_does_not_join(self):
         self.start_run()

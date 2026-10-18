@@ -42,6 +42,7 @@ class Guard(unittest.TestCase):
         (principles / "fix-root-causes.md").write_text("# Fix Root Causes\n\nReproduce first.\n")
         (principles / "prove-it-works.md").write_text("# Prove It Works\n\nCheck the real thing.\n")
         self.env = {**os.environ, "AUTORUN_HOME": str(base / "autorun"), "GUARD_HOME": str(base / "guard"), "GUARD_SKILL_ROOTS": str(self.skills)}
+        self.env["GUARD_HEADLESS"] = "0"
         for k in ("AUTORUN_RUN", "AUTORUN_DISABLE", "CURSOR_VERSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             self.env.pop(k, None)
 
@@ -62,7 +63,7 @@ class Guard(unittest.TestCase):
         return json.loads(r.stdout) if r.stdout.strip() else None
 
     def step(self, *args, ok=True):
-        r = subprocess.run([sys.executable, str(GUARD), "todo", *args, "--session", "claude:s1"], capture_output=True, text=True, env=self.env)
+        r = subprocess.run([sys.executable, str(GUARD), "todo", *args, "--session", "claude:s1"], capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
         self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
         return r.stdout + r.stderr
 
@@ -156,6 +157,28 @@ class Guard(unittest.TestCase):
             self.assertEqual([t for _, t, _, _ in steps(f)], expected, name)
         self.assertIn("todo add", self.todo("from", "rules", ok=False))
 
+    def test_an_item_naming_a_check_script_closes_only_when_it_passes(self):
+        scripts = self.skills / "checker" / "scripts"
+        scripts.mkdir(parents=True)
+        self.write_skill("checker", "---\nname: checker\ndescription: x\n---\n")
+        (scripts / "check.py").write_text("import pathlib, sys\nok = pathlib.Path('ready').exists()\nprint('ready' if ok else 'not ready: write the ready file')\nsys.exit(0 if ok else 1)\n")
+        self.write_skill("gated", """\
+            ---
+            name: gated
+            description: x
+            ---
+
+            1. Write the ready file, and close this step only when `../checker/scripts/check.py plan` passes.
+            2. Name a missing gate `../absent/scripts/check.py`.
+            """)
+        self.todo("from", "gated")
+        out = self.todo("done", "1", ok=False)
+        self.assertIn("not ready: write the ready file", out)
+        self.assertIn("stays open", out)
+        self.assertIn("not installed", self.todo("done", "2", ok=False))
+        pathlib.Path(self.tmp.name, "ready").write_text("")
+        self.todo("done", "1")
+
     def test_principle_citations_need_a_read(self):
         self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
         out = self.stop("Applied Fix Root Causes: reproduced first.")
@@ -217,6 +240,14 @@ class Guard(unittest.TestCase):
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "reply" / "SKILL.md")}})
         self.assertIsNone(self.stop("All done."))
 
+    def test_a_headless_session_cannot_end_the_turn_on_background_work(self):
+        self.todo("add", "Ship it")
+        self.env["GUARD_HEADLESS"] = "1"
+        blocked = self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}])
+        self.assertIn("non-interactive", blocked["reason"])
+        self.env["GUARD_HEADLESS"] = "0"
+        self.assertIsNone(self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}]))
+
     def test_waiting_on_background_work_may_end_the_turn(self):
         self.todo("add", "Implement it")
         self.assertIsNone(self.stop("Delegated; waiting.", background_tasks=[{"id": "t"}]))
@@ -226,6 +257,34 @@ class Guard(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(self.stop("Still working.")["decision"], "block")
         self.assertIsNone(self.stop("Still working."))
+
+    def test_mandatory_items_are_not_released_by_idle_stops(self):
+        self.hook("UserPromptSubmit", {"prompt": "/demo build the thing"})
+        self.todo("from", "demo")
+        self.todo("done", "1")
+        self.todo("skip", "3", "4", "--reason", "n/a")
+        for _ in range(4):
+            blocked = self.stop("Still working.")
+            self.assertEqual(blocked["decision"], "block")
+        self.assertIn("Item(s) 2 are mandatory", blocked["reason"])
+        self.assertIsNone(self.stop("The gate needs a staging database I cannot reach. Can you grant access?"))
+
+    def test_reading_a_skills_source_in_the_working_tree_is_not_following_it(self):
+        bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        self.write_skill("router", "---\nname: router\ndescription: x\n---\n\n# Router\n")
+        self.hook("UserPromptSubmit", {"prompt": "/router edit the demo skill"})
+        source = pathlib.Path(self.tmp.name) / "src" / "skills" / "eng" / "demo"
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text((self.skills / "demo" / "SKILL.md").read_text())
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(source / "SKILL.md")}})
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": "cat src/skills/eng/demo/SKILL.md"}})
+        self.assertIsNone(self.hook("PreToolUse", bash))
+        with tempfile.TemporaryDirectory() as elsewhere:
+            outside = pathlib.Path(elsewhere) / "demo" / "SKILL.md"
+            outside.parent.mkdir()
+            outside.write_text(source.joinpath("SKILL.md").read_text())
+            self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(outside)}})
+        self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_editing_a_skill_file_does_not_count_as_reading_it(self):
         principles = self.skills / "principles" / "SKILL.md"

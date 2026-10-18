@@ -182,6 +182,9 @@ def execute(run, prompt, manifest, timeout, hidden):
     run.update(result=result_path, transcript=log_path, stderr=err_path)
     cmd = command(agent, model, effort, run["work"], result_path, hidden)
     env = {**os.environ, "HOME": manifest["shadow_home"]} if agent == "claude" and manifest.get("shadow_home") else None
+    if manifest.get("clean_room"):
+        env = {k: v for k, v in (env or os.environ).items() if k != "AUTORUN_RUN"}
+        env["AUTORUN_BOUNDARY_PID"] = str(os.getpid())
     print(f"started  {run['label']}", flush=True)
     start = time.time()
     try:
@@ -220,7 +223,8 @@ def run_salvo(args):
     with open(os.path.join(out, "task.md"), "w") as f:
         f.write(prompt_task + "\n")
 
-    manifest = {"status": "running", "source": source, "repo": None, "base_tree": None, "shadow_home": None, "runs": []}
+    manifest = {"status": "running", "source": source, "repo": None, "base_tree": None, "shadow_home": None,
+                "clean_room": args.clean_room, "runs": []}
     if args.hide_skill and any(spec.startswith("claude:") for spec in args.specs):
         manifest["shadow_root"] = os.path.join("/tmp", secrets.token_hex(4))
         manifest["shadow_home"] = build_shadow_home(manifest["shadow_root"], set(args.hide_skill))
@@ -251,6 +255,9 @@ def run_salvo(args):
             # A standalone clone, unlike a worktree, cannot list its sibling workspaces.
             git(manifest["repo"], "clone", "-q", manifest["repo"], checkout)
             git(checkout, "checkout", "-q", "-B", branch, base)
+            for ref in git(manifest["repo"], "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
+                if ref != branch:
+                    git(checkout, "branch", "-f", ref, f"origin/{ref}")
             git(checkout, "remote", "remove", "origin")
             git(checkout, "reflog", "expire", "--expire=now", "--all")
             run["work"] = os.path.normpath(os.path.join(checkout, os.path.relpath(source, manifest["repo"])))

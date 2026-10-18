@@ -17,7 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from guard_lib import skills, state  # noqa: E402
+from guard_lib import gates, skills, state  # noqa: E402
 
 SKILL_REF = re.compile(r"\.\./([a-z0-9][a-z0-9-]*)/SKILL\.md")
 
@@ -60,6 +60,9 @@ def resolve(data, n, status, note):
             if missing:
                 sys.exit("guard: item {} needs every principle file read first; still unread: {}.".format(
                     n, ", ".join(f"references/principles/{m}.md" for m in missing)))
+        failed = gates.failures(item["text"])
+        if failed:
+            sys.exit(f"guard: item {n} stays open, because " + "\n".join(failed) + "\nFix what the gate reports, then mark the item done again.")
     item["status"], item["note"] = status, note
     message = f"Item {n} {status}."
     if status == "skipped":

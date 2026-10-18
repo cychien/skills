@@ -12,11 +12,19 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [principles](./skills/eng/principles/) - the engineering principles playbooks read before they design or build
 - [code-comments](./skills/eng/code-comments/) - how code is commented in every file a playbook produces
 - [feature](./skills/eng/feature/) - build new or changed behavior: clarify the spec, ground, design, delegate, verify, open a PR
+- [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, verify, land the failing repro before the fix
+- [perf-issue](./skills/eng/perf-issue/) - fix a slowness against a vetted baseline, cheapest performance mantra first
+- [hillclimb](./skills/eng/hillclimb/) - improve one metric against a target: frozen harness, keep or revert, decision log
 - [open-pr](./skills/eng/open-pr/) - open PRs as small ordered commits with a one-minute description
 - [how](./skills/eng/how/) - explain how a subsystem works
 - [why](./skills/eng/why/) - find the rationale behind code from history, tickets, docs, and chat
 - [architect](./skills/eng/architect/) - sketch types and module structure across several models before writing code
 - [interrogate](./skills/eng/interrogate/) - adversarial review of changes by several models
+- [verify](./skills/eng/verify/) - prove a change works: a plan of checkable predicates, an independent verifier on the real surface, an evidence audit
+- [create-verification-skill](./skills/eng/create-verification-skill/) - generate a project-local `verify-<app>` skill that launches and drives the app
+- [maintain-verification-skill](./skills/eng/maintain-verification-skill/) - keep a verification skill and its feature map honest as the app changes
+- [benchmark-checklist](./skills/eng/benchmark-checklist/) - vet a performance number before you report or act on it, measured on read-only production when available
+- [blast-radius](./skills/eng/blast-radius/) - find what a change breaks beyond its diff, and prove the fact it is safe because of
 - [no-comments](./skills/eng/no-comments/) - strip comments that should be code
 - [technical-writing](./skills/eng/technical-writing/) - the standard for docs, PR descriptions, and commit messages
 

@@ -14,6 +14,10 @@ The prose that ships alongside the type sketch. One page. Sentence-case headings
 
 *The recommended architecture. Data structures first. Then how data flows through the signatures. Name the load-bearing decisions. State which invariants are encoded in types, where validation lives, and what the system deliberately does not do. Judge interface depth explicitly. State what complexity the public surface hides, what remains exposed to callers, and why the interface is no larger than needed. Cite the principle behind each decision (e.g., `per boundary-discipline`). Don't restate it.*
 
+## Performance
+
+*Required. For each dominant operation: the realistic data size, its time complexity, I/O round trips, memory, and the work it adds to hot paths. Show how the shape meets each perf budget in the verification plan, or name the budget at risk and why. Name the first measurement that would prove the shape wrong.*
+
 ## Synthesis decision
 
 *Filled in by **arena**. Records which candidate became the base and why, what was adapted from each of the others, and what was rejected and why.*
@@ -24,7 +28,7 @@ The prose that ships alongside the type sketch. One page. Sentence-case headings
 
 ## Alternatives considered
 
-*Required. Name at least one concrete alternative shape, with one line on why it lost. Judge each alternative on interface depth, not implementation simplicity alone. Name the complexity it exposes to callers and the complexity it hides. Two or three alternatives belong here when the design space had real contenders. One is fine when the constraints forced the answer, with the conclusion phrased as "this was the only viable shape because..." Avoid listing flavors of the same shape. This section covers design alternatives the chosen shape considered and rejected, not other runner candidates.*
+*Required. Name at least one concrete alternative shape, with one line on why it lost. Judge each alternative on interface depth and performance, not implementation simplicity alone. Name the complexity it exposes to callers and the complexity it hides. Two or three alternatives belong here when the design space had real contenders. One is fine when the constraints forced the answer, with the conclusion phrased as "this was the only viable shape because..." Avoid listing flavors of the same shape. This section covers design alternatives the chosen shape considered and rejected, not other runner candidates.*
 
 ## Open questions and risks
 

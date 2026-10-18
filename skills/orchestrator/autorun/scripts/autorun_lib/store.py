@@ -241,8 +241,10 @@ def processes():
 
 
 def ancestors(table, pid):
+    """pid and its ancestors, stopping below $AUTORUN_BOUNDARY_PID, which a launcher sets so its children stay out of its run."""
+    boundary = int(os.environ.get("AUTORUN_BOUNDARY_PID") or 0)
     seen = []
-    while pid in table and pid not in seen and pid > 1:
+    while pid in table and pid not in seen and pid > 1 and pid != boundary:
         seen.append(pid)
         pid = table[pid][0]
     return seen

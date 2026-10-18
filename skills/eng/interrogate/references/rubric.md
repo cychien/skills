@@ -53,6 +53,20 @@ Can you tell that this code works from reading it?
 - Check the real thing, not a proxy. If the code checks liveness via file mtime or cached state instead of reading the actual value, that's a verification gap.
 - For delegated or async work: does the code verify actual output artifacts, or does it trust self-reports and summaries?
 
+## Performance
+
+Will this stay fast at the data size and load it will really see?
+
+- Work that grows with data: nested loops over collections, repeated scans or lookups in a loop, sorting or copying inside a loop. Name the complexity at the realistic size.
+- I/O in a loop: N+1 queries or requests, per-item writes where a batch exists, sequential awaits on independent work.
+- Unbounded work: fetching, rendering, or holding a whole collection without pagination or a limit; caches, queues, or retries with no bound.
+- Hot paths: work added to startup, every request, every render, or every keystroke; blocking I/O or heavy computation on the main or UI thread.
+- Data access: queries without a supporting index, over-fetched rows or columns, the same result recomputed where it could be reused, a cache with no invalidation.
+- Size: response, payload, or bundle growth; memory held longer than needed; listeners or timers never cleaned up.
+- When the change has a verification plan, check the code against its perf budgets at the stated data size.
+
+For each finding, name the input size where it starts to hurt and the measurement that would confirm it. Don't flag micro-optimizations on cold paths.
+
 ## Complexity Budget
 
 Is the complexity justified by what the code accomplishes?

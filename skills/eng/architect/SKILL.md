@@ -38,6 +38,8 @@ Screen every candidate against [`references/design-red-flags.md`](references/des
 
 Compare viable candidates on interface depth. Prefer the design that hides more complexity behind a smaller, simpler public surface. A rich interface can keep call chains short by concentrating capability instead of scattering it across layers.
 
+Compare viable candidates on performance too. Pass the verification plan's perf budgets to every runner with the task, and make performance one of arena's rubric criteria: the candidate that meets the budgets at the stated data size with the fewest round trips and the least hot-path work. A candidate that cannot meet a budget loses, unless the user agrees to change the budget.
+
 Arena returns one synthesized design package. Its synthesis decision fills the rationale's "Synthesis decision" section.
 
 ## Phase C: Agree (opt-in)

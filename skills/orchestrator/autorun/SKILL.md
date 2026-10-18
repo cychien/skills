@@ -58,7 +58,7 @@ The same hooks run the `guard` skill's rules when guard is installed beside this
 
 `~/.agents/autorun/config.json` overrides any of these keys: `enter` and `exit` (regexes matched against the user's prompt), `irreversible_commands` and `irreversible_tools` (lists of `[label, regex]`), `stop_idle_limit` (stops in a row without progress before the run becomes a dead-end gate, default 3), `notify` (a shell command run with `$AUTORUN_MESSAGE` when the run needs the user), `review` (false skips the independent reviewer), and `review_command` (a shell command that reads the review prompt on stdin and prints the JSON verdict, replacing the default reviewer). By default the reviewer is the planner role from the `setup-orchestrator` config, preferring a different agent from the one asking. With no reviewer, escalations and permission prompts go to the user and `done` relies on the check alone.
 
-State lives in `~/.agents/autorun/`: one folder per run with `run.json`, `decisions.jsonl`, and `gates/`. Hook failures are logged to `errors.log` and never block the agent. Set `AUTORUN_TRACE=1` in the agent's environment to log every hook decision to `trace.jsonl`.
+State lives in `~/.agents/autorun/`: one folder per run with `run.json`, `decisions.jsonl`, and `gates/`. Hook failures are logged to `errors.log` and never block the agent. Set `AUTORUN_TRACE=1` in the agent's environment to log every hook decision to `trace.jsonl`. A launcher whose children must not join the caller's run, such as a blind experiment, sets `AUTORUN_BOUNDARY_PID` to its own pid: the process search that makes a child a delegate stops there. A delegate cannot replace the root's done condition; `start` refuses it.
 
 ## Output
 
