@@ -453,6 +453,27 @@ class Driver(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("but HEAD is now", out.stdout)
 
+    def test_the_report_accepts_a_regrouped_head_with_the_same_tree(self):
+        d = pathlib.Path(self.tmp.name) / "verification"
+        d.mkdir()
+        (d / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        run = lambda *a: subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
+        run("freeze")
+        (d / "B1-terminal.txt").write_text("[{...}]\n")
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
+        (d / "report.md").write_text(report)
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "Regroup commits")
+        out = run("report")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn(f"Head {head[:9]} has the same tree as HEAD", out.stdout)
+        (self.repo / "app.py").write_text("print('later fix')\n")
+        self.commit("Fix after verification")
+        out = run("report")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("but HEAD is now", out.stdout)
+
     def test_where_names_the_repo_and_branch(self):
         env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
         out = subprocess.run([sys.executable, "-I", str(VERIFY), "where"], cwd=self.repo, capture_output=True, text=True, env=env).stdout

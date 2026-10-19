@@ -16,7 +16,7 @@ usage: verify.py <command> [--dir DIR]
   oracles     every oracle check has its expected value, computed from the spec after the freeze
   compare     every oracle check's observed value matches its expected value
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match
-              the comparison
+              the comparison; the report's Head is HEAD or a commit with HEAD's tree (a regrouped history)
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
               base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
@@ -126,6 +126,13 @@ def git(*args, cwd=None):
     if r.returncode:
         raise Failed(f"git {' '.join(args)} failed: {r.stderr.strip()}")
     return r.stdout.rstrip("\n")
+
+
+def tree_of(rev):
+    try:
+        return git("rev-parse", "--verify", "-q", f"{rev}^{{tree}}")
+    except Failed:
+        return None
 
 
 def verification_dir(override):
@@ -519,9 +526,14 @@ def cmd_report(directory, args):
         current_head = git("rev-parse", "HEAD")
     except Failed:
         current_head = None
+    same_tree = None
     if current_head and reported_head and not (len(reported_head) >= 7 and current_head.startswith(reported_head)):
-        problems.append(f"the report covers Head {reported_head}, but HEAD is now {current_head[:12]}; verify the code that ships, "
-                        "sending the checks the later commits could touch to a fresh verifier")
+        reported_tree = tree_of(reported_head)
+        if reported_tree and reported_tree == tree_of("HEAD"):
+            same_tree = f"Head {reported_head} has the same tree as HEAD {current_head[:12]}"
+        else:
+            problems.append(f"the report covers Head {reported_head}, but HEAD is now {current_head[:12]}; verify the code that ships, "
+                            "sending the checks the later commits could touch to a fresh verifier")
     if header.get("Author", "").strip() and header.get("Author", "").strip() == header.get("Verifier", "").strip():
         problems.append("the Verifier is the Author; a fresh agent must produce the verdicts")
     exploration = re.search(r"^## Exploration\s*\n(.*?)(?=^## |\Z)", report, re.M | re.S)
@@ -562,7 +574,7 @@ def cmd_report(directory, args):
     if problems:
         raise Failed("\n".join(f"{path}: {p}" for p in problems))
     revisions = "".join(f"\n  revision {r['at']}: {r['why']}" for r in lock["revisions"])
-    return f"report ok: {len(ids)} checks have verdicts backed by evidence{revisions}"
+    return f"report ok: {len(ids)} checks have verdicts backed by evidence" + (f"\n  {same_tree}" if same_tree else "") + revisions
 
 
 def cmd_decisions(directory, args):
