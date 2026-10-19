@@ -872,6 +872,12 @@ class RunGroup(unittest.TestCase):
         p.wait()
         self.assertFalse(tree.exists())
 
+    def test_a_spec_in_a_scratch_tree_runs_with_pnpm_deps_check_off(self):
+        tree = self.base / "tree"
+        tree.mkdir()
+        ok, tail = verify.run_spec(tree, 'printf "%s" "$pnpm_config_verify_deps_before_run"', 30)
+        self.assertEqual((ok, tail.strip()), (True, "false"))
+
 
 class Commits(RepoFixture):
     TESTS = f"{shlex.quote(sys.executable)} -m unittest discover -s tests"

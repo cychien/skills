@@ -108,6 +108,8 @@ GLOB_MAGIC = re.compile(r"[*?\[]")
 KILL_WAIT_S = 3.0
 TOP_CPU = 5
 SALVO_GLOBS = ("/tmp/salvo-*", "/private/tmp/salvo-*")
+# A scratch tree borrows the checkout's installed dependencies through symlinks, which pnpm 11's pre-run deps check rejects.
+SCRATCH_ENV = {"pnpm_config_verify_deps_before_run": "false"}
 TEST_SCRIPTS = {"pnpm-lock.yaml": "pnpm test", "yarn.lock": "yarn test", "bun.lock": "bun run test", "bun.lockb": "bun run test"}
 
 
@@ -845,7 +847,7 @@ def scratch_tree(top, rev, specs=(), specs_from=None):
 
 def run_spec(tree, command, timeout):
     try:
-        r = run_in_group(command, timeout, shell=True, cwd=tree)
+        r = run_in_group(command, timeout, shell=True, cwd=tree, env={**os.environ, **SCRATCH_ENV})
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout}s"
     return r.returncode == 0, "\n".join((r.stdout + r.stderr).strip().splitlines()[-3:])
