@@ -362,6 +362,19 @@ class Verify(unittest.TestCase):
         r = subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--dir", str(self.dir), "--", "--instance", "a"], capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_rerun_fails_a_check_that_deletes_or_empties_another_checks_evidence(self):
+        for name, text in (("evidence/B2/shot.png", "png"), ("evidence/B3/log.txt", "log"), ("B1-own.txt", "own"), ("evidence/B1/own.png", "own")):
+            path = self.dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"\nrm -rf "$d/evidence/B2" "$d/B1-own.txt" "$d/evidence/B1"\n: > "$d/evidence/B3/log.txt"\n')
+        self.check_script("B2.check.sh", "exit 0\n")
+        out = self.run_verify("rerun", ok=False)
+        self.assertRegex(out, r"FAIL\s+B1.*deleted or emptied files that are not its own: evidence/B2/shot.png, evidence/B3/log.txt\n")
+        self.assertRegex(out, r"PASS\s+B2")
+        self.assertNotIn("B1-own", out)
+        self.assertNotIn("evidence/B1", out)
+
     def test_decision_log_needs_its_header_and_a_verdict_per_attempt(self):
         header = "id\thypothesis\tchange\tbefore\tafter\tdelta\tgate\tverdict\tnote\n"
         self.write("decision.tsv", header + "1\tbatch queries\tjoin orders\t4.1s\t0.9s\t-78%\tgreen\tkept\t\n")

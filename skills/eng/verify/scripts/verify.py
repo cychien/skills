@@ -28,7 +28,8 @@ usage: verify.py <command> [--dir DIR]
               gets 300 seconds unless --timeout raises it. Exits 0 with a "no saved check scripts" line when there
               are none. A check script runs with zero arguments and provisions and tears down its own instance through
               the project driver (optional ARGS may reuse a running instance); it cleans only its own evidence
-              (evidence/<id>/ or files starting with <id>), never a shared folder; the report cites <id>.rerun.log, not the script. After a run where every
+              (evidence/<id>/ or files starting with <id>), never a shared folder, and a script that deletes or empties
+              another check's file FAILs; the report cites <id>.rerun.log, not the script. After a run where every
               script passes, rerun stamps rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff,
               and a sha256 per check script and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS
               and an unchanged stamp prints one line and exits 0 without running; --force always runs. Any run deletes
@@ -104,6 +105,7 @@ RERUN_TIMEOUT = 300
 RERUN_STAMP = "rerun.stamp.json"
 HELPER_SUFFIXES = {".mjs", ".cjs", ".js", ".ts", ".py", ".sh"}
 EVIDENCE_DIR = "evidence"
+LISTED_LOSSES = 5
 LOAD_RATIO = 0.7
 NATIVE_BUILDS = {
     "xcodebuild": re.compile(r"(?:^|/)xcodebuild(?:\s|$)"),
@@ -630,6 +632,31 @@ def rerun_inputs(directory, scripts, rest):
     return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": files}
 
 
+def file_sizes(directory):
+    sizes = {}
+    for root, dirs, names in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in DEPENDENCY_DIRS]
+        for name in names:
+            path = pathlib.Path(root, name)
+            with contextlib.suppress(OSError):
+                sizes[path.relative_to(directory)] = path.stat().st_size
+    return sizes
+
+
+def owned_by(path, check_id):
+    parts = path.parts
+    if parts[0] == EVIDENCE_DIR and len(parts) > 1:
+        parts = parts[1:]
+    return parts[0].startswith(check_id)
+
+
+def lost_files(before, after, check_id):
+    lost = sorted(str(p) for p, size in before.items() if size and not after.get(p) and not owned_by(p, check_id))
+    if len(lost) > LISTED_LOSSES:
+        lost = [*lost[:LISTED_LOSSES], f"and {len(lost) - LISTED_LOSSES} more"]
+    return lost
+
+
 def cmd_rerun(directory, args):
     scripts = check_scripts(directory)
     if not scripts:
@@ -651,6 +678,7 @@ def cmd_rerun(directory, args):
         check_id = CHECK_SCRIPT.match(path.name).group(1)
         command = script_command(path)
         started = time.time()
+        before = file_sizes(directory)
         if not command:
             verdict, detail = "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}"
         else:
@@ -664,6 +692,10 @@ def cmd_rerun(directory, args):
                     detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
             except subprocess.TimeoutExpired:
                 verdict, detail = "FAIL", f"timed out after {args.timeout}s"
+        lost = lost_files(before, file_sizes(directory), check_id)
+        if lost:
+            verdict = "FAIL"
+            detail = f"deleted or emptied files that are not its own: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
         failed += verdict == "FAIL"
         head, _, rest = detail.partition("\n")
         lines.append(f"{verdict:<5} {check_id}  ({time.time() - started:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
