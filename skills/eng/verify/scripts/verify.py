@@ -3,7 +3,7 @@
 
 usage: verify.py <command> [--dir DIR]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
-       verify.py rerun [--timeout SECONDS] [-- ARGS ...]
+       verify.py rerun [--timeout SECONDS] [--force] [-- ARGS ...]
        verify.py commits [<base>..<head>] [--cmd CMD] [--typecheck CMD] [--timeout SECONDS]
        verify.py leftovers [--kill] [--root DIR ...]
        verify.py capacity [--native]
@@ -26,7 +26,13 @@ usage: verify.py <command> [--dir DIR]
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
               instance id) to each; one PASS or FAIL line per check from its exit code, and a summary. Each script
               gets 300 seconds unless --timeout raises it. Exits 0 with a "no saved check scripts" line when there
-              are none.
+              are none. A check script runs with zero arguments and provisions and tears down its own instance through
+              the project driver (optional ARGS may reuse a running instance); it cleans only its own evidence
+              (evidence/<id>/ or files starting with <id>), never a shared folder; the report cites <id>.rerun.log, not the script. After a run where every
+              script passes, rerun stamps rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff,
+              and a sha256 per check script and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS
+              and an unchanged stamp prints one line and exits 0 without running; --force always runs. Any run deletes
+              the stamp first, so a failed or interrupted run leaves none.
   commits     check every commit in <base>..<head> (default like units), one at a time in a scratch tree: --typecheck
               first when given, then --cmd (default: the project's test script, else pytest or unittest). One PASS or
               FAIL line per commit; a commit that leaves a process running in its tree FAILs and the process is killed.
@@ -95,6 +101,9 @@ NODE_LOCKS = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bunx",
 DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
 SCRIPT_TIMEOUT = 900
 RERUN_TIMEOUT = 300
+RERUN_STAMP = "rerun.stamp.json"
+HELPER_SUFFIXES = {".mjs", ".cjs", ".js", ".ts", ".py", ".sh"}
+EVIDENCE_DIR = "evidence"
 LOAD_RATIO = 0.7
 NATIVE_BUILDS = {
     "xcodebuild": re.compile(r"(?:^|/)xcodebuild(?:\s|$)"),
@@ -608,10 +617,34 @@ def script_command(path):
     return [*runner, str(path)] if runner else None
 
 
+def rerun_inputs(directory, scripts, rest):
+    """What a passing rerun depends on, or None outside a git repository."""
+    tree = tree_of("HEAD")
+    diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True)
+    if not tree or diff.returncode:
+        return None
+    skipped = {EVIDENCE_DIR, *DEPENDENCY_DIRS}
+    helpers = [p for p in directory.rglob("*")
+               if p.is_file() and p.suffix in HELPER_SUFFIXES and not skipped & set(p.relative_to(directory).parts[:-1])]
+    files = {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted({*scripts, *helpers})}
+    return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": files}
+
+
 def cmd_rerun(directory, args):
     scripts = check_scripts(directory)
     if not scripts:
         return f"no saved check scripts (<id>.check.<ext>) in {directory}; nothing to rerun"
+    stamp_path = directory / RERUN_STAMP
+    inputs = rerun_inputs(directory, scripts, args.rest)
+    if inputs and not args.force and stamp_path.exists():
+        try:
+            stamp = json.loads(stamp_path.read_text())
+        except ValueError:
+            stamp = {}
+        if {k: stamp.get(k) for k in inputs} == inputs:
+            return (f"rerun: {len(scripts)} checks passed at {stamp.get('at')} on this tree; "
+                    "nothing changed since (pass --force to run again)")
+    stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
     lines, failed = [], 0
     for path in scripts:
@@ -638,6 +671,9 @@ def cmd_rerun(directory, args):
     lines.append(summary)
     if failed:
         raise Failed("\n" + "\n".join(lines))
+    if inputs:
+        at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        stamp_path.write_text(json.dumps({**inputs, "at": at}, indent=2) + "\n")
     return "\n".join(lines)
 
 
@@ -1026,6 +1062,7 @@ def main():
     parser.add_argument("--typecheck")
     parser.add_argument("--kill", action="store_true")
     parser.add_argument("--native", action="store_true")
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--root", action="append")
     parser.add_argument("--spec", action="append")
     parser.add_argument("--timeout", type=int)

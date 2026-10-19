@@ -484,6 +484,91 @@ class Driver(unittest.TestCase):
         self.assertNotEqual(out.strip(), out2.strip())
 
 
+class RerunStamp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self.tmp.name) / "app"
+        self.repo.mkdir()
+        self.dir = pathlib.Path(self.tmp.name) / "verification"
+        self.dir.mkdir()
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "app.py").write_text("print('app')\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Start the app")
+        self.script("B1.check.sh", 'echo run >> "$(dirname "$0")/runs.txt"\n')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=self.repo, check=True, capture_output=True)
+
+    def script(self, name, body):
+        (self.dir / name).write_text(body)
+
+    def runs(self):
+        return len((self.dir / "runs.txt").read_text().split())
+
+    def rerun(self, *extra, ok=True):
+        r = subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--dir", str(self.dir), *extra], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout
+
+    def test_a_second_rerun_on_the_same_tree_prints_one_line_without_running(self):
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL", self.rerun())
+        out = self.rerun()
+        self.assertRegex(out, r"^rerun: 1 checks passed at \S+ on this tree; nothing changed since \(pass --force to run again\)\n$")
+        self.assertEqual(self.runs(), 1)
+
+    def test_force_runs_again_and_restamps(self):
+        self.rerun()
+        self.assertIn("1 PASS", self.rerun("--force"))
+        self.assertEqual(self.runs(), 2)
+        self.assertIn("nothing changed", self.rerun())
+
+    def test_a_regrouped_commit_with_the_same_tree_keeps_the_stamp(self):
+        self.rerun()
+        self.git("commit", "--allow-empty", "-qm", "Regroup")
+        self.assertIn("nothing changed", self.rerun())
+
+    def test_a_changed_tree_diff_script_helper_or_args_run_again(self):
+        self.rerun()
+        (self.repo / "app.py").write_text("print('edited')\n")
+        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("nothing changed", self.rerun())
+        (self.repo / "app.py").write_text("print('edited again')\n")
+        self.assertIn("1 PASS", self.rerun())
+        self.git("commit", "-qam", "Edit")
+        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("nothing changed", self.rerun())
+        (self.dir / "drive.mjs").write_text("export const a = 1\n")
+        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("nothing changed", self.rerun())
+        (self.dir / "drive.mjs").write_text("export const a = 2\n")
+        self.assertIn("1 PASS", self.rerun())
+        self.script("B1.check.sh", 'echo run >> "$(dirname "$0")/runs.txt"\n# edited\n')
+        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("1 PASS", self.rerun("--", "inst-1"))
+        self.assertIn("nothing changed", self.rerun("--", "inst-1"))
+        self.assertEqual(self.runs(), 8)
+
+    def test_evidence_files_do_not_invalidate_the_stamp(self):
+        self.rerun()
+        (self.dir / "evidence" / "B1").mkdir(parents=True)
+        (self.dir / "evidence" / "B1" / "shot.py").write_text("x\n")
+        (self.dir / "B1.observed.json").write_text("{}")
+        self.assertIn("nothing changed", self.rerun())
+
+    def test_a_failing_run_deletes_the_stamp(self):
+        self.rerun()
+        self.assertTrue((self.dir / "rerun.stamp.json").exists())
+        self.script("B2.check.sh", "exit 1\n")
+        self.rerun(ok=False)
+        self.assertFalse((self.dir / "rerun.stamp.json").exists())
+        (self.dir / "B2.check.sh").unlink()
+        self.assertIn("1 PASS", self.rerun())
+
+
 class RepoFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
