@@ -3,8 +3,8 @@
 
 usage:
   autorun.py hook <agent> <event>        entry point for agent hooks (reads the hook payload on stdin)
-  autorun.py start [--run ID] --done TEXT [--check CMD] [--goal TEXT] [--cwd DIR] [--narrows GATE]
-  autorun.py ask [--run ID] --kind KIND --question TEXT [--option TEXT ...] --pick TEXT --why TEXT --confidence LEVEL [--command TEXT]
+  autorun.py start [--run ID] --done TEXT [--check CMD] [--goal TEXT] [--cwd DIR] [--narrows GATE] [--backlog PATH]
+  autorun.py ask [--run ID] --kind KIND --question TEXT [--option TEXT ...] --pick TEXT --why TEXT --confidence LEVEL [--command TEXT] [--backlog PATH]
   autorun.py done [--run ID] --evidence TEXT
   autorun.py status | report | stop [--run ID]
   autorun.py install [--agent NAME ...] [--print] | uninstall [--agent NAME ...]
@@ -12,6 +12,7 @@ usage:
 import argparse
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import traceback
@@ -122,6 +123,8 @@ def cmd_start(args):
                 d["base"] = store.git_head(cwd)
         if args.goal:
             d["prompt"] = args.goal
+        if args.backlog:
+            d["backlog"] = os.path.realpath(os.path.expanduser(args.backlog))
     print(f"Run {run.id} is active. Done condition: {args.done}" + (f" (verified by: {args.check})" if args.check else ""))
     print(f"Working directory: {cwd}")
     print(f"Decisions log: {run.decisions_path}")
@@ -133,7 +136,8 @@ def segments(check):
 
 def extends(old, new):
     """Whether the replacement keeps everything the current done condition demands and only adds to it."""
-    squash = lambda text: " ".join((text or "").lower().split())
+    def squash(text):
+        return " ".join((text or "").lower().split())
     return squash(old["done"]) in squash(new["done"]) and segments(old.get("check")) <= segments(new.get("check"))
 
 
@@ -188,7 +192,33 @@ def cmd_ask(args):
             return
         if verdict:
             question["review"] = {"model": verdict["model"], "reason": verdict.get("reason")}
+        backlog = args.backlog or run.data().get("backlog")
+        if backlog:
+            defer(run, question, backlog)
+            return
     escalate(run, question)
+
+
+def defer(run, question, backlog):
+    path = pathlib.Path(backlog).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text() if path.exists() else "# Backlog\n"
+    if DEFERRED_SECTION not in text:
+        text = text.rstrip("\n") + f"\n\n{DEFERRED_SECTION}\n"
+    review = question.get("review")
+    fields = [f"- Source: autonomous run {run.id}, {store.now()[:10]}",
+              *([f"- Options: {'; '.join(question['options'])}"] if question.get("options") else []),
+              f"- Taken: {question['pick']}",
+              f"- Why: {question['why']}",
+              *([f"- Reviewer: {review['model']}: {review.get('reason')}"] if review else []),
+              "- Revisit: confirm what was taken, or say what to change; the run did not wait for an answer."]
+    path.write_text(text.rstrip("\n") + f"\n\n### {question['question']}\n\n" + "\n".join(fields) + "\n")
+    run.record_decision({**question, "basis": f"deferred to the backlog at {path}"})
+    print(f"DEFERRED: proceed with: {question['pick']}\nThe question is in the backlog at {path}, so the user can revisit it. "
+          f"{LOGGED.format(path=run.decisions_path)}")
+
+
+DEFERRED_SECTION = "## Deferred by autonomous runs"
 
 
 LOGGED = "Recorded in {path}. List it in your final report; do not stop for it."
@@ -337,6 +367,7 @@ def main():
     p.add_argument("--goal")
     p.add_argument("--cwd")
     p.add_argument("--narrows", metavar="GATE")
+    p.add_argument("--backlog", metavar="PATH")
     p = sub.add_parser("mode")
     p.add_argument("mode", choices=["interactive"])
     p.add_argument("--reason", required=True)
@@ -350,6 +381,7 @@ def main():
     p.add_argument("--why", required=True)
     p.add_argument("--confidence", required=True, choices=["high", "medium", "low"])
     p.add_argument("--command")
+    p.add_argument("--backlog", metavar="PATH")
     p = sub.add_parser("done")
     p.add_argument("--run")
     p.add_argument("--evidence", required=True)

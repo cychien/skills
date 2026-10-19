@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from . import pr, skills, state
+from . import pr, skills, state, verifiers
 
 PASS = ("pass", None)
 DECISION = re.compile(r"guard\.py['\"]?\s+todo\b|autorun\.py['\"]?\s+(start|mode)\b")
@@ -233,10 +233,14 @@ def on_pre_tool(event):
     command = shell_command(event) or ""
     if detached_salvo(command):
         return "deny", SALVO_DETACHED
-    unfilled = unfilled_template(outgoing_prompt(event, command), event.cwd)
+    prompt = outgoing_prompt(event, command)
+    unfilled = unfilled_template(prompt, event.cwd)
     if unfilled:
         return "deny", ("This subagent prompt comes from a skill's prompt template but still holds unfilled placeholders: "
                         + ", ".join(unfilled) + ". Fill each one, then send it again.")
+    spent = verifiers.over_budget(prompt)
+    if spent:
+        return "deny", spent
     if (event.tool or "").lower() in SPAWN_TOOLS:
         swept = sweep_leftovers(event)
         if swept and swept[0] == 1:

@@ -1,12 +1,12 @@
 ---
 name: architect
-description: "Sketch types, signatures, and module structure before code, then stay in the loop while implementation fills in. Use for /architect, 'architect this', 'design this', or non-trivial work where jumping to code would lock in the wrong shape."
+description: "Design the shape of a change before code: types, signatures, and module structure, explored across several models and delivered as a skeleton patch that typechecks, plus its rationale. Use for /architect, 'architect this', 'design this', or non-trivial work where jumping to code would lock in the wrong shape."
 disable-model-invocation: true
 ---
 
 # Architect
 
-Sketch types, function signatures, class shapes, and module boundaries with `not implemented` bodies and pseudocode. Synthesize across multiple model perspectives, then fill in code against the chosen sketch.
+Sketch types, function signatures, class shapes, and module boundaries with `not implemented` bodies and pseudocode. Synthesize across multiple model perspectives and deliver the chosen skeleton. Design only: building against the skeleton belongs to the playbook that called this skill, or to the feature skill.
 
 Paths like `../how/SKILL.md` point to skills installed beside this one, relative to this file's folder.
 
@@ -16,9 +16,7 @@ Open a todolist with one entry per phase before starting.
 
 1. Ground
 2. Sketch
-3. Agree
-4. Implement
-5. Scrap
+3. Deliver
 
 ## Phase A: Ground the problem
 
@@ -44,42 +42,12 @@ Compare viable candidates on performance too. Pass the verification plan's perf 
 
 Arena returns one synthesized design package. Its synthesis decision fills the rationale's "Synthesis decision" section.
 
-## Phase C: Agree (opt-in)
+## Phase C: Deliver
 
-Default: proceed directly to implementation with the synthesized design. No human checkpoint.
+Write the synthesized skeleton as `skeleton.patch`: real files at the paths the code will live in, types and signatures in full, bodies `not implemented` with pseudocode for the tricky logic. Apply it to a scratch worktree of current main and run the project's typecheck, and fix the skeleton until it passes, because a skeleton that does not compile hides a wrong signature until someone builds against it. Write the rationale beside it, shaped per `references/rationale-template.md`. Save both where the caller names, or in the project's design docs folder when called directly, and present them: the skeleton is the contract the implementation is built and checked against.
 
-Opt in to a checkpoint when the invoker explicitly asks: "/architect with checkpoint," "stop and show me before implementing," or similar. Then surface the synthesized design and pause for sign-off.
-
-The synthesis can ship as its own commit either way, as the "scaffold first" mode of the Foundational Thinking principle (`../principles/references/principles/foundational-thinking.md`). Planned and scoped breakage during fill-in is fine, per the Outcome-Oriented Execution principle (`../principles/references/principles/outcome-oriented-execution.md`). For adversarial pressure on the design before implementing, run the **interrogate** skill (`../interrogate/SKILL.md`) on the synthesized sketch.
-
-If the human pushes back on the shape (in a checkpoint or after the fact), treat that as Phase A evidence. Re-ground and re-run Phase B before writing more code.
-
-## Phase D: Implement against the sketch
-
-Replace `not implemented` bodies with code, pseudocode with logic. The synthesized sketch is the contract. Deviations from it are signal to surface, not friction to absorb silently. If a function needs a parameter the sketch didn't anticipate, ask whether the sketch was wrong, the requirement was missed, or the implementation is overreaching.
-
-## Phase E: Scrap when the architecture is wrong
-
-If implementation keeps producing friction the sketch can't absorb, throw the sketch out. Don't bolt fixes onto a wrong design, per the **redesign-from-first-principles** and **fix-root-causes** principle skills.
-
-The signal is a *pattern*, not single instances. Tells:
-
-- The same shape of workaround appearing repeatedly across unrelated code.
-- Multiple unrelated edge cases that all need special-case branches.
-- Types that need escape hatches (`any`, casts, optional fields always set in practice) to compile.
-- The "we need a lock" reflex when the sketch said the state wasn't shared.
-- Callers having to know the abstraction's internal rules to use it.
-- Two or more independent Phase D deviations of the same shape across the implementation.
-
-Use judgment. A few edge cases don't condemn an architecture. Some problems are legitimately complex. Complexity in the data is not complexity in the design.
-
-When you scrap:
-
-1. Re-run the **how** skill (`../how/SKILL.md`) over what's been built.
-2. Redesign as if the new constraints had been day-one assumptions, per redesign-from-first-principles.
-3. Subtract before adding, per the Subtract Before You Add principle (`../principles/references/principles/subtract-before-you-add.md`). The new sketch should be smaller than the old one before it grows.
-4. Return to Phase B and re-run arena.
+If the human pushes back on the shape, treat that as Phase A evidence. Re-ground and re-run Phase B.
 
 ## Outputs
 
-The caller's usage is written first and the type sketch derived from it. One file with new types and signatures for small changes. Module map plus type definitions for larger work. The rationale ships alongside, shaped per `references/rationale-template.md`, including the usage sketch and the synthesis decision.
+`skeleton.patch`, which typechecks against main, and the rationale beside it, including the caller's usage sketch and the synthesis decision.

@@ -317,19 +317,52 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": quoted}}))
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "grep -n 'salvo.py run' notes.md &"}}))
 
+    def verifier(self, evidence, checks):
+        prompt = f"You are verifying a change you did not write.\nEvidence directory: {evidence}\nChecks: {checks}\n"
+        out = self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": prompt}})
+        return out["hookSpecificOutput"]["permissionDecisionReason"] if out else None
+
+    def test_each_check_gets_a_full_round_and_one_fix_wave_verifier(self):
+        evidence = pathlib.Path(self.tmp.name) / "verification"
+        self.assertIsNone(self.verifier(evidence, "C1 C2"))
+        (evidence / "C1.png").write_text("x")
+        (evidence / "C2.txt").write_text("x")
+        self.assertIsNone(self.verifier(evidence, "C1"))
+        time.sleep(0.01)
+        (evidence / "C1-retry.png").write_text("x")
+        self.assertIn("Checks C1 already had", self.verifier(evidence, "C1 C2"))
+        self.assertIsNone(self.verifier(evidence, "C2"))
+
+    def test_a_verifier_that_left_no_evidence_does_not_spend_the_budget(self):
+        evidence = pathlib.Path(self.tmp.name) / "verification"
+        self.assertIsNone(self.verifier(evidence, "C1"))
+        self.assertIsNone(self.verifier(evidence, "C1"))
+        (evidence / "C1.png").write_text("x")
+        self.assertIsNone(self.verifier(evidence, "C1"))
+        time.sleep(0.01)
+        (evidence / "evidence" / "C1").mkdir(parents=True)
+        (evidence / "evidence" / "C1" / "shot.png").write_text("x")
+        self.assertIn("already had", self.verifier(evidence, "C1"))
+
+    def test_a_verifier_prompt_must_name_its_checks(self):
+        self.assertIn("no 'Checks:' line", self.verifier(pathlib.Path(self.tmp.name), ""))
+
     def test_a_prompt_template_with_unfilled_placeholders_is_denied(self):
         self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
         refs = self.skills / "verify" / "references"
         refs.mkdir()
         (refs / "verifier-prompt.md").write_text(
             "# Verifier prompt\n\n```\nYou are verifying a change you did not write.\n"
-            "Head: <head SHA>\nFull round: <yes or no>.\nWrite <id>.observed.json.\n```\n")
-        raw = "You are verifying a change you did not write.\nHead: <head SHA>\nFull round: <yes or no>.\nWrite <id>.observed.json."
+            "Head: <head SHA>\nEvidence directory: <verification directory path>\nChecks: <check ids>\n"
+            "Full round: <yes or no>.\nWrite <id>.observed.json.\n```\n")
+        raw = ("You are verifying a change you did not write.\nHead: <head SHA>\nEvidence directory: <verification directory path>\n"
+               "Checks: <check ids>\nFull round: <yes or no>.\nWrite <id>.observed.json.")
         out = self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": raw}})["hookSpecificOutput"]
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn("<head SHA>", out["permissionDecisionReason"])
         self.assertIn("<yes or no>", out["permissionDecisionReason"])
-        filled = raw.replace("<head SHA>", "abc123").replace("<yes or no>", "yes")
+        filled = (raw.replace("<head SHA>", "abc123").replace("<yes or no>", "yes").replace("<check ids>", "C1")
+                  .replace("<verification directory path>", str(pathlib.Path(self.tmp.name) / "verification")))
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": filled}}))
         task = pathlib.Path(self.tmp.name) / "task.md"
         task.write_text(raw)
@@ -352,6 +385,13 @@ class Guard(unittest.TestCase):
         out = self.todo("done", "1", "--not-run", "alpha", "--not-run", "beta", "--reason", "single module, no premise to test")
         self.assertIn("not run: alpha, beta - single module, no premise to test", out)
         self.assertIn("not run: alpha, beta", self.todo("list"))
+
+    def test_not_run_accepts_the_skill_path_the_refusal_prints(self):
+        self.write_skill("alpha", "---\nname: alpha\ndescription: x\n---\n")
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Run alpha (`../alpha/SKILL.md`) when it spans modules.\n")
+        self.todo("from", "flow")
+        out = self.todo("done", "1", "--not-run", "../alpha/SKILL.md", "--reason", "single module")
+        self.assertIn("not run: alpha - single module", out)
 
     def test_an_item_naming_a_skill_needs_it_read_and_the_reply_skill_is_enforced(self):
         self.write_skill("reply", "---\nname: reply\ndescription: x\n---\n\n# Writing the reply\n")
@@ -535,6 +575,30 @@ class Guard(unittest.TestCase):
         self.assertEqual(out["decision"], "block")
         self.assertIn("em dash", out["reason"])
         self.assertIn("done condition", out["reason"])
+
+
+class ShippedPlaybooks(unittest.TestCase):
+    """The verification floor of each feature tier is held by gates on steps guard will not let be skipped."""
+
+    def gated_mandatory_steps(self, skill):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import gates, skills
+        path = ROOT / "skills" / "eng" / skill / "SKILL.md"
+        return {n: {" ".join(args) for _, _, args in gates.named(text)} for n, _, text, mandatory in skills.steps(path) if mandatory}
+
+    def test_quick_feature_freezes_the_plan_before_code_delegates_and_cannot_skip_verification(self):
+        mandatory = self.gated_mandatory_steps("quick-feature")
+        self.assertEqual(mandatory, {1: {"plan", "lock"}, 3: {"driver"}, 4: {"rerun"}, 6: {"report", "rerun", "leftovers"}})
+
+    def test_feature_locks_the_plan_before_code_and_keeps_its_driver_build_and_verify_gates(self):
+        mandatory = self.gated_mandatory_steps("feature")
+        self.assertEqual(mandatory, {1: {"plan"}, 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units", "rerun"},
+                                     9: {"report", "rerun", "leftovers"}})
+
+    def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
+        mandatory = self.gated_mandatory_steps("plan-feature")
+        self.assertEqual(mandatory, {2: set(), 6: {"phases"}})
 
 
 if __name__ == "__main__":

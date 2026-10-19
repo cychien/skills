@@ -5,6 +5,11 @@ import re
 import subprocess
 
 SKILL_REF = re.compile(r"\.\./([a-z0-9][a-z0-9-]*)/SKILL\.md")
+
+
+def skill_name(ref):
+    match = SKILL_REF.fullmatch(ref)
+    return match.group(1) if match else ref
 STEP = re.compile(r"^(\d+)\. (.+)$")
 STEP_HEADING = re.compile(r"^(?:(?:Step|Phase|Pass)\s+)?(?:\d+|[A-Z])[.,:)]\s*(.+)$")
 
@@ -23,7 +28,8 @@ def followed(path, cwd):
     working tree. A skill's own source inside the working tree is being authored, not followed."""
     base = os.path.abspath(cwd or ".")
     target = os.path.abspath(os.path.join(base, os.path.expanduser(path)))
-    under = lambda t, root: os.path.commonpath([t, root]) == root
+    def under(t, root):
+        return os.path.commonpath([t, root]) == root
     if any(under(target, os.path.abspath(root)) for root in roots(cwd)):
         return True
     return not under(os.path.realpath(target), os.path.realpath(worktree(base)))

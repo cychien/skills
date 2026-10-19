@@ -11,14 +11,16 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [eng-do](./skills/eng/eng-do/) - the engineering switchboard: routes engineering work to its playbook
 - [principles](./skills/eng/principles/) - the engineering principles playbooks read before they design or build
 - [code-comments](./skills/eng/code-comments/) - how code is commented in every file a playbook produces
-- [feature](./skills/eng/feature/) - build new or changed behavior: clarify the spec, ground, design, delegate, verify, open a PR
+- [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements, design, phases, and every phase's verification plan before any code
+- [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground, design, lock the plan before code, delegate, verify once, open a PR; builds a plan-feature plan phase by phase as stacked PRs
+- [quick-feature](./skills/eng/quick-feature/) - build a small feature in one PR with the same verification floor: plan locked before code, fresh verifier, oracle, fail-first specs
 - [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, verify, land the failing repro before the fix
 - [perf-issue](./skills/eng/perf-issue/) - fix a slowness against a vetted baseline, cheapest performance mantra first
 - [hillclimb](./skills/eng/hillclimb/) - improve one metric against a target: frozen harness, keep or revert, decision log
 - [open-pr](./skills/eng/open-pr/) - open PRs as small ordered commits with a one-minute description
 - [how](./skills/eng/how/) - explain how a subsystem works
 - [why](./skills/eng/why/) - find the rationale behind code from history, tickets, docs, and chat
-- [architect](./skills/eng/architect/) - sketch types and module structure across several models before writing code
+- [architect](./skills/eng/architect/) - design types and module structure across several models and deliver a skeleton patch that typechecks
 - [prototype](./skills/eng/prototype/) - settle a design or behavioral decision with throwaway variants observed on the real surface
 - [interrogate](./skills/eng/interrogate/) - adversarial review of changes by several models
 - [verify](./skills/eng/verify/) - prove a change works: a plan of checkable predicates, an independent verifier on the real surface, an evidence audit

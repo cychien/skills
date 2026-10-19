@@ -3,7 +3,10 @@
 
 usage: verify.py <command> [--dir DIR]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
-       verify.py rerun [--timeout SECONDS] [--force] [-- ARGS ...]
+       verify.py rerun [--only ID ...] [--timeout SECONDS] [--force] [-- ARGS ...]
+       verify.py carry <branch or directory>
+       verify.py phases [<plan folder>]
+       verify.py adopt <phase folder>
        verify.py commits [<base>..<head>] [--cmd CMD] [--typecheck CMD] [--timeout SECONDS]
        verify.py leftovers [--kill] [--root DIR ...]
        verify.py capacity [--native]
@@ -13,6 +16,12 @@ usage: verify.py <command> [--dir DIR]
   driver      a project verification skill is on main, or was committed before any product change
   freeze      record the plan's hash before a verifier runs; --revision "<why; agreed by>"
               records a deliberate change to an already frozen plan
+  lock        freeze the plan before any code exists: refuses while the working tree changes product files since the
+              base (the commit `adopt` recorded, else the merge-base with main), leaving the project's verification
+              skill and the adopted plan folder aside. Once locked, passes while the plan is unchanged or every change
+              is a recorded revision, and fails for a plan first frozen after code existed.
+  adopt       copy a phase's plan.md from a feature plan folder into this branch's verification directory and record
+              HEAD as the phase's base, so `lock` measures code from where the phase starts.
   oracles     every oracle check has its expected value, computed from the spec after the freeze
   compare     every oracle check's observed value matches its expected value
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match
@@ -33,7 +42,21 @@ usage: verify.py <command> [--dir DIR]
               script passes, rerun stamps rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff,
               and a sha256 per check script and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS
               and an unchanged stamp prints one line and exits 0 without running; --force always runs. Any run deletes
-              the stamp first, so a failed or interrupted run leaves none.
+              the stamp first, so a failed or interrupted run leaves none. --only ID (repeatable) runs just those checks,
+              for a fix executor proving its own checks; it neither reads nor writes the stamp, so the full rerun still
+              decides the gate. A check script finds the repository from its working directory, never a hard-coded
+              worktree path, so a later phase can carry it.
+  carry       copy the saved check scripts and their helpers from an earlier phase's verification directory (a branch
+              name, resolved beside this one, or a path) into this one, so rerun regrades that phase's checks without an
+              agent. Evidence, plans, reports, and logs stay behind, and so do the scripts of the source plan's perf checks,
+              because perf is measured where its path changes. A file that already exists here is kept, and named when it
+              differs. Refuses, copying nothing, when a script names another worktree of this repo, because it would
+              drive that worktree's code instead of this one's.
+  phases      every phase of a feature plan has a sound verification plan: <plan folder>/phases/<phase>/plan.md for
+              each phase, each passing the plan rules, check ids unique across the whole feature (carried scripts keep
+              their ids), and, when <plan folder>/skeleton.patch exists, every phase holding a conformance check with a
+              Skeleton field naming the skeleton files and symbols it implements. Given a plan folder, it records it in
+              this branch's verification directory, so the bare command (a gate) checks the same folder later.
   commits     check every commit in <base>..<head> (default like units), one at a time in a scratch tree: --typecheck
               first when given, then --cmd (default: the project's test script, else pytest or unittest). One PASS or
               FAIL line per commit; a commit that leaves a process running in its tree FAILs and the process is killed.
@@ -119,6 +142,7 @@ GLOB_MAGIC = re.compile(r"[*?\[]")
 KILL_WAIT_S = 3.0
 TOP_CPU = 5
 SALVO_GLOBS = ("/tmp/salvo-*", "/private/tmp/salvo-*")
+ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/[^\s'\"`;,()<>|&]+")
 # A scratch tree borrows the checkout's installed dependencies through symlinks, which pnpm 11's pre-run deps check rejects.
 SCRATCH_ENV = {"pnpm_config_verify_deps_before_run": "false"}
 TEST_SCRIPTS = {"pnpm-lock.yaml": "pnpm test", "yarn.lock": "yarn test", "bun.lock": "bun run test", "bun.lockb": "bun run test"}
@@ -361,6 +385,56 @@ def cmd_freeze(directory, args):
     lock["sha"] = sha(text)
     lock_path.write_text(json.dumps(lock, indent=2) + "\n")
     return f"revision recorded: {args.revision.strip()}"
+
+
+BASE_RECORD = "base.json"
+
+
+def cmd_adopt(directory, args):
+    if len(args.rest) != 1:
+        raise Failed("adopt takes one <phase folder> from the feature plan")
+    folder = pathlib.Path(args.rest[0]).expanduser().resolve()
+    text = read(folder / "plan.md", "phase plan")
+    problems, ids, _ = lint_plan(text)
+    if problems:
+        raise Failed("\n".join(f"{folder / 'plan.md'}:{p}" for p in problems))
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "plan.md"
+    if target.exists() and target.read_text() != text:
+        raise Failed(f"{target} already holds a different plan; this branch adopted another phase or edited it")
+    target.write_text(text)
+    head = git("rev-parse", "HEAD")
+    (directory / BASE_RECORD).write_text(json.dumps({"base": head, "plan": str(folder.parent.parent)}, indent=2) + "\n")
+    return f"adopted {folder.name}: {len(ids)} checks, base {head[:12]}"
+
+
+def product_changes(base, skip):
+    top = pathlib.Path(git("rev-parse", "--show-toplevel"))
+    names = set(git("diff", "--name-only", base).splitlines()) | set(git("ls-files", "--others", "--exclude-standard").splitlines())
+    skipped = [str(pathlib.Path(s).resolve().relative_to(top.resolve())) for s in skip if under(str(pathlib.Path(s).resolve()), str(top.resolve()))]
+    return sorted(n for n in names if n and not n.startswith(DRIVER_DIRS) and not any(n == d or n.startswith(d + "/") for d in skipped))
+
+
+def cmd_lock(directory, args):
+    _, text, _, _ = load_plan(directory)
+    lock_path = directory / "plan.lock"
+    if lock_path.exists():
+        if not json.loads(lock_path.read_text()).get("before_code"):
+            raise Failed("the plan was frozen after code existed, so it cannot show it was written first. "
+                         "Write the plan before the code on the next change.")
+        frozen_lock(directory, text)
+        return "plan locked before code, unchanged since or changed only by recorded revisions"
+    record = json.loads((directory / BASE_RECORD).read_text()) if (directory / BASE_RECORD).is_file() else {}
+    base = record.get("base") or git("merge-base", default_branch(), "HEAD")
+    changed = product_changes(base, [record["plan"]] if record.get("plan") else [])
+    if changed:
+        shown = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
+        raise Failed(f"product files already changed since {base[:12]}: {shown}. Lock the plan before any code: "
+                     "stash or move the change aside, lock, then bring it back.")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    lock_path.write_text(json.dumps({"sha": sha(text), "frozen_at": now, "frozen_ts": time.time(), "revisions": [],
+                                     "before_code": True, "base": base}, indent=2) + "\n")
+    return f"plan locked before code at {now}, base {base[:12]}"
 
 
 def frozen_lock(directory, text):
@@ -619,16 +693,19 @@ def script_command(path):
     return [*runner, str(path)] if runner else None
 
 
+def helper_files(directory):
+    skipped = {EVIDENCE_DIR, *DEPENDENCY_DIRS}
+    return [p for p in directory.rglob("*")
+            if p.is_file() and p.suffix in HELPER_SUFFIXES and not skipped & set(p.relative_to(directory).parts[:-1])]
+
+
 def rerun_inputs(directory, scripts, rest):
     """What a passing rerun depends on, or None outside a git repository."""
     tree = tree_of("HEAD")
     diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True)
     if not tree or diff.returncode:
         return None
-    skipped = {EVIDENCE_DIR, *DEPENDENCY_DIRS}
-    helpers = [p for p in directory.rglob("*")
-               if p.is_file() and p.suffix in HELPER_SUFFIXES and not skipped & set(p.relative_to(directory).parts[:-1])]
-    files = {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted({*scripts, *helpers})}
+    files = {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted({*scripts, *helper_files(directory)})}
     return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": files}
 
 
@@ -657,12 +734,26 @@ def lost_files(before, after, check_id):
     return lost
 
 
+def script_id(path):
+    return CHECK_SCRIPT.match(path.name).group(1)
+
+
+def only_scripts(scripts, wanted):
+    by_id = {script_id(p): p for p in scripts}
+    unknown = [i for i in wanted if i not in by_id]
+    if unknown:
+        raise Failed(f"no saved check script for {', '.join(unknown)}; saved: {', '.join(sorted(by_id)) or 'none'}")
+    return [by_id[i] for i in dict.fromkeys(wanted)]
+
+
 def cmd_rerun(directory, args):
     scripts = check_scripts(directory)
+    if args.only:
+        scripts = only_scripts(scripts, args.only)
     if not scripts:
         return f"no saved check scripts (<id>.check.<ext>) in {directory}; nothing to rerun"
     stamp_path = directory / RERUN_STAMP
-    inputs = rerun_inputs(directory, scripts, args.rest)
+    inputs = None if args.only else rerun_inputs(directory, scripts, args.rest)
     if inputs and not args.force and stamp_path.exists():
         try:
             stamp = json.loads(stamp_path.read_text())
@@ -671,11 +762,12 @@ def cmd_rerun(directory, args):
         if {k: stamp.get(k) for k in inputs} == inputs:
             return (f"rerun: {len(scripts)} checks passed at {stamp.get('at')} on this tree; "
                     "nothing changed since (pass --force to run again)")
-    stamp_path.unlink(missing_ok=True)
+    if not args.only:
+        stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
     lines, failed = [], 0
     for path in scripts:
-        check_id = CHECK_SCRIPT.match(path.name).group(1)
+        check_id = script_id(path)
         command = script_command(path)
         started = time.time()
         before = file_sizes(directory)
@@ -700,12 +792,144 @@ def cmd_rerun(directory, args):
         head, _, rest = detail.partition("\n")
         lines.append(f"{verdict:<5} {check_id}  ({time.time() - started:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
     summary = f"rerun: {len(scripts)} checks, {len(scripts) - failed} PASS, {failed} FAIL"
-    lines.append(summary)
+    lines.append(summary + (" (--only: no stamp; the full rerun decides the gate)" if args.only else ""))
     if failed:
         raise Failed("\n" + "\n".join(lines))
     if inputs:
         at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         stamp_path.write_text(json.dumps({**inputs, "at": at}, indent=2) + "\n")
+    return "\n".join(lines)
+
+
+def source_directory(directory, ref):
+    path = pathlib.Path(ref).expanduser()
+    source = path if path.is_dir() else directory.parent / ref.replace("/", "-")
+    if not source.is_dir():
+        raise Failed(f"no verification directory for {ref!r}: not a directory, and {source} does not exist")
+    if source.resolve() == directory.resolve():
+        raise Failed(f"{ref!r} is this branch's own verification directory; carry from the phase before it")
+    return source
+
+
+def perf_ids(directory):
+    path = directory / "plan.md"
+    if not path.is_file():
+        return set()
+    _, perf = entries(sections(path.read_text().splitlines()).get("Perf", []))
+    return {check_id for entry in perf if (check_id := entry_id(entry))}
+
+
+def named_paths(text):
+    """Every absolute path a script names, resolved, so /tmp and /private/tmp spell one place."""
+    return {os.path.realpath(token) for token in ABSOLUTE_PATH.findall(text)}
+
+
+def under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def foreign_worktrees(paths, worktrees, current):
+    """Other worktrees among these paths; a path belongs to the deepest worktree it sits under."""
+    found = set()
+    for path in paths:
+        owners = [w for w in worktrees if under(path, w)]
+        if owners and (owner := max(owners, key=len)) != current:
+            found.add(owner)
+    return sorted(found)
+
+
+PHASES_POINTER = "phases.json"
+
+
+def phase_root(directory, args):
+    pointer = directory / PHASES_POINTER
+    if args.rest:
+        root = pathlib.Path(args.rest[0]).expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(json.dumps({"root": str(root)}, indent=2) + "\n")
+        return root
+    if not pointer.is_file():
+        raise Failed("no feature plan recorded for this branch. Run `verify.py phases <plan folder>` once.")
+    return pathlib.Path(json.loads(pointer.read_text())["root"])
+
+
+def cmd_phases(directory, args):
+    if len(args.rest) > 1:
+        raise Failed("phases takes at most one <plan folder>")
+    root = phase_root(directory, args)
+    phases = sorted(p for p in (root / "phases").glob("*/") if p.is_dir()) if (root / "phases").is_dir() else []
+    if not phases:
+        raise Failed(f"no phases under {root / 'phases'}: write one folder per phase, each with its plan.md")
+    skeleton = (root / "skeleton.patch").is_file()
+    problems, owner, total = [], {}, 0
+    for phase in phases:
+        path = phase / "plan.md"
+        if not path.is_file():
+            problems.append(f"{path}: missing")
+            continue
+        text = path.read_text()
+        found, ids, _ = lint_plan(text)
+        problems += [f"{path}:{p}" for p in found]
+        for check_id in ids:
+            if check_id in owner:
+                problems.append(f"{path}: id {check_id!r} is also used in {owner[check_id]}; number checks across the feature")
+            owner.setdefault(check_id, phase.name)
+        total += len(ids)
+        if skeleton and not conformance_checks(text):
+            problems.append(f"{path}: no conformance check; add one whose '- Skeleton:' names the skeleton files and symbols "
+                            "this phase implements")
+    if problems:
+        raise Failed("\n".join(problems))
+    return f"phases ok: {len(phases)} phases, {total} checks" + (", each with a skeleton conformance check" if skeleton else "")
+
+
+def conformance_checks(text):
+    found = sections(text.splitlines())
+    _, checks = entries(found.get("Checks", []))
+    return [c for c in checks if (field := c["fields"].get("Skeleton")) and field[1] and not PLACEHOLDER.search(field[1])]
+
+
+def cmd_carry(directory, args):
+    if len(args.rest) != 1:
+        raise Failed("carry takes one <branch or directory>: the earlier phase's")
+    source = source_directory(directory, args.rest[0])
+    perf = perf_ids(source)
+    scripts = [p for p in check_scripts(source) if script_id(p) not in perf]
+    left = sorted(script_id(p) for p in check_scripts(source) if script_id(p) in perf)
+    helpers = [p for p in helper_files(source) if not (p.parent == source and CHECK_SCRIPT.match(p.name))]
+    files = sorted({*scripts, *helpers})
+    if not files:
+        raise Failed(f"no saved check scripts or helpers in {source}")
+    try:
+        current = os.path.realpath(git("rev-parse", "--show-toplevel"))
+    except Failed:
+        current = None
+    worktrees = {os.path.realpath(w) for w in worktree_paths()} if current else set()
+    problems = []
+    for path in files:
+        paths, name = named_paths(path.read_text(errors="replace")), path.relative_to(source)
+        problems += [f"{name} names {w}, another worktree; make it find the repository from its working directory "
+                     "(git rev-parse --show-toplevel)" for w in foreign_worktrees(paths, worktrees, current)]
+        if any(under(n, os.path.realpath(source)) for n in paths):
+            problems.append(f"{name} names {source}, the earlier phase's verification directory; make it write to $VERIFY_DIR "
+                            "or its own folder")
+    if problems:
+        raise Failed("carried nothing:\n" + "\n".join(problems))
+    copied, kept = [], []
+    for path in files:
+        target = directory / path.relative_to(source)
+        if target.exists():
+            if target.read_bytes() != path.read_bytes():
+                kept.append(str(path.relative_to(source)))
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        copied.append(path)
+    ids = sorted(script_id(p) for p in copied if p in scripts)
+    lines = [f"carry: {len(ids)} check scripts and {len(copied) - len(ids)} helpers from {source}" + (f": {' '.join(ids)}" if ids else "")]
+    if left:
+        lines.append(f"left behind perf checks {' '.join(left)}: perf is measured where its path changes")
+    lines += [f"kept this directory's {name}, which differs from the source's" for name in kept]
     return "\n".join(lines)
 
 
@@ -894,7 +1118,7 @@ def cmd_leftovers(directory, args):
         script = shlex.quote(str(pathlib.Path(__file__).resolve()))
         raise Failed("\n" + "\n".join(describe(p) for p in found)
                      + f"\n{len(found)} still running. Stop them with: python3 {script} leftovers --kill")
-    lines = [f"leftovers: " + (f"killed {killed}, " if killed else "") + "none remain"]
+    lines = ["leftovers: " + (f"killed {killed}, " if killed else "") + "none remain"]
     return "\n".join([*lines, load_report()]).strip()
 
 
@@ -1080,8 +1304,8 @@ def indent(text):
 
 
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
-            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun,
-            "commits": cmd_commits, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
+            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "carry": cmd_carry,
+            "commits": cmd_commits, "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
 
 
 def main():
@@ -1097,10 +1321,11 @@ def main():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--root", action="append")
     parser.add_argument("--spec", action="append")
+    parser.add_argument("--only", action="append")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("rest", nargs="*")
     args = parser.parse_args()
-    if args.rest and args.command not in ("units", "rerun", "commits"):
+    if args.rest and args.command not in ("units", "rerun", "commits", "carry", "phases", "adopt"):
         parser.error(f"{args.command} takes no arguments")
     args.timeout = args.timeout or (RERUN_TIMEOUT if args.command == "rerun" else SCRIPT_TIMEOUT)
     try:

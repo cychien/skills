@@ -140,7 +140,7 @@ def main():
         else:
             status = {"done": "done", "skip": "skipped", "wait": "waiting"}[args.action]
             note = args.note if args.action == "done" else args.reason
-            not_run = args.not_run if args.action == "done" else []
+            not_run = [skills.skill_name(s) for s in args.not_run] if args.action == "done" else []
             if args.action == "done" and not_run:
                 if not args.reason:
                     sys.exit("guard: --not-run needs --reason, the user reads why the skill did not run.")

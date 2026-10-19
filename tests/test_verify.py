@@ -453,7 +453,8 @@ class Driver(unittest.TestCase):
         d.mkdir()
         (d / "plan.md").write_text(plan(CHECKS, PERF_NA))
         env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
-        run = lambda *a: subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
+        def run(*a):
+            return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
         run("freeze")
         (d / "B1-terminal.txt").write_text("[{...}]\n")
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
@@ -471,7 +472,8 @@ class Driver(unittest.TestCase):
         d.mkdir()
         (d / "plan.md").write_text(plan(CHECKS, PERF_NA))
         env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
-        run = lambda *a: subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
+        def run(*a):
+            return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
         run("freeze")
         (d / "B1-terminal.txt").write_text("[{...}]\n")
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
@@ -581,6 +583,181 @@ class RerunStamp(unittest.TestCase):
         (self.dir / "B2.check.sh").unlink()
         self.assertIn("1 PASS", self.rerun())
 
+    def test_only_runs_the_named_checks_and_leaves_the_stamp_alone(self):
+        self.script("B2.check.sh", 'echo two >> "$(dirname "$0")/runs2.txt"\n')
+        self.rerun()
+        stamp = (self.dir / "rerun.stamp.json").read_text()
+        out = self.rerun("--only", "B2", "--only", "B2")
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the full rerun decides the gate)", out)
+        self.assertNotIn("B1", out)
+        self.assertEqual(self.runs(), 1)
+        self.assertEqual(len((self.dir / "runs2.txt").read_text().split()), 2)
+        self.assertEqual((self.dir / "rerun.stamp.json").read_text(), stamp)
+        self.assertIn("nothing changed", self.rerun())
+
+    def test_only_names_a_check_without_a_script(self):
+        out = self.rerun("--only", "B9", ok=False)
+        self.assertIn("no saved check script for B9; saved: B1", out)
+        self.assertFalse((self.dir / "runs.txt").exists())
+
+
+class Phases(unittest.TestCase):
+    CONFORMANCE = """
+    ### K1. Phase 1 follows the skeleton
+
+    - Scenario: the public types and signatures phase 1 implements
+    - Surface: the source at head
+    - Evidence: K1-signatures.diff
+    - Pass: the diff against skeleton.patch is empty, or each difference is in the design addendum with the user's agreement
+    - Oracle: n/a: compares signatures, no value is computed
+    - Skeleton: src/export.ts: exportJson, ExportOptions
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.tmp.name)
+        self.dir = self.base / "verification"
+        self.root = self.base / "docs" / "export"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def phases(self, *extra, ok=True):
+        env = {**os.environ, "VERIFY_HOME": str(self.base / "home")}
+        args = [sys.executable, "-I", str(VERIFY), "phases", *extra, "--dir", str(self.dir)]
+        r = subprocess.run(args, capture_output=True, text=True, cwd=self.base, env=env)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout
+
+    def write_phase(self, name, text):
+        folder = self.root / "phases" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "plan.md").write_text(text)
+
+    def test_records_the_plan_folder_so_the_bare_gate_checks_every_phase(self):
+        self.write_phase("01-json", plan(CHECKS, PERF_NA))
+        self.write_phase("02-csv", plan(CHECKS.replace("B1", "B2"), PERF_NA))
+        self.assertIn("phases ok: 2 phases, 2 checks", self.phases(str(self.root)))
+        self.assertIn("phases ok: 2 phases", self.phases())
+
+    def test_the_bare_gate_asks_for_the_plan_folder_first(self):
+        self.assertIn("verify.py phases <plan folder>", self.phases(ok=False))
+
+    def test_refuses_a_folder_without_phases_or_a_phase_without_a_plan(self):
+        self.root.mkdir(parents=True)
+        self.assertIn("no phases", self.phases(str(self.root), ok=False))
+        (self.root / "phases" / "01-json").mkdir(parents=True)
+        self.assertIn("01-json/plan.md: missing", self.phases(ok=False))
+
+    def test_refuses_a_phase_plan_that_breaks_the_plan_rules(self):
+        self.write_phase("01-json", plan(CHECKS))
+        self.assertIn("missing '## Perf' section", self.phases(str(self.root), ok=False))
+
+    def test_refuses_a_check_id_reused_by_another_phase(self):
+        self.write_phase("01-json", plan(CHECKS, PERF_NA))
+        self.write_phase("02-csv", plan(CHECKS, PERF_NA))
+        self.assertIn("id 'B1' is also used in 01-json", self.phases(str(self.root), ok=False))
+
+    def test_with_a_skeleton_every_phase_needs_a_conformance_check(self):
+        self.write_phase("01-json", plan(CHECKS, PERF_NA))
+        (self.root / "skeleton.patch").write_text("diff --git a/src/export.ts b/src/export.ts\n")
+        self.assertIn("no conformance check", self.phases(str(self.root), ok=False))
+        self.write_phase("01-json", plan(CHECKS, self.CONFORMANCE, PERF_NA))
+        self.assertIn("each with a skeleton conformance check", self.phases())
+
+    def test_a_skeleton_field_still_holding_the_placeholder_does_not_count(self):
+        (self.root / "phases").mkdir(parents=True)
+        (self.root / "skeleton.patch").write_text("diff\n")
+        placeholder = self.CONFORMANCE.replace("src/export.ts: exportJson, ExportOptions", "<files and symbols>")
+        self.write_phase("01-json", plan(CHECKS, placeholder, PERF_NA))
+        self.assertIn("no conformance check", self.phases(str(self.root), ok=False))
+
+
+class Carry(unittest.TestCase):
+    """Phase 1 lives on feat-1 in the main checkout; phase 2 is a worktree nested inside it, on feat-2."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.tmp.name)
+        self.repo = self.base / "app"
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "main")
+        (self.repo / ".gitignore").write_text(".worktrees/\n")
+        (self.repo / "server.py").write_text("print('app')\n")
+        self.git(self.repo, "add", ".")
+        self.git(self.repo, "commit", "-qm", "Start the app")
+        self.git(self.repo, "checkout", "-qb", "feat-1")
+        self.phase2 = self.repo / ".worktrees" / "two"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "feat-2", str(self.phase2))
+        self.env = {**os.environ, "VERIFY_HOME": str(self.base / "home")}
+        self.one = pathlib.Path(self.verify(self.repo, "where").strip())
+        self.two = pathlib.Path(self.verify(self.phase2, "where").strip())
+        (self.one / "plan.md").write_text(plan(CHECKS, PERF_MAIN))
+        self.put(self.one, "B1.check.sh", 'node "$(dirname "$0")/lib/drive.mjs" >/dev/null 2>&1; echo ok > "$VERIFY_DIR/B1-own.txt"\n')
+        self.put(self.one, "P1.check.sh", "exit 0\n")
+        self.put(self.one, "lib/drive.mjs", "export const drive = () => 1\n")
+        for name in ("B1-terminal.txt", "B1.rerun.log", "B1.observed.json", "report.md", "plan.lock", "rerun.stamp.json",
+                     "evidence/B1/shot.png", "evidence/B1/trace.js"):
+            self.put(self.one, name, "x\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, cwd, *args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True, capture_output=True)
+
+    def put(self, directory, name, text):
+        path = directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def verify(self, cwd, command, *args, ok=True):
+        r = subprocess.run([sys.executable, "-I", str(VERIFY), command, *args], cwd=cwd, capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout
+
+    def carried(self):
+        return sorted(str(p.relative_to(self.two)) for p in self.two.rglob("*") if p.is_file())
+
+    def test_carries_check_scripts_and_helpers_but_never_evidence_or_perf_checks(self):
+        out = self.verify(self.phase2, "carry", "feat-1")
+        self.assertIn(f"carry: 1 check scripts and 1 helpers from {self.one}: B1", out)
+        self.assertIn("left behind perf checks P1", out)
+        self.assertEqual(self.carried(), ["B1.check.sh", "lib/drive.mjs"])
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL", self.verify(self.phase2, "rerun"))
+        self.assertTrue((self.two / "B1-own.txt").exists())
+        self.assertFalse((self.one / "B1-own.txt").exists())
+
+    def test_a_path_source_and_a_second_carry_copy_nothing_new_and_keep_a_changed_script(self):
+        self.verify(self.phase2, "carry", str(self.one))
+        self.put(self.two, "B1.check.sh", "exit 0\n")
+        out = self.verify(self.phase2, "carry", "feat-1")
+        self.assertIn("carry: 0 check scripts and 0 helpers", out)
+        self.assertIn("kept this directory's B1.check.sh, which differs from the source's", out)
+        self.assertEqual((self.two / "B1.check.sh").read_text(), "exit 0\n")
+
+    def test_refuses_a_script_that_drives_another_worktree_and_copies_nothing(self):
+        self.put(self.one, "B2.check.sh", f"cd {self.phase2}/sub && python3 {self.repo}/server.py\n")
+        out = self.verify(self.phase2, "carry", "feat-1", ok=False)
+        self.assertIn(f"B2.check.sh names {os.path.realpath(self.repo)}, another worktree", out)
+        self.assertEqual(out.count("another worktree"), 1)
+        self.assertEqual(self.carried(), [])
+
+    def test_a_path_inside_this_worktree_is_not_foreign(self):
+        self.put(self.one, "B2.check.sh", f"cd {self.phase2} && python3 {self.phase2}/server.py\n")
+        self.assertIn("2 check scripts", self.verify(self.phase2, "carry", "feat-1"))
+
+    def test_refuses_a_script_that_writes_into_the_earlier_phase_directory(self):
+        self.put(self.one, "B2.check.sh", f"echo ok > {self.one}/B2-out.txt\n")
+        out = self.verify(self.phase2, "carry", "feat-1", ok=False)
+        self.assertIn("B2.check.sh names", out)
+        self.assertIn("the earlier phase's verification directory", out)
+
+    def test_a_missing_source_or_this_branch_is_an_error(self):
+        self.assertIn("does not exist", self.verify(self.phase2, "carry", "feat-0", ok=False))
+        self.assertIn("this branch's own verification directory", self.verify(self.phase2, "carry", "feat-2", ok=False))
+        self.assertIn("carry takes one", self.verify(self.phase2, "carry", ok=False))
+
 
 class RepoFixture(unittest.TestCase):
     def setUp(self):
@@ -632,6 +809,57 @@ class RepoFixture(unittest.TestCase):
 
     NEW = "from calc import mul"
     NEW_BODY = "self.assertEqual(mul(2, 3), 6)"
+
+
+class Lock(RepoFixture):
+    def where(self):
+        return pathlib.Path(self.verify("where").strip())
+
+    def write_plan(self, text=None):
+        self.where().joinpath("plan.md").write_text(text or plan(CHECKS, PERF_NA))
+
+    def test_locks_before_code_and_keeps_passing_while_the_plan_holds(self):
+        self.write_plan()
+        self.assertIn("plan locked before code", self.verify("lock"))
+        self.feature()
+        self.assertIn("unchanged since", self.verify("lock"))
+        self.write_plan(plan(CHECKS.replace("3 records", "4 records"), PERF_NA))
+        self.assertIn("plan changed after it was frozen", self.verify("lock", ok=False))
+        self.verify("freeze", "--revision", "export holds 4 records now; agreed by the user")
+        self.verify("lock")
+
+    def test_refuses_once_product_code_has_changed(self):
+        self.write_plan()
+        self.put(".claude/skills/verify-calc/SKILL.md", "driver\n")
+        self.commit("Add the driver")
+        self.verify("lock")
+        self.where().joinpath("plan.lock").unlink()
+        self.put("calc.py", "def add(a, b):\n    return b + a\n")
+        self.assertIn("product files already changed", self.verify("lock", ok=False))
+        self.git("checkout", "--", "calc.py")
+        self.put("mul.py", "def mul(a, b):\n    return a * b\n")
+        self.assertIn("mul.py", self.verify("lock", ok=False))
+
+    def test_a_plan_frozen_after_the_code_cannot_pass_as_locked(self):
+        self.feature()
+        self.write_plan()
+        self.verify("freeze")
+        self.assertIn("frozen after code existed", self.verify("lock", ok=False))
+
+    def test_adopt_starts_a_phase_from_its_own_base(self):
+        self.feature()
+        folder = self.repo / "docs" / "export" / "phases" / "02-csv"
+        folder.mkdir(parents=True)
+        (folder / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        self.assertIn("adopted 02-csv: 1 checks", self.verify("adopt", str(folder)))
+        self.assertIn("plan locked before code", self.verify("lock"))
+
+    def test_adopt_refuses_to_replace_a_different_plan(self):
+        self.write_plan(plan(CHECKS.replace("B1", "Z9"), PERF_NA))
+        folder = pathlib.Path(self.tmp.name) / "plans" / "export" / "phases" / "01-json"
+        folder.mkdir(parents=True)
+        (folder / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        self.assertIn("already holds a different plan", self.verify("adopt", str(folder), ok=False))
 
 
 class Units(RepoFixture):
@@ -808,7 +1036,8 @@ class Leftovers(unittest.TestCase):
     def test_orphans_in_any_worktree_of_the_repo_are_leftovers_but_the_users_live_processes_are_not(self):
         repo = self.base / "shop"
         repo.mkdir()
-        run = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=repo, check=True, capture_output=True)
+        def run(*a):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=repo, check=True, capture_output=True)
         run("init", "-q", "-b", "main")
         (repo / "a.txt").write_text("a")
         run("add", ".")
@@ -980,7 +1209,8 @@ class RunGroup(unittest.TestCase):
     def test_a_scratch_tree_kills_processes_running_in_it_before_removal(self):
         repo = self.base / "repo"
         repo.mkdir()
-        run = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=repo, check=True, capture_output=True)
+        def run(*a):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=repo, check=True, capture_output=True)
         run("init", "-q", "-b", "main")
         (repo / "a.txt").write_text("a")
         run("add", ".")

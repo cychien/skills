@@ -418,6 +418,38 @@ class Review(Harness):
         self.assertIn("DECIDED by independent review", out)
         self.assertIn("proceed with: b", out)
 
+    def test_backlog_defers_an_unresolved_question_instead_of_blocking(self):
+        run = self.start_run()
+        self.cli("start", "--run", run, "--done", "tests pass")
+        self.reviewer({"verdict": "escalate", "reason": "a product call"})
+        backlog = pathlib.Path(self.tmp.name) / "docs" / "backlog.md"
+        out = self.ask(run, "direction", backlog=str(backlog))
+        self.assertIn("DEFERRED: proceed with: a", out)
+        text = backlog.read_text()
+        self.assertIn("## Deferred by autonomous runs", text)
+        self.assertIn("### Which name?", text)
+        self.assertIn("- Taken: a", text)
+        self.assertIn("a product call", text)
+        self.assertEqual(list((self.home / "runs" / run / "gates").glob("g-*.json")), [])
+        self.assertIn("deferred to the backlog", (self.home / "runs" / run / "decisions.jsonl").read_text())
+        self.ask(run, "choice", "medium", backlog=str(backlog))
+        self.assertEqual(backlog.read_text().count("## Deferred by autonomous runs"), 1)
+
+    def test_a_run_started_with_a_backlog_defers_every_unresolved_question(self):
+        run = self.start_run()
+        backlog = pathlib.Path(self.tmp.name) / "backlog.md"
+        self.cli("start", "--run", run, "--done", "tests pass", "--backlog", str(backlog))
+        self.reviewer({"verdict": "escalate", "reason": "a product call"})
+        self.assertIn("DEFERRED", self.ask(run, "direction"))
+        self.assertIn("### Which name?", backlog.read_text())
+
+    def test_backlog_never_defers_an_irreversible_call_or_a_dead_end(self):
+        run = self.start_run()
+        backlog = pathlib.Path(self.tmp.name) / "backlog.md"
+        self.assertIn("ESCALATED", self.ask(run, "irreversible", backlog=str(backlog)))
+        self.assertIn("ESCALATED", self.ask(run, "dead-end", backlog=str(backlog)))
+        self.assertFalse(backlog.exists())
+
     def test_done_review_rejects_and_escalates(self):
         run = self.start_run()
         self.cli("start", "--run", run, "--done", "pricing listed")
