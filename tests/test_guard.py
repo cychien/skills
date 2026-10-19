@@ -123,6 +123,43 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.stop("All done."))
         self.assertIn("1. Next task", self.todo("add", "Next task"))
 
+    def test_waiting_items_let_the_turn_end_on_a_plain_text_question(self):
+        self.todo("add", "Pick the format", "Write the doc")
+        blocked = self.stop("Started.")
+        self.assertIn("todo wait", blocked["reason"])
+        out = self.todo("wait", "1", "--reason", "which format the user wants")
+        self.assertNotIn("End the turn now", out)
+        self.assertIn("[?] 1. Pick the format - waiting on the user: which format the user wants", out)
+        self.assertIn("2. Write the doc", self.stop("I need to know more.")["reason"])
+        self.assertNotIn("1. Pick the format", self.stop("I need to know more.")["reason"])
+        self.assertIn("End the turn now", self.todo("wait", "2", "--reason", "same answer"))
+        self.assertIsNone(self.stop("Tell me the format first."))
+
+    def test_the_next_user_prompt_reopens_waiting_items(self):
+        self.todo("add", "Pick the format")
+        self.todo("wait", "1", "--reason", "format")
+        self.assertIsNone(self.stop("Tell me the format first."))
+        self.hook("UserPromptSubmit", {"prompt": "markdown"})
+        self.assertIn("[ ] 1. Pick the format", self.todo("list"))
+        self.assertEqual(self.stop("Working.")["decision"], "block")
+
+    def test_waiting_items_can_be_done_or_skipped_but_not_waited_twice_over_resolved_ones(self):
+        self.todo("add", "One", "Two", "Three")
+        self.todo("wait", "1", "2", "--reason", "answer")
+        self.assertIn("[x] 1. One", self.todo("done", "1"))
+        self.assertIn("[-] 2. Two", self.todo("skip", "2", "--reason", "not needed"))
+        self.assertIn("already done", self.todo("wait", "1", "--reason", "again", ok=False))
+        self.assertEqual(self.stop("Working.")["decision"], "block")
+        self.todo("wait", "3", "--reason", "answer")
+        self.assertIn("Every item is resolved", self.todo("done", "3"))
+
+    def test_a_list_of_only_waiting_items_is_not_archived_by_new_items(self):
+        self.todo("add", "One")
+        self.todo("wait", "1", "--reason", "answer")
+        out = self.todo("add", "Two")
+        self.assertIn("[?] 1. One", out)
+        self.assertIn("2. Two", out)
+
     def test_skipping_an_item_that_runs_a_skill_skips_that_skills_items(self):
         self.write_skill("outer", """\
             ---

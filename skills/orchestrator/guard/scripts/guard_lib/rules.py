@@ -99,7 +99,7 @@ def todo_hint(skill, event):
    {cmd} todo add "<item>" ["<item>" ...] {sess}
 If this task needs no list, say why:
    {cmd} todo none {sess} --reason "<why>"
-Resolve each item as you go with `todo done <n> [<n> ...]` or `todo skip <n> [<n> ...] --reason "..."`. The turn cannot end while an item is open, except to ask the user a question."""
+Resolve each item as you go with `todo done <n> [<n> ...]` or `todo skip <n> [<n> ...] --reason "..."`. The turn cannot end while an item is open, except to ask the user a question: mark the items that wait on the answer with `todo wait <n> [<n> ...] --reason "..."` first."""
 
 
 def on_prompt(event):
@@ -111,6 +111,7 @@ def on_prompt(event):
         return PASS
     with state.update(event.agent, event.session) as data:
         data["todo_undecided"], data["todo_decided"] = None, []
+        state.reopen_waiting(data)
         if path and m.group(1) not in data["skills"]:
             data["skills"].append(m.group(1))
         ask = bool(path) and needs_decision(data, m.group(1), path)
@@ -121,7 +122,7 @@ def on_prompt(event):
 
 def needs_decision(data, skill, path):
     """A skill with steps needs a todo decision, unless this prompt already made one for it or its steps are listed."""
-    if skill in data.get("todo_decided", []) or any(i["source"] == skill for i in state.open_items(data)):
+    if skill in data.get("todo_decided", []) or any(i["source"] == skill for i in state.unresolved(data)):
         return False
     return bool(skills.steps(path))
 
@@ -342,7 +343,7 @@ def on_stop(event):
         problems.append(f"Your reply cites principles whose file you did not read this session ({files} in the principles skill). Read them, or remove those citations.")
     sources = {i["source"]: i["source_path"] for i in data["todo"] if i["source"] and i["source_path"]}
     needs_reply = [name for name, path in sources.items() if "../reply/SKILL.md" in (skills.read(path) or "")]
-    if needs_reply and data["todo"] and not state.open_items(data) and "reply" not in data["skills"]:
+    if needs_reply and data["todo"] and not state.unresolved(data) and "reply" not in data["skills"]:
         problems.append(f"The `{needs_reply[0]}` skill asks for its reply per the reply skill. Read `../reply/SKILL.md` beside it and write the reply that way.")
     items = state.open_items(data)
     mandatory = [i for i in items if i["mandatory"]]
@@ -361,7 +362,7 @@ def on_stop(event):
         if idle_blocks < IDLE_LIMIT or mandatory:
             cmd, sess = cli(session_ref(event))
             lines = ["The todo list has open items:"] + [f"   {i['n']}. {i['title']}" for i in items]
-            problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> {sess}`, or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. End the turn only to ask the user a question.")
+            problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> {sess}`, or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. To end the turn on a question only the user can answer, even one asked in plain text after they declined a question tool, first mark the items that wait on the answer with `{cmd} todo wait <n> {sess} --reason \"<what the user must answer>\"`; they reopen when the user replies.")
         if idle_blocks >= IDLE_LIMIT and mandatory:
             problems.append("Item(s) {} are mandatory, so stopping repeatedly does not release them. If something outside your control "
                             "keeps one from closing, ask the user a question that names the item and what blocks it.".format(

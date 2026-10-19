@@ -47,13 +47,24 @@ def update(agent, session):
         os.replace(tmp, path(agent, session))
 
 
+def reopen_waiting(data):
+    reopened = [i for i in data["todo"] if i["status"] == "waiting"]
+    for item in reopened:
+        item["status"], item["note"] = "open", None
+    return reopened
+
+
 def open_items(data):
     return [i for i in data["todo"] if i["status"] == "open"]
 
 
+def unresolved(data):
+    return [i for i in data["todo"] if i["status"] in ("open", "waiting")]
+
+
 def add_items(data, texts, source=None, source_path=None, titles=None, mandatory=None):
     """Append items; a list whose every item is resolved is archived first, so a new task starts a new list."""
-    if data["todo"] and not open_items(data):
+    if data["todo"] and not unresolved(data):
         data["archived"].append({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "items": data["todo"]})
         data["todo"] = []
     start = len(data["todo"]) + 1
