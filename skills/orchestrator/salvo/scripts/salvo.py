@@ -11,6 +11,14 @@ files included. Outside one, every run gets
 its own empty directory. Blocks until all runs finish, then prints a JSON summary.
 salvo.json in --out says "status": "running" until every run has finished, then "done".
 
+Each runner starts in its own session, so a timeout, or the runner finishing, takes down every process it started
+in that session. `clean` stops any process still running from a workspace, the shadow home, or the run directory
+(SIGTERM, then SIGKILL) and refuses to delete anything while one survives, because a directory removed under a live
+process hides it.
+
+A run stopped by a usage limit that resets within 24 hours waits for the reset and resumes
+its own session, up to 3 times; salvo.json lists each wait under "limit_waits".
+
 --clean-room keeps the setup invisible to the runs: each workspace lives at
 /tmp/<random>/<source directory name>, unconnected to --out or the source, and the prompt
 carries no orchestration wording.
@@ -22,11 +30,13 @@ outranks a project skill of the same name. Codex keeps its real home and has tho
 skills disabled by path.
 """
 import argparse
+import datetime
 import json
 import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -37,13 +47,25 @@ from concurrent.futures import ThreadPoolExecutor
 AGENTS = ("claude", "codex")
 # Byproducts of running code; excluded even when the repo forgets to ignore them.
 ARTIFACTS = ["__pycache__", "*.pyc", "node_modules", ".DS_Store", ".pytest_cache", ".venv"]
+LIMIT_RESUMES = 3
+KILL_WAIT_S = 3.0
+RESET_MARGIN_S = 60
+MAX_LIMIT_WAIT_S = 24 * 3600
+CONTINUE_PROMPT = ("Your usage limit has reset. Continue the task you were working on when the limit was reached; "
+                   "do not repeat work that is already complete.")
+CODEX_RETRY_AT = re.compile(r"usage limit\b.*\btry again at ([^\n]+?)\.?\s*(?:\n|$)", re.I | re.S)
+# Codex states the reset in local clock time, rounded to the minute.
+CODEX_CLOCK_SLACK_S = 600
 
+DELEGATE = "You are a delegate of a larger run: never run autorun.py start, done, or stop; only the session that launched you may change or finish that run."
 FOOTER_GIT = """
 ---
-Your working directory is {work}, a private copy of {source} in its current state. Edit it freely; nothing you do there touches the original."""
+Your working directory is {work}, a private copy of {source} in its current state. Edit it freely; nothing you do there touches the original.
+""" + DELEGATE
 FOOTER_PLAIN = """
 ---
-Your working directory is {work}. It starts empty. Read anything you need from {source}, but write files only inside your working directory."""
+Your working directory is {work}. It starts empty. Read anything you need from {source}, but write files only inside your working directory.
+""" + DELEGATE
 FOOTER_CLEAN_GIT = """
 ---
 The project is at {work}."""
@@ -121,21 +143,26 @@ def build_shadow_home(root, hidden):
     return home
 
 
-def command(agent, model, effort, work, result_path, hidden):
+def command(agent, model, effort, work, result_path, hidden, session=None):
     if agent == "claude":
         cmd = ["claude", "-p", "--model", model, "--permission-mode", "bypassPermissions",
                "--output-format", "stream-json", "--verbose"]
-        return cmd + (["--effort", effort] if effort else [])
-    cmd = ["codex", "exec", "--skip-git-repo-check", "-C", work, "-m", model,
-           "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
-           "--json", "-o", result_path]
+        cmd += ["--effort", effort] if effort else []
+        return cmd + (["--resume", session] if session else [])
+    # codex exec resume takes neither -C nor -s; it runs in the subprocess cwd.
+    head = ["codex", "exec", "resume"] if session else ["codex", "exec"]
+    sandbox = ["-c", 'sandbox_mode="workspace-write"'] if session else ["-C", work, "-s", "workspace-write"]
+    cmd = head + ["--skip-git-repo-check", *sandbox, "-m", model, "-c", "sandbox_workspace_write.network_access=true",
+                  "--json", "-o", result_path]
     cmd += codex_skill_overrides(hidden) if hidden else []
-    return cmd + (["-c", f"model_reasoning_effort={effort}"] if effort else []) + ["-"]
+    cmd += ["-c", f"model_reasoning_effort={effort}"] if effort else []
+    return cmd + ([session, "-"] if session else ["-"])
 
 
-def read_events(log_path):
+def read_events(log_path, start=0):
     events = []
     with open(log_path, errors="ignore") as f:
+        f.seek(start)
         for line in f:
             try:
                 events.append(json.loads(line))
@@ -157,7 +184,138 @@ def collect(agent, run, log_path, result_path):
                 f.write(final.get("result") or "")
         return session, is_error, f"cd {run['work']} && claude --resume {session}"
     session = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
-    return session, False, f"codex resume {session}"
+    last_turn = next((e for e in reversed(events) if e.get("type") in ("turn.completed", "turn.failed")), {})
+    return session, last_turn.get("type") == "turn.failed", f"codex resume {session}"
+
+
+def codex_reset(text, now):
+    text = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", text.strip())
+    for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+        try:
+            return datetime.datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            pass
+    try:
+        clock = datetime.datetime.strptime(text, "%I:%M %p")
+    except ValueError:
+        return None
+    at = datetime.datetime.fromtimestamp(now).replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+    if at.timestamp() < now - CODEX_CLOCK_SLACK_S:
+        at += datetime.timedelta(days=1)
+    return at.timestamp()
+
+
+def limit_reset(agent, events, now):
+    """When the usage limit that ended this attempt resets, in epoch seconds, or None if no limit ended it."""
+    if agent == "claude":
+        hit = next((e for e in reversed(events) if e.get("type") == "rate_limit_event"), {})
+        info = hit.get("rate_limit_info") or {}
+        return info.get("resetsAt") if info.get("status") == "rejected" else None
+    failed = next((e for e in reversed(events) if e.get("type") == "turn.failed"), {})
+    found = CODEX_RETRY_AT.search((failed.get("error") or {}).get("message") or "")
+    return codex_reset(found.group(1), now) if found else None
+
+
+def kill_group(pgid):
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def process_table():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="], capture_output=True, text=True, timeout=15).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) == 5 and parts[0].isdigit():
+            rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "pgid": int(parts[2]), "stat": parts[3], "command": parts[4]})
+    return rows
+
+
+def process_cwds():
+    """Working directory of every process this user can see; a deleted one keeps the path it had."""
+    if os.path.exists("/proc/self/cwd"):
+        cwds = {}
+        for name in os.listdir("/proc"):
+            try:
+                cwds[int(name)] = os.readlink(f"/proc/{name}/cwd").removesuffix(" (deleted)")
+            except (ValueError, OSError):
+                pass
+        return cwds
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"cannot read process working directories with lsof: {e}")
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def lineage(table):
+    parents = {row["pid"]: row["ppid"] for row in table}
+    chain, pid = set(), os.getpid()
+    while pid and pid not in chain:
+        chain.add(pid)
+        pid = parents.get(pid)
+    return chain
+
+
+def processes_under(roots):
+    """Processes whose working directory or command line is under any root, excluding this process and its ancestors."""
+    paths = {p.rstrip("/") for r in roots if r for p in (r, os.path.realpath(r))} - {""}
+    if not paths:
+        return []
+    body = "|".join(re.escape(p) for p in sorted(paths))
+    in_cwd, in_command = re.compile(rf"^(?:{body})(?:/|$)"), re.compile(rf"(?<![\w./-])(?:{body})(?=/|$|[^\w.-])")
+    table = process_table()
+    skip = lineage(table)
+    cwds = process_cwds()
+    return [{**row, "cwd": cwds.get(row["pid"])} for row in table
+            if row["pid"] not in skip and not row["stat"].startswith("Z")
+            and ((cwds.get(row["pid"]) and in_cwd.search(cwds[row["pid"]])) or in_command.search(row["command"]))]
+
+
+def signal_processes(found, sig):
+    table = process_table()
+    skip = lineage(table)
+    protected = {row["pgid"] for row in table if row["pid"] in skip}
+    for proc in found:
+        try:
+            if proc["pgid"] in protected or proc["pgid"] <= 1:
+                os.kill(proc["pid"], sig)
+            else:
+                os.killpg(proc["pgid"], sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def stop_processes_under(roots):
+    """SIGTERM, then SIGKILL after a grace period, to every process under the roots; returns those still running."""
+    found = processes_under(roots)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not found:
+            break
+        signal_processes(found, sig)
+        deadline = time.time() + KILL_WAIT_S
+        while found and time.time() < deadline:
+            time.sleep(0.1)
+            running = {row["pid"] for row in process_table() if not row["stat"].startswith("Z")}
+            found = [p for p in found if p["pid"] in running]
+    return processes_under(roots)
+
+
+def sleep_until(wake):
+    while (left := wake - time.time()) > 0:
+        time.sleep(min(left, 60))
+
+
+def clock(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 def record_changes(run, manifest):
@@ -180,29 +338,51 @@ def execute(run, prompt, manifest, timeout, hidden):
     err_path = os.path.join(run["dir"], "stderr.log")
     result_path = os.path.join(run["dir"], "result.md")
     run.update(result=result_path, transcript=log_path, stderr=err_path)
-    cmd = command(agent, model, effort, run["work"], result_path, hidden)
     env = {**os.environ, "HOME": manifest["shadow_home"]} if agent == "claude" and manifest.get("shadow_home") else None
     if manifest.get("clean_room"):
         env = {k: v for k, v in (env or os.environ).items() if k != "AUTORUN_RUN"}
         env["AUTORUN_BOUNDARY_PID"] = str(os.getpid())
     print(f"started  {run['label']}", flush=True)
     start = time.time()
-    try:
-        with open(log_path, "w") as out, open(err_path, "w") as err:
-            r = subprocess.run(cmd, input=prompt, stdout=out, stderr=err, text=True, cwd=run["work"], timeout=timeout, env=env)
-        code, timed_out = r.returncode, False
-    except subprocess.TimeoutExpired:
-        code, timed_out = None, True
+    session, waits = None, []
+    while True:
+        offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        cmd = command(agent, model, effort, run["work"], result_path, hidden, session)
+        run.pop("agent_error", None)
+        with open(log_path, "a") as out, open(err_path, "a") as err, \
+                subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, cwd=run["work"], env=env, start_new_session=True) as proc:
+            try:
+                proc.communicate(prompt, timeout=timeout)
+                code, timed_out = proc.returncode, False
+            except subprocess.TimeoutExpired:
+                code, timed_out = None, True
+            finally:
+                kill_group(proc.pid)
+        session, is_error, resume = collect(agent, run, log_path, result_path)
+        ok = code == 0 and not is_error and os.path.exists(result_path) and os.path.getsize(result_path) > 0
+        reset = None if ok or timed_out else limit_reset(agent, read_events(log_path, offset), time.time())
+        if reset is None or len(waits) == LIMIT_RESUMES or reset - time.time() > MAX_LIMIT_WAIT_S:
+            break
+        wake = max(reset, time.time()) + RESET_MARGIN_S
+        print(f"waiting  {run['label']} for its usage limit to reset, resuming at {clock(wake)}", flush=True)
+        asleep = time.time()
+        sleep_until(wake)
+        waits.append({"reset": clock(reset), "waited_s": round(time.time() - asleep)})
+        prompt = CONTINUE_PROMPT if session else prompt
     run["duration_s"] = round(time.time() - start)
-    session, is_error, resume = collect(agent, run, log_path, result_path)
+    if waits:
+        run["limit_waits"] = waits
     run.update(session_id=session, resume=resume if session else None)
     record_changes(run, manifest)
-    ok = code == 0 and not is_error and os.path.exists(result_path) and os.path.getsize(result_path) > 0
     if timed_out:
         run["error"] = f"timed out after {timeout}s"
     elif not ok:
-        tail = [line for line in open(err_path, errors="ignore").read().splitlines() if line.strip()][-5:]
+        with open(err_path, errors="ignore") as f:
+            tail = [line for line in f.read().splitlines() if line.strip()][-5:]
         run["error"] = run.pop("agent_error", None) or "\n".join(tail) or f"exit code {code}"
+        if reset is not None:
+            why = "more than 24 hours away" if reset - time.time() > MAX_LIMIT_WAIT_S else f"gave up after {LIMIT_RESUMES} resumes"
+            run["error"] += f" (usage limit resets at {clock(reset)}; not resumed: {why})"
     run["ok"] = ok
     print(f"finished {run['label']} {'ok' if ok else 'FAILED'} in {run['duration_s']}s", flush=True)
     return run
@@ -299,7 +479,14 @@ def clean(args):
     manifest_path = os.path.join(out, "salvo.json")
     if not os.path.exists(manifest_path):
         sys.exit(f"{manifest_path} not found; not a salvo run directory")
-    manifest = json.load(open(manifest_path))
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    places = [out, *(r.get("workspace_root") for r in manifest["runs"]), *(r["checkout"] for r in manifest["runs"]), manifest.get("shadow_root")]
+    survivors = stop_processes_under(places)
+    if survivors:
+        lines = "\n".join(f"  pid {p['pid']} ppid {p['ppid']} pgid {p['pgid']} cwd {p.get('cwd') or '-'}  {p['command'][:160]}" for p in survivors)
+        sys.exit(f"not removed: {len(survivors)} process(es) still run from the workspaces, so deleting them would hide the processes\n{lines}\n"
+                 "Stop them, then run clean again.")
     if manifest.get("repo"):
         for run in manifest["runs"]:
             git(manifest["repo"], "worktree", "remove", "--force", run["checkout"], check=False)

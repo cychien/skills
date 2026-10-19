@@ -53,6 +53,9 @@ DEFAULTS = {
     "review_command": None,
 }
 
+# Messages to agents the session launched, not to people.
+AGENT_MESSAGE_TOOLS = re.compile(r"^SendMessage$")
+USAGE_LIMIT = re.compile(r"(?i)\b(usage|session|weekly)[ -]limits?\b|額度|用量上限")
 QUESTION_TOOLS = re.compile(r"(?i)^(askuserquestion|ask_?user(_?question)?|ask_?question|request_?user_?input)$")
 SHELL_TOOLS = re.compile(r"(?i)^(bash|shell|exec_command|local_shell|run_shell_command|terminal|powershell|run_terminal_cmd)$")
 NOT_THE_USERS_WORDS = re.compile(
@@ -162,10 +165,16 @@ def irreversible(tool, tool_input):
             if re.search(pattern, command, re.IGNORECASE):
                 return label, command
         return None
+    if AGENT_MESSAGE_TOOLS.match(tool or ""):
+        return None
     for label, pattern in cfg["irreversible_tools"]:
         if tool and re.search(pattern, tool):
             return label, tool
     return None
+
+
+def about_usage_limit(*texts):
+    return any(USAGE_LIMIT.search(t or "") for t in texts)
 
 
 def ends_with_question(message):

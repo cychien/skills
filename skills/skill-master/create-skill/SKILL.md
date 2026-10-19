@@ -18,7 +18,7 @@ Work through the sections below as a loop:
 4. Show the user the output.
 5. Revise on their feedback and return to step 3, until the user is happy or you stop making progress.
 
-Start where the user is. "I want a skill for X" starts at step 1. "Is my draft any good?" starts at step 3. A change to an existing skill, however small, runs the whole loop at the scale of the change, because an untested rule is a guess about agent behavior. Skip testing only when the user says so.
+Start where the user is. "I want a skill for X" starts at step 1. "Is my draft any good?" starts at step 3. A change to an existing skill runs the whole loop at the scale of the change, because an untested rule is a guess about agent behavior. A small change skips step 3, because an eval round costs far more than the risk of one sentence the user reviews in step 4 anyway. Small means one bullet or sentence added or tightened, or a stale fact corrected, in the body of an existing skill. A new skill, a new section, table, or step, or a changed gate is not small. A description change, however small, still runs the trigger test. Skip testing anything else only when the user says so.
 
 ## House rules
 
@@ -63,7 +63,7 @@ When the project already keeps skills elsewhere, ask before moving them, because
 
 ## Write the SKILL.md
 
-When updating an existing skill, first copy it to a scratch directory as the baseline for testing, and keep its folder name and `name` field.
+When updating an existing skill, first copy it to a scratch directory as the baseline for testing unless the change is small, and keep its folder name and `name` field.
 
 ### Anatomy
 
@@ -133,7 +133,7 @@ Run this whenever the description is new or changed. An agent sees only the name
 
 ## Output
 
-Once the eval recommends promoting the skill, or you are stuck on a call only the user can make, show the user:
+Once the eval recommends promoting the skill, a small change is written, or you are stuck on a call only the user can make, show the user:
 
 - The final round's eval-skill report, with its recommendation. For an update, point at where the change made a difference.
 - What you already fixed along the way.

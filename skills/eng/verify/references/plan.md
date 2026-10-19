@@ -30,11 +30,11 @@ Cover:
 
 1. **Behavior.** Every behavior the change adds or alters, including the edges settled with the user: empty input, errors, boundaries, permissions.
 2. **Regression.** The load-bearing existing behavior the change could break, run on main and on head. Name what must stay identical, such as byte-identical output or the same screen. When main lacks the feature, say so and gate head on its own predicates.
-3. **Unit.** Tests for logic with a cheap local test path, written to fail before the change and pass after. Assert behavior per the Test Behavior, Not Implementation principle (`../../principles/references/principles/test-behavior-not-implementation.md`). Prefer no new test over a test of mocks, timing, or internals. Tests are one part of the plan, never all of it.
+3. **Unit.** Tests for logic with a cheap local test path, written to fail before the change and pass after. Assert behavior per the Test Behavior, Not Implementation principle (`../../principles/references/principles/test-behavior-not-implementation.md`). Prefer no new test over a test of mocks, timing, or internals. Tests are one part of the plan, never all of it. Grade fail-first with `python3 ../scripts/verify.py units`: each spec file added or changed in the range, which defaults to the merge-base with the default branch through HEAD, fails on base plus the spec and passes at head, never judged from commit order, so commits group freely and no history is rewritten for evidence. A spec that already passes on base must be a regression guard in its own spec file containing the marker `regression-guard`. Compile-time type tests, import guards, and regression tests that pin behavior main already has cannot fail first: they land in the commit with the code they guard and are exempt from the fail-first predicate, so say so in the check.
 
 ## Perf
 
-Every plan decides its perf acceptance, because a correct result that is too slow still fails the user, and nobody measures what nobody asked for. For each path a user waits on that the change adds or alters (a page becoming usable, a command returning, a job finishing, a request answering), write one perf check:
+Every plan decides its perf acceptance, because a correct result that is too slow still fails the user, and nobody measures what nobody asked for. For each path a user waits on that the change adds or alters (a page becoming usable, a command returning, a job finishing, a request answering), write one perf check, but only where the change adds work the user waits on or work that scales with data:
 
 - **Path.** The wait as the user experiences it, at a stated, realistic data size.
 - **Metric.** What is measured. Prefer a count (queries, requests, bytes, renders) when it captures the cost, because counts carry no run-to-run noise. Add a timing for the wait itself.
@@ -42,7 +42,7 @@ Every plan decides its perf acceptance, because a correct result that is too slo
 - **Baseline.** `main` when main already has the path; the verifier measures main first. `none: <why>` when main lacks it.
 - **Rule.** The number that fails. Against a `main` baseline, a relative limit such as "p50 more than 5% slower than main" or "any added query". With no baseline, absolute budgets for both the work the change adds and the end state the user waits for, such as "the list is usable within 1 s with 10,000 rows". Never claim a ratio between unlike scenarios.
 
-Propose the budgets from the user's stated expectations, comparable paths in the same app, and common thresholds (about 100 ms feels instant, about 1 s keeps the user in flow), and let the user decide. When the change alters nothing a user waits on, write `n/a: <reason>` under the Perf heading. The user sees it and can reject it.
+Propose the budgets from the user's stated expectations, comparable paths in the same app, and common thresholds (about 100 ms feels instant, about 1 s keeps the user in flow), and let the user decide. "Not slower than main" on a path the change leaves untouched is `n/a`, because nothing could have moved it. When the change alters nothing a user waits on, write `n/a: <reason>` under the Perf heading. The user sees it and can reject it.
 
 ## Surface by change
 
@@ -51,6 +51,7 @@ Propose the budgets from the user's stated expectations, comparable paths in the
 | CLI | A real terminal | Run the real command and compare stdout, stderr, and exit code |
 | Web UI | A real browser through chrome-devtools-axi | Walk the changed flow; diff screenshots against a frozen baseline when it must match pixel for pixel |
 | API or service | HTTP | Send a real request, check status and body, read the side effect back |
+| Agent-facing tool (MCP, an agent API) | A direct protocol client; a real agent run only for checks about how an agent reads the tool | Call the tool with set arguments and check the result. Spend a real agent run, which costs a model turn per call, only where the check is whether an agent picks the right tool or argument from a sentence |
 | Parser, migration, or transform | Saved inputs | Replay recorded inputs and diff old against new outputs |
 | Storage | The store | Write, then read back through the public path |
 | Refactor | The surface the code serves | Same inputs give the same outputs before and after |
@@ -64,4 +65,4 @@ A design or a prototype can show that a predicate or a budget was wrong, or that
 
 ## Autonomous runs
 
-When the `autorun` skill has a run active, the plan is its done condition. Restart the run with the predicates and budgets as `--done`, and, when every check is scripted, one command that runs them all as `--check`, so `done` refuses until they hold.
+When the `autorun` skill has a run active, the plan is its done condition. Restart the run with the predicates and budgets as `--done` and `--check "python3 <verify skill>/scripts/verify.py report"`, adding `&& python3 <verify skill>/scripts/verify.py rerun` when every check is scripted, so `done` refuses until they hold. `start` records the shell's cwd, so run it inside the worktree, or pass `--cwd <worktree>`, because the check runs there.

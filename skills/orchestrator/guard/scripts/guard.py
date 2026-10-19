@@ -12,14 +12,11 @@ usage:
 """
 import argparse
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from guard_lib import gates, skills, state  # noqa: E402
-
-SKILL_REF = re.compile(r"\.\./([a-z0-9][a-z0-9-]*)/SKILL\.md")
 
 
 def session(ref):
@@ -51,7 +48,7 @@ def resolve(data, n, status, note):
     if status == "skipped" and item["mandatory"]:
         sys.exit(f"guard: item {n} is mandatory and cannot be skipped.")
     if status == "done":
-        unread = sorted(set(SKILL_REF.findall(item["text"])) - set(data["skills"]))
+        unread = sorted(set(skills.SKILL_REF.findall(item["text"])) - set(data["skills"]))
         if unread:
             sys.exit("guard: item {} names skills you have not read this session: {}. Read them first.".format(
                 n, ", ".join(f"../{u}/SKILL.md" for u in unread)))
@@ -66,7 +63,7 @@ def resolve(data, n, status, note):
     item["status"], item["note"] = status, note
     message = f"Item {n} {status}."
     if status == "skipped":
-        children = set(SKILL_REF.findall(item["text"]))
+        children = set(skills.SKILL_REF.findall(item["text"]))
         dropped = [i for i in state.open_items(data) if i["source"] in children]
         for child in dropped:
             child["status"], child["note"] = "skipped", f"item {n} that runs {child['source']} was skipped"

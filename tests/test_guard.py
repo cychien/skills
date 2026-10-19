@@ -228,6 +228,47 @@ class Guard(unittest.TestCase):
         self.assertIn("order", self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": misordered}})["hookSpecificOutput"]["permissionDecisionReason"])
 
 
+    def test_a_detached_salvo_run_is_denied(self):
+        for command in (
+            "nohup python3 /x/salvo/scripts/salvo.py run --out /tmp/s claude:m < task.md > log 2>&1 &",
+            "(nohup python3 salvo.py run --out /tmp/s claude:m < task.md > log 2>&1 &); sleep 5",
+            "python3 scripts/salvo.py run --out /tmp/s claude:m < task.md &",
+        ):
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("run_in_background", out["permissionDecisionReason"])
+        tracked = {"tool_name": "Bash", "tool_input": {"command": "python3 salvo.py run --out /tmp/s claude:m < task.md && echo done", "run_in_background": True}}
+        self.assertIsNone(self.hook("PreToolUse", tracked))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "python3 salvo.py clean /tmp/s &"}}))
+        redirected = {"tool_name": "Bash", "tool_input": {"command": "python3 salvo.py run --out /tmp/s claude:m < task.md > log 2>&1", "run_in_background": True}}
+        self.assertIsNone(self.hook("PreToolUse", redirected))
+        quoted = "python3 - <<'EOF'\nprint('nohup python3 salvo.py run --out /tmp/s claude:m &')\nEOF"
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": quoted}}))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "grep -n 'salvo.py run' notes.md &"}}))
+
+    def test_a_prompt_template_with_unfilled_placeholders_is_denied(self):
+        self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
+        refs = self.skills / "verify" / "references"
+        refs.mkdir()
+        (refs / "verifier-prompt.md").write_text(
+            "# Verifier prompt\n\n```\nYou are verifying a change you did not write.\n"
+            "Head: <head SHA>\nFull round: <yes or no>.\nWrite <id>.observed.json.\n```\n")
+        raw = "You are verifying a change you did not write.\nHead: <head SHA>\nFull round: <yes or no>.\nWrite <id>.observed.json."
+        out = self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": raw}})["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("<head SHA>", out["permissionDecisionReason"])
+        self.assertIn("<yes or no>", out["permissionDecisionReason"])
+        filled = raw.replace("<head SHA>", "abc123").replace("<yes or no>", "yes")
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": filled}}))
+        task = pathlib.Path(self.tmp.name) / "task.md"
+        task.write_text(raw)
+        salvo = {"tool_name": "Bash", "tool_input": {"command": f"python3 salvo.py run --out /tmp/s claude:m < {task}", "run_in_background": True}}
+        self.assertEqual(self.hook("PreToolUse", salvo)["hookSpecificOutput"]["permissionDecision"], "deny")
+        task.write_text(filled)
+        self.assertIsNone(self.hook("PreToolUse", salvo))
+        unrelated = {"tool_name": "Agent", "tool_input": {"prompt": "Summarize <head SHA> notes."}}
+        self.assertIsNone(self.hook("PreToolUse", unrelated))
+
     def test_an_item_naming_a_skill_needs_it_read_and_the_reply_skill_is_enforced(self):
         self.write_skill("reply", "---\nname: reply\ndescription: x\n---\n\n# Writing the reply\n")
         self.write_skill("helper", "---\nname: helper\ndescription: x\n---\n\n# Helper\n")
@@ -239,6 +280,27 @@ class Guard(unittest.TestCase):
         self.assertIn("reply", self.stop("All done.")["reason"])
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "reply" / "SKILL.md")}})
         self.assertIsNone(self.stop("All done."))
+
+    def test_reading_a_skill_only_because_an_item_cites_it_does_not_ask_for_a_todo_decision(self):
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Use the demo skill (`../demo/SKILL.md`).\n2. Wrap up.\n")
+        self.todo("from", "flow")
+        bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        demo = str(self.skills / "demo" / "SKILL.md")
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": demo}})
+        self.assertIsNone(self.hook("PreToolUse", bash))
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cat {demo}"}})
+        self.assertIsNone(self.hook("PreToolUse", bash))
+        self.todo("done", "1")
+        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "demo"}})
+        self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.todo("none", "--reason", "demo is only a reference here")
+        self.assertIsNone(self.hook("PreToolUse", bash))
+
+    def test_reading_a_skill_that_no_item_cites_still_asks_for_a_todo_decision(self):
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Wrap up.\n")
+        self.todo("from", "flow")
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
+        self.assertEqual(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}})["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_a_headless_session_cannot_end_the_turn_on_background_work(self):
         self.todo("add", "Ship it")
@@ -293,6 +355,64 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.stop("Applied Fix Root Causes."))
         self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd /tmp && sed -n '1,80p' {principles}"}})
         self.assertEqual(self.stop("Applied Fix Root Causes.")["decision"], "block")
+
+    def fake_verify(self, mode):
+        self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
+        scripts = self.skills / "verify" / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "verify.py").write_text(textwrap.dedent(f"""\
+            import pathlib, sys
+            with open(pathlib.Path(__file__).with_name("calls.txt"), "a") as f:
+                f.write(" ".join(sys.argv[1:]) + "\\n")
+            mode = {mode!r}
+            if mode == "survivors":
+                print("pid 42 ppid 1 pgid 42 elapsed 03:00 cwd /work/app  node server.js")
+                print("1 still running. Stop them with: python3 verify.py leftovers --kill")
+                sys.exit(1)
+            if mode == "broken":
+                print("verify leftovers: cannot read process working directories")
+                sys.exit(2)
+            print("leftovers: none remain")
+            """))
+        return scripts / "calls.txt"
+
+    def errors_log(self):
+        path = pathlib.Path(self.env["GUARD_HOME"]) / "errors.log"
+        return path.read_text() if path.exists() else ""
+
+    def test_stopping_a_task_sweeps_for_leftovers_and_shows_the_result(self):
+        calls = self.fake_verify("survivors")
+        out = self.hook("PostToolUse", {"tool_name": "TaskStop", "tool_input": {"task_id": "b1"}})["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("pid 42", out)
+        self.assertEqual(calls.read_text().strip(), "leftovers --kill")
+        self.fake_verify("clean")
+        out = self.hook("PostToolUse", {"tool_name": "TaskStop", "tool_input": {}})["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("none remain", out)
+        calls.unlink()
+        self.assertIsNone(self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+        self.assertFalse(calls.exists())
+
+    def test_spawning_an_agent_is_denied_while_leftovers_survive(self):
+        calls = self.fake_verify("survivors")
+        for tool in ("Agent", "Task"):
+            out = self.hook("PreToolUse", {"tool_name": tool, "tool_input": {"prompt": "verify it"}})["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("pid 42", out["permissionDecisionReason"])
+        self.assertEqual(set(calls.read_text().split("\n")) - {""}, {"leftovers"})
+        calls.unlink()
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+        self.assertFalse(calls.exists())
+        self.fake_verify("clean")
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "verify it"}}))
+
+    def test_the_leftovers_sweep_fails_open_and_says_why(self):
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "x"}}))
+        self.assertIn("not installed", self.errors_log())
+        self.fake_verify("broken")
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "x"}}))
+        self.assertIsNone(self.hook("PostToolUse", {"tool_name": "TaskStop", "tool_input": {}}))
+        self.assertIn("exited 2", self.errors_log())
+        self.assertIn("cannot read process working directories", self.errors_log())
 
     def test_subagent_stops_are_not_checked(self):
         self.todo("add", "Implement it")

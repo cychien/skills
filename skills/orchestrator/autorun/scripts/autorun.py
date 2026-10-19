@@ -3,7 +3,7 @@
 
 usage:
   autorun.py hook <agent> <event>        entry point for agent hooks (reads the hook payload on stdin)
-  autorun.py start [--run ID] --done TEXT [--check CMD] [--goal TEXT]
+  autorun.py start [--run ID] --done TEXT [--check CMD] [--goal TEXT] [--cwd DIR] [--narrows GATE]
   autorun.py ask [--run ID] --kind KIND --question TEXT [--option TEXT ...] --pick TEXT --why TEXT --confidence LEVEL [--command TEXT]
   autorun.py done [--run ID] --evidence TEXT
   autorun.py status | report | stop [--run ID]
@@ -102,26 +102,76 @@ def cmd_start(args):
     bound, role = store.lookup(agent, session)
     run = store.resolve_cli(args.run) if args.run else (bound or store.resolve_cli(None))
     if run:
-        refuse_delegate(run, (agent, session), "sets the done condition")
+        refuse_delegate(run, (agent, session, proc), "sets the done condition")
+    cwd = os.path.realpath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        sys.exit(f"autorun: --cwd {args.cwd}: no such directory")
     if not run:
-        cwd = (proc and store.proc_cwd(proc["pid"])) or os.getcwd()
         run = store.create_run(agent, session, cwd, "start command", args.goal, proc)
         if not session:
-            store.add_pending(run, cwd)
+            store.add_pending(run, (proc and store.proc_cwd(proc["pid"])) or cwd)
+    narrowed_by = narrowing_gate(run, args)
     with run.update() as d:
         if d.get("done") and (d["done"], d.get("check")) != (args.done, args.check):
-            d.setdefault("done_history", []).append({"at": store.now(), "done": d["done"], "check": d.get("check")})
+            d.setdefault("done_history", []).append({"at": store.now(), "done": d["done"], "check": d.get("check"),
+                                                     **({"narrowed_by": narrowed_by} if narrowed_by else {})})
         d["done"], d["check"] = args.done, args.check
+        if d.get("cwd") != cwd:
+            d["cwd"] = cwd
+            if not store.has_commit(cwd, d.get("base")):
+                d["base"] = store.git_head(cwd)
         if args.goal:
             d["prompt"] = args.goal
     print(f"Run {run.id} is active. Done condition: {args.done}" + (f" (verified by: {args.check})" if args.check else ""))
+    print(f"Working directory: {cwd}")
     print(f"Decisions log: {run.decisions_path}")
+
+
+def segments(check):
+    return {part.strip() for part in (check or "").split("&&") if part.strip()}
+
+
+def extends(old, new):
+    """Whether the replacement keeps everything the current done condition demands and only adds to it."""
+    squash = lambda text: " ".join((text or "").lower().split())
+    return squash(old["done"]) in squash(new["done"]) and segments(old.get("check")) <= segments(new.get("check"))
+
+
+def narrowing_gate(run, args):
+    """The user gate that authorizes replacing the done condition with one that is not a pure extension, else None."""
+    data = run.data()
+    current = {"done": data.get("done"), "check": data.get("check")}
+    if not current["done"] or extends(current, {"done": args.done, "check": args.check}):
+        return None
+    if not args.narrows:
+        sys.exit(f"""autorun: the new done condition narrows run {run.id}: it drops or rewrites part of the current one ("{current['done']}"{f", checked by `{current['check']}`" if current['check'] else ""}). Shipping less than was asked is the user's call, so an agent cannot decide it, not even through a direction verdict.
+1. Ask: {ask_command(run.id)} --kind irreversible --question "Drop <what> from the done condition?" --pick "<your answer>" --why "..." --confidence <level>
+2. Once the user has answered, repeat this start with --narrows <gate id>.
+To only add conditions, keep the current text and the current check and append to them.""")
+    gate = next((g for g in run.gates() if g["id"] == args.narrows), None)
+    if not gate:
+        sys.exit(f"autorun: --narrows {args.narrows}: no gate with that id in run {run.id}.")
+    if gate["kind"] != "irreversible":
+        sys.exit(f"autorun: gate {gate['id']} is a {gate['kind']} gate. Narrowing the done condition needs an irreversible gate the user answered.")
+    if gate["status"] != "answered":
+        sys.exit(f"autorun: gate {gate['id']} is not answered yet ({gate['status']}). Wait for the user's answer.")
+    if any(h.get("narrowed_by") == gate["id"] for h in data.get("done_history", [])):
+        sys.exit(f"autorun: gate {gate['id']} was already used to narrow the done condition. Ask again for another narrowing.")
+    return gate["id"]
+
+
+def ask_command(run_id):
+    return f"python3 {os.path.abspath(sys.argv[0])} ask --run {run_id}"
 
 
 def cmd_ask(args):
     from autorun_lib import review
 
+    from autorun_lib import policy
+
     run = _active_run(args.run)
+    if args.kind == "dead-end" and policy.about_usage_limit(args.question, args.pick, args.why):
+        sys.exit(NOT_A_GATE)
     question = {"kind": args.kind, "question": args.question, "options": args.option or [], "pick": args.pick,
                 "why": args.why, "confidence": args.confidence, "command": args.command}
     if args.kind in ("detail", "choice") and args.confidence == "high":
@@ -142,6 +192,10 @@ def cmd_ask(args):
 
 
 LOGGED = "Recorded in {path}. List it in your final report; do not stop for it."
+NOT_A_GATE = ("NOT A GATE: a usage limit resets on its own, so it is neither a dead end nor a question for the user. "
+              "Do not ask. Finish the piece in hand and end your turn with a status line, not a question: "
+              "Claude Code waits and continues the task after the reset, while a pending question holds the session until the user answers. "
+              "After the reset, resume a subagent that stopped on the limit with SendMessage. Salvo runs wait for the reset and resume on their own.")
 
 
 def escalate(run, question, code=0):
@@ -199,6 +253,7 @@ def cmd_status(args):
 
 def cmd_stop(args):
     run = _active_run(args.run)
+    refuse_delegate(run, None, "stops the run")
     run.set_status("stopped")
     print(f"Run {run.id} stopped. Autonomous mode is off.")
 
@@ -208,7 +263,8 @@ def report(run):
     lines = [f"# Autonomous run {run.id} ({data.get('status')})", "",
              f"- Done condition: {data.get('done') or '(not set)'}" + (f", checked by `{data['check']}`" if data.get("check") else "")]
     for old in data.get("done_history", []):
-        lines.append(f"- Replaced at {old['at']}: {old['done']}" + (f", checked by `{old['check']}`" if old.get("check") else ""))
+        lines.append(f"- Replaced at {old['at']}: {old['done']}" + (f", checked by `{old['check']}`" if old.get("check") else "")
+                     + (f" (narrowed with the user's answer to gate {old['narrowed_by']})" if old.get("narrowed_by") else ""))
     if data.get("evidence"):
         lines.append(f"- Evidence: {data['evidence']}")
     decisions = [d for d in run.decisions() if d.get("basis") != "user answer"]
@@ -224,12 +280,21 @@ def report(run):
 def refuse_delegate(run, caller, action):
     """Only the run's root session may change its done condition or finish it."""
     if caller is None:
-        agent, session, _ = store.host_agent(store.processes())
-        caller = (agent, session)
-    bound, role = store.lookup(*caller) if caller[1] else (None, None)
-    if bound and bound.id == run.id and role != "root":
-        sys.exit(f"autorun: this session works inside run {run.id} as a {role}, and only its root {action}. "
-                 "Finish your task and state in your final message what done means for it.")
+        caller = store.host_agent(store.processes())
+    agent, session, proc = caller
+    bound, role = store.lookup(agent, session)
+    if bound and bound.id == run.id:
+        if role == "root":
+            return
+        who = f"works inside run {run.id} as a {role}"
+    elif os.environ.get("AUTORUN_RUN"):
+        who = f"was started by run {os.environ['AUTORUN_RUN']}"
+    elif proc and not store.is_registered(run, proc):
+        who = f"is an agent process of its own that run {run.id} never registered as its root"
+    else:
+        return
+    sys.exit(f"autorun: this session {who}, and only its root {action}. "
+             "Finish your task and state in your final message what done means for it.")
 
 
 def _active_run(run_id):
@@ -270,6 +335,8 @@ def main():
     p.add_argument("--done", required=True)
     p.add_argument("--check")
     p.add_argument("--goal")
+    p.add_argument("--cwd")
+    p.add_argument("--narrows", metavar="GATE")
     p = sub.add_parser("mode")
     p.add_argument("mode", choices=["interactive"])
     p.add_argument("--reason", required=True)

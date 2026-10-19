@@ -23,11 +23,11 @@ Every candidate gets the same prompt, so the prompt is the contract.
 
 Launch all N candidates in one run of the **salvo** skill (`../salvo/SKILL.md`), in the background where your agent supports it, each with the task, the path to the shared grounding, and instructions to produce the artifact and a short rationale naming the alternatives it considered and what it rejected.
 
-If a candidate produces no output, proceed with N-1 and note the dropout.
+If a candidate produces no output, proceed with N-1 and note the dropout. When a runner stops on a usage limit and at least two structurally distinct candidates are complete, continue without it as a dropout; wait for the reset only while fewer than two are in hand, because the wait idles the run for hours to add a candidate you no longer need.
 
 ## Phase C: Cross-judge
 
-After all Phase B candidates complete, choose one planner model from the orchestrator config, preferring a different model family from yours. Run it alone through `salvo` as a read-only judge, from the directory holding the candidates' outputs. It sees the rubric and the candidates by path label, scores each criterion, and recommends a base with rationale. It runs in parallel with your reading in Phase D. Don't spawn it while candidates are still writing.
+After all Phase B candidates complete or drop out, choose one planner model from the orchestrator config, preferring a different model family from yours. Run it alone through `salvo` as a read-only judge, from the directory holding the candidates' outputs. It sees the rubric and the candidates by path label, scores each criterion, and recommends a base with rationale. It runs in parallel with your reading in Phase D. Don't spawn it while candidates are still writing.
 
 ## Phase D: Pick a base
 

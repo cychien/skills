@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from . import policy, store
 
 PASS = ("pass", None)
+RUN_CONTROL = re.compile(r"\bpython3?\s+\S*autorun\.py['\"]?\s+(start|done|stop)\b")
 MODE_DECISION = re.compile(r"autorun\.py['\"]?\s+(start|mode)\b|guard\.py['\"]?\s+todo\b")
 PRE_TOOL_ALLOWS = {"claude"}  # agents whose pre-tool hook can grant a call; elsewhere the permission hook does
 KINDS = "detail | choice | direction | irreversible | dead-end"
@@ -186,6 +187,9 @@ def answer_gates(run, gates, answer):
 def on_pre_tool(event, run, role):
     with run.update() as d:
         d["activity"] = d.get("activity", 0) + 1
+    if role != "root" and RUN_CONTROL.search(policy.shell_command(event.tool, event.tool_input) or ""):
+        return "deny", (f"You are a {role} in autonomous run {run.id}, and only the root session may start, replace the done condition of, "
+                        "finish, or stop it. Finish your task and state in your final message what done means for it.")
     subject = policy.subject(event.tool, event.tool_input)
     if run.has_approval(subject):
         if event.agent in PRE_TOOL_ALLOWS and run.take_approval(subject):

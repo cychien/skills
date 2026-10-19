@@ -4,6 +4,7 @@ import pathlib
 import re
 import subprocess
 
+SKILL_REF = re.compile(r"\.\./([a-z0-9][a-z0-9-]*)/SKILL\.md")
 STEP = re.compile(r"^(\d+)\. (.+)$")
 STEP_HEADING = re.compile(r"^(?:(?:Step|Phase|Pass)\s+)?(?:\d+|[A-Z])[.,:)]\s*(.+)$")
 

@@ -62,7 +62,7 @@ The judge may know it is judging, but sees runs only by shuffled label, never by
    4. If you agree on whether the variant does what it promises (and beats the baseline, if there is one), go to step 10. That includes agreeing that it does not help: that is a result, so report it rather than rerunning.
    5. If you disagree, find out why from the evidence. When one side misread an output, settle it from the evidence and go to step 10.
    6. When the disagreement comes from the task or the criteria allowing both readings, the experiment was flawed. Fix the prompt or criteria and rerun from step 2, once. If the rerun still disagrees, report the disagreement instead of a verdict.
-10. **Clean up.** Run `salvo.py clean` on every arm's run directory. That removes the workspaces; the packet and key stay in the experiment directory. Stop any background command or wait you started, so no late notification lands after your report and replaces it as your last message.
+10. **Clean up.** Run `salvo.py clean` on every arm's run directory. That removes the workspaces; the packet and key stay in the experiment directory. Then run `../verify/scripts/verify.py leftovers --kill --root <experiment dir>`, because clean-room runs can start servers and autonomous runs that the arms' repos know nothing about, and `clean` cannot see what a run started outside its workspace. Stop any background command or wait you started, so no late notification lands after your report and replaces it as your last message.
 
 ## Output
 

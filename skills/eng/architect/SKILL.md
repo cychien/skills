@@ -32,7 +32,9 @@ Run the **arena** skill (`../arena/SKILL.md`) with the design-sketch task and th
 
 Run the candidates on the planner role, in place of arena's choice of role, because a design sketch is planning work.
 
-Design it twice. Require at least two structurally distinct candidates before synthesis, even when the first looks sufficient. This is the Exhaust the Design Space principle (`../principles/references/principles/exhaust-the-design-space.md`) made concrete. Whole-shape alternatives, not point fixes inside one shape.
+When the caller hands a design doc that still applies, frame the arena task as the structural gap the doc leaves open, with the doc as a fixed constraint, so "design it twice" applies to the gap and not to the shape the doc already settled.
+
+Design it twice. Require at least two structurally distinct candidates before synthesis, even when the first looks sufficient. This is the Exhaust the Design Space principle (`../principles/references/principles/exhaust-the-design-space.md`) made concrete. Alternatives to the whole framed task, not point fixes inside one shape.
 
 Screen every candidate against [`references/design-red-flags.md`](references/design-red-flags.md) before synthesis. Assume the next contributor is an agent that sees only the files it opened, copies the nearest example, and takes the shortest path that compiles. Prefer the design where a change that looks right from one file is right for the whole repo.
 

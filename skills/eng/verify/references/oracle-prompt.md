@@ -1,6 +1,6 @@
 # Oracle prompt
 
-Fill every `<...>` and send the block as the oracle's whole task. Copy the seed files into a fresh directory outside the repository, and launch the oracle from there with salvo, so the repository's code is out of reach. Use a different model family from the author's when the orchestrator config has one, because a shared misreading of the spec would match itself.
+Fill every `<...>` that contains a space and send the block as the oracle's whole task; `<id>` stays as written. The guard skill denies a subagent prompt that still holds a fill. Copy the seed files into a fresh directory outside the repository, and launch the oracle from there with salvo, so the repository's code is out of reach. Use a different model family from the author's when the orchestrator config has one, because a shared misreading of the spec would match itself.
 
 ```
 Compute what a correct implementation must show, from the definition and the data below. You have no access to any implementation, and you must not look for one.

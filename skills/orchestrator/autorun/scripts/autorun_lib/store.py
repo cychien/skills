@@ -175,7 +175,7 @@ def create_run(agent, session, cwd, trigger, prompt, agent_proc=None):
         "cwd": cwd,
         "trigger": trigger,
         "prompt": (prompt or "")[:4000],
-        "base": _git_head(cwd),
+        "base": git_head(cwd),
         "done": None,
         "check": None,
         "agent_procs": [agent_proc] if agent_proc else [],
@@ -191,12 +191,25 @@ def create_run(agent, session, cwd, trigger, prompt, agent_proc=None):
     return run
 
 
-def _git_head(cwd):
+def git_head(cwd):
     try:
         out = subprocess.run(["git", "-C", cwd or ".", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return out.stdout.strip() if out.returncode == 0 else None
+
+
+def has_commit(cwd, rev):
+    if not rev:
+        return False
+    try:
+        return subprocess.run(["git", "-C", cwd, "cat-file", "-e", f"{rev}^{{commit}}"], capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def is_registered(run, proc):
+    return proc in run.data().get("agent_procs", [])
 
 
 def bind(agent, session, run, role):

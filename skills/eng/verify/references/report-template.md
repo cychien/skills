@@ -7,7 +7,7 @@ Verifier: <agent:model that produced the verdicts>
 
 | Check | Verdict | Evidence | Observed |
 |---|---|---|---|
-| <id> | <PASS, FAIL, or INCONCLUSIVE> | <evidence files, comma-separated, relative to this directory> | <one line; a FAIL starts with "defect:" and the repro, an INCONCLUSIVE with "blocker:"> |
+| <id> | <PASS, FAIL, or INCONCLUSIVE> | <evidence files, globs, or brace patterns, comma-separated, relative to this directory; each must match a directory or a non-empty file written after the freeze> | <one line; a FAIL starts with "defect:" and the repro, an INCONCLUSIVE with "blocker:"> |
 
 ## Perf numbers
 

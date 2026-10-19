@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,11 +34,30 @@ class Harness(unittest.TestCase):
         self.assertFalse((self.home / "errors.log").exists(), (self.home / "errors.log").read_text() if (self.home / "errors.log").exists() else "")
         return json.loads(r.stdout) if r.stdout.strip() else None
 
-    def cli(self, *args, ok=True):
-        r = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
+    def cli(self, *args, ok=True, cwd=None):
+        env = {**self.env, "AUTORUN_BOUNDARY_PID": str(os.getppid())}
+        r = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=env, cwd=cwd or self.tmp.name)
         if ok:
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout + r.stderr
+
+    def run_data(self, run):
+        return json.loads((self.home / "runs" / run / "run.json").read_text())
+
+    def as_agent(self, name, *args, env=None, boundary=True):
+        """Run autorun.py under a process named like an agent CLI, the way a salvo runner or a nested agent calls it."""
+        binary = self.home / "bin" / name
+        if not binary.exists():
+            binary.parent.mkdir(exist_ok=True)
+            binary.symlink_to(sys.executable)
+        child_env = {**self.env, **(env or {})}
+        if boundary:
+            child_env["AUTORUN_BOUNDARY_PID"] = str(os.getpid())
+        code = f"import subprocess, sys; r = subprocess.run([{sys.executable!r}, {str(SCRIPT)!r}, *{list(args)!r}], capture_output=True, text=True); sys.stdout.write(str(r.returncode) + chr(10) + r.stdout + r.stderr)"
+        r = subprocess.run([str(binary), "-c", code], capture_output=True, text=True, env=child_env, cwd=self.tmp.name)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        status, _, output = r.stdout.partition("\n")
+        return int(status), output
 
     def start_run(self):
         out = self.hook("UserPromptSubmit", {"prompt": "fix the flaky test, I'm going to bed"})
@@ -53,6 +73,18 @@ class Harness(unittest.TestCase):
 
 
 class AutorunFlow(Harness):
+    def test_a_usage_limit_is_not_a_gate(self):
+        run = self.start_run()
+        for question in ["The account usage limit was reached, so no agent can continue until it resets. Resume after the reset?",
+                         "Usage 額度已到上限,要等恢復後繼續嗎?"]:
+            out = self.cli("ask", "--run", run, "--kind", "dead-end", "--question", question,
+                           "--pick", "resume after the reset", "--why", "every step needs model calls", "--confidence", "high", ok=False)
+            self.assertIn("NOT A GATE", out)
+        self.assertFalse(list((self.home / "runs" / run / "gates").glob("*.json")))
+        product = self.cli("ask", "--run", run, "--kind", "detail", "--question", "Should the free plan's usage limit be 100 calls a day?",
+                           "--pick", "100", "--why", "matches the pricing page", "--confidence", "high")
+        self.assertIn("DECIDED", product)
+
     def test_normal_prompt_stays_out_of_the_way(self):
         self.assertIsNone(self.hook("UserPromptSubmit", {"prompt": "rename this function"}))
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "AskUserQuestion", "tool_input": {}}))
@@ -229,6 +261,136 @@ class AutorunFlow(Harness):
         self.assertIn("only its root sets the done condition", out)
         self.assertEqual(json.loads((self.home / "runs" / run / "run.json").read_text())["done"], "the root's condition")
 
+    def test_a_runner_whose_session_is_unresolved_cannot_replace_or_finish_the_root_run(self):
+        run = self.start_run()
+        self.cli("start", "--run", run, "--done", "the root's condition")
+        for env, boundary, command in [({}, True, ["start", "--run", run, "--done", "the runner's condition"]),
+                                       ({}, True, ["done", "--run", run, "--evidence", "all green"]),
+                                       ({}, True, ["stop", "--run", run]),
+                                       ({"AUTORUN_RUN": run}, False, ["start", "--done", "the runner's condition"]),
+                                       ({"AUTORUN_RUN": run}, False, ["done", "--evidence", "all green"]),
+                                       ({"AUTORUN_RUN": run}, False, ["stop"])]:
+            status, output = self.as_agent("codex", *command, env=env, boundary=boundary)
+            self.assertNotEqual(status, 0, (command, output))
+            self.assertIn("only its root", output)
+        data = self.run_data(run)
+        self.assertEqual((data["status"], data["done"]), ("active", "the root's condition"))
+        self.assertNotIn("done_history", data)
+        self.cli("start", "--session", "claude:s-root", "--run", run, "--done", "the root's condition and docs")
+        self.assertEqual(self.run_data(run)["done"], "the root's condition and docs")
+        self.cli("stop", "--run", run)
+
+    def test_the_agent_process_that_registered_as_root_is_the_root(self):
+        payload = json.dumps({"session_id": "", "cwd": self.tmp.name, "prompt": "going to bed"})
+        code = (f"import subprocess, sys; run = lambda *a, **k: subprocess.run([{sys.executable!r}, {str(SCRIPT)!r}, *a], text=True, capture_output=True, **k); "
+                f"run('hook', 'copilot', 'userPromptSubmitted', input={payload!r}); "
+                f"r = run('start', '--session', 'copilot:', '--done', 'x'); sys.stdout.write(str(r.returncode) + r.stdout + r.stderr)")
+        binary = self.home / "bin" / "copilot"
+        binary.parent.mkdir(exist_ok=True)
+        binary.symlink_to(sys.executable)
+        env = {**self.env, "AUTORUN_BOUNDARY_PID": str(os.getppid())}
+        out = subprocess.run([str(binary), "-c", code], env=env, capture_output=True, text=True).stdout
+        self.assertTrue(out.startswith("0"), out)
+        run = next((self.home / "active").iterdir()).name
+        self.assertEqual((len(self.run_data(run)["agent_procs"]), self.run_data(run)["done"]), (1, "x"))
+        status, output = self.as_agent("codex", "start", "--run", run, "--done", "x and more")
+        self.assertNotEqual(status, 0)
+        self.assertIn("only its root", output)
+        self.assertEqual(self.run_data(run)["done"], "x")
+
+    def test_a_native_subagent_cannot_run_start_done_or_stop(self):
+        run = self.start_run()
+        self.cli("start", "--run", run, "--done", "the root's condition")
+        for verb in ("start --done x", "done --evidence x", "stop"):
+            command = f"cd /work && python3 {SCRIPT} {verb} --run {run}"
+            out = self.hook("PreToolUse", {"agent_id": "a1", "tool_name": "Bash", "tool_input": {"command": command}})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", verb)
+            self.assertIn("only the root session", out["hookSpecificOutput"]["permissionDecisionReason"])
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}}), verb)
+        ask = f"python3 {SCRIPT} ask --run {run} --kind detail --question q --pick a --why w --confidence high"
+        self.assertIsNone(self.hook("PreToolUse", {"agent_id": "a1", "tool_name": "Bash", "tool_input": {"command": ask}}))
+        self.assertIsNone(self.hook("PreToolUse", {"agent_id": "a1", "tool_name": "Bash", "tool_input": {"command": "grep 'autorun.py done' notes.md"}}))
+
+    def test_start_records_the_shell_cwd_and_the_check_runs_there(self):
+        repo = pathlib.Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        for command in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"]):
+            subprocess.run(["git", *command], cwd=repo, check=True, capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+        run = self.start_run()
+        self.assertNotEqual(self.run_data(run)["cwd"], os.path.realpath(repo))
+        out = self.cli("start", "--run", run, "--done", "in a repo", "--check", "git rev-parse --show-toplevel", cwd=repo)
+        self.assertIn(f"Working directory: {os.path.realpath(repo)}", out)
+        data = self.run_data(run)
+        self.assertEqual((data["cwd"], data["base"]), (os.path.realpath(repo), head))
+        self.assertIn("is done", self.cli("done", "--run", run, "--evidence", "inside the repo"))
+
+    def test_start_takes_an_explicit_cwd(self):
+        work = pathlib.Path(self.tmp.name) / "work"
+        work.mkdir()
+        run = self.start_run()
+        out = self.cli("start", "--run", run, "--done", "elsewhere", "--check", "test \"$(pwd -P)\" = " + str(os.path.realpath(work)), "--cwd", str(work))
+        self.assertIn(f"Working directory: {os.path.realpath(work)}", out)
+        self.assertEqual(self.run_data(run)["cwd"], os.path.realpath(work))
+        self.assertIn("is done", self.cli("done", "--run", run, "--evidence", "ran in work"))
+        self.assertIn("no such directory", self.cli("start", "--session", "claude:s-new", "--done", "x", "--cwd", str(work / "missing"), ok=False))
+
+    def test_a_new_run_from_start_records_the_shell_cwd(self):
+        work = pathlib.Path(self.tmp.name) / "work"
+        work.mkdir()
+        self.cli("start", "--session", "claude:s-new", "--done", "x", cwd=work)
+        run = next((self.home / "active").iterdir()).name
+        self.assertEqual(self.run_data(run)["cwd"], os.path.realpath(work))
+
+    def narrowing_run(self):
+        run = self.start_run()
+        self.cli("start", "--run", run, "--done", "tests pass and docs updated", "--check", "test -f a && test -f b")
+        return run
+
+    def answered_gate(self, run, kind):
+        gate = re.search(r"gate (g-[0-9a-f]+)", self.ask(run, kind))[1]
+        self.hook("UserPromptSubmit", {"prompt": "yes, go ahead"})
+        return gate
+
+    def test_extending_the_done_condition_needs_no_gate(self):
+        run = self.narrowing_run()
+        out = self.cli("start", "--run", run, "--done", "tests pass and docs updated and the changelog is written", "--check", "test -f a && test -f b && test -f c")
+        self.assertIn("is active", out)
+        self.cli("start", "--run", run, "--done", "tests pass and docs updated and the changelog is written", "--check", "test -f a && test -f b && test -f c")
+        self.assertEqual(len(self.run_data(run)["done_history"]), 1)
+
+    def test_a_narrower_done_condition_is_refused_without_an_answered_user_gate(self):
+        run = self.narrowing_run()
+        for done, check in [("tests pass and docs updated", "test -f a"), ("tests pass and docs updated", None), ("tests pass", "test -f a && test -f b"),
+                            ("tests pass and docs updated", "test -f a || test -f b")]:
+            args = ["start", "--run", run, "--done", done] + (["--check", check] if check else [])
+            out = self.cli(*args, ok=False)
+            self.assertIn("narrows", out)
+            self.assertIn(f"ask --run {run} --kind irreversible", out)
+            self.assertIn("--narrows", out)
+        self.assertEqual(self.run_data(run)["done"], "tests pass and docs updated")
+        narrower = ["start", "--run", run, "--done", "tests pass and docs updated", "--check", "test -f a"]
+        self.assertIn("no gate", self.cli(*narrower, "--narrows", "g-000000", ok=False))
+        direction = self.answered_gate(run, "direction")
+        self.assertIn("irreversible", self.cli(*narrower, "--narrows", direction, ok=False))
+        self.assertEqual(self.run_data(run)["check"], "test -f a && test -f b")
+        self.ask(run, "irreversible")
+        waiting = next(g for g in json.loads("[" + ",".join(p.read_text() for p in (self.home / "runs" / run / "gates").glob("g-*.json")) + "]") if g["status"] == "open")
+        self.assertIn("not answered", self.cli(*narrower, "--narrows", waiting["id"], ok=False))
+
+    def test_an_answered_irreversible_gate_lets_the_done_condition_narrow_once(self):
+        run = self.narrowing_run()
+        gate = self.answered_gate(run, "irreversible")
+        narrower = ["start", "--run", run, "--done", "tests pass and docs updated", "--check", "test -f a", "--narrows", gate]
+        self.assertIn("is active", self.cli(*narrower))
+        data = self.run_data(run)
+        self.assertEqual(data["check"], "test -f a")
+        self.assertEqual(data["done_history"][-1]["check"], "test -f a && test -f b")
+        self.assertEqual(data["done_history"][-1]["narrowed_by"], gate)
+        self.assertIn(gate, self.cli("report", "--run", run))
+        again = ["start", "--run", run, "--done", "tests pass", "--narrows", gate]
+        self.assertIn("already used", self.cli(*again, ok=False))
+
     def test_unrelated_session_in_same_process_does_not_join(self):
         self.start_run()
         self.assertIsNone(self.hook("PreToolUse", {"session_id": "s-other", "tool_name": "AskUserQuestion", "tool_input": {}}))
@@ -378,6 +540,7 @@ class Policy(unittest.TestCase):
         for c in ["git push origin feature", "rm -rf node_modules", "rm -rf ./build", "git commit -m 'force push docs'", "npm test"]:
             self.assertFalse(bash(c), c)
         self.assertTrue(policy.irreversible("mcp__slack__send_message", {}))
+        self.assertFalse(policy.irreversible("SendMessage", {"to": "executor", "message": "continue"}))
         self.assertTrue(policy.irreversible("exec_command", {"cmd": ["git", "push", "--force"]}))
 
     def test_own_cli_is_recognized_only_when_alone(self):

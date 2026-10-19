@@ -1,9 +1,12 @@
 """Guard's hard rules. Each hook event returns (action, message); the shared hook runtime renders it per agent."""
 import glob
 import os
+import pathlib
 import re
 import shlex
 import subprocess
+import sys
+import time
 
 from . import pr, skills, state
 
@@ -18,6 +21,21 @@ SHELL_SPLIT = re.compile(r"&&|\|\||;|\||\n")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 FOR_LOOP = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;]+?)\s*;\s*do\b")
 VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+SALVO_RUN = re.compile(r"salvo\.py['\"]?\s+run\b")
+FILL = re.compile(r"<[^<>\n]* [^<>\n]*>")
+STDIN_FILE = re.compile(r"<\s*([^\s<>|;&]+)")
+DETACHED = re.compile(r"\bnohup\b|(?<![&|<>])&(?![&>])")
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\b", re.S)
+QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+SALVO_DETACHED = ("salvo runs every model and blocks until all finish. Detaching it with nohup or a trailing & hides it from the "
+                  "harness, so nothing notifies you when it ends. Run the same command without nohup or & in a background tool call "
+                  "(Claude Code: Bash with run_in_background) and wait for its completion notification.")
+
+
+SPAWN_TOOLS = {"agent", "task"}
+LEFTOVERS_TIMEOUT = 30
+LEFTOVERS_DENIED = ("Processes from earlier delegates or tasks are still running. Spawning another agent on top of them hides which one "
+                    "caused any later problem and burns the machine. Stop them, then spawn again.\n")
 
 
 def expand(text, variables):
@@ -146,10 +164,40 @@ def files_read(event):
     return paths
 
 
+def sweep_leftovers(event, *flags):
+    """Run the verify skill's leftovers sweep. Returns (exit code, output), or None when it cannot run, which is logged and never blocks the agent."""
+    found = skills.find("verify", event.cwd)
+    script = found.parent / "scripts" / "verify.py" if found else None
+    if not script or not script.is_file():
+        return skipped("the verify skill is not installed")
+    try:
+        r = subprocess.run([sys.executable, str(script), "leftovers", *flags], cwd=event.cwd, capture_output=True, text=True, timeout=LEFTOVERS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return skipped(f"{type(e).__name__}: {e}")
+    output = (r.stdout + r.stderr).strip()
+    if r.returncode not in (0, 1):
+        return skipped(f"the sweep exited {r.returncode}: {output[-300:]}")
+    return r.returncode, output
+
+
+def skipped(why):
+    try:
+        state.HOME.mkdir(parents=True, exist_ok=True)
+        with open(state.HOME / "errors.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} leftovers sweep skipped: {why}\n")
+    except OSError:
+        pass
+    return None
+
+
 def on_post_tool(event):
-    loaded, read = [], []
+    if (event.tool or "").lower() == "taskstop":
+        swept = sweep_leftovers(event, "--kill")
+        return ("context", swept[1]) if swept and swept[1] and event.can_inject else PASS
+    loaded, read, invoked = [], [], set()
     if event.tool and event.tool.lower() == "skill" and isinstance(event.tool_input, dict) and event.tool_input.get("skill"):
         loaded.append(event.tool_input["skill"].split(":")[-1])
+        invoked.add(loaded[-1])
     for path in files_read(event):
         if (m := SKILL_FILE.search(path)) and skills.followed(path, event.cwd):
             loaded.append(m.group(1))
@@ -163,7 +211,8 @@ def on_post_tool(event):
             if name not in data["skills"]:
                 data["skills"].append(name)
             path = skills.find(name, event.cwd)
-            if not data.get("todo_undecided") and not event.agent_id and path and needs_decision(data, name, path):
+            cited = name not in invoked and any(name in skills.SKILL_REF.findall(i["text"]) for i in state.open_items(data))
+            if not data.get("todo_undecided") and not event.agent_id and not cited and path and needs_decision(data, name, path):
                 data["todo_undecided"] = name
         for name in read:
             if name not in data["principles_read"]:
@@ -172,10 +221,20 @@ def on_post_tool(event):
 
 
 def on_pre_tool(event):
+    command = shell_command(event) or ""
+    if detached_salvo(command):
+        return "deny", SALVO_DETACHED
+    unfilled = unfilled_template(outgoing_prompt(event, command), event.cwd)
+    if unfilled:
+        return "deny", ("This subagent prompt comes from a skill's prompt template but still holds unfilled placeholders: "
+                        + ", ".join(unfilled) + ". Fill each one, then send it again.")
+    if (event.tool or "").lower() in SPAWN_TOOLS:
+        swept = sweep_leftovers(event)
+        if swept and swept[0] == 1:
+            return "deny", LEFTOVERS_DENIED + swept[1]
     if not state.exists(event.agent, event.session):
         return PASS
     data = state.load(event.agent, event.session)
-    command = shell_command(event) or ""
     skill = data.get("todo_undecided")
     if skill and not event.agent_id and not DECISION.search(command) and not reads_a_skill(event):
         return "deny", todo_hint(skill, event)
@@ -185,6 +244,57 @@ def on_pre_tool(event):
     if not found:
         return PASS
     return "deny", "The open-pr skill's PR rules reject this command:\n- " + "\n- ".join(found) + "\nFix the command and run it again."
+
+
+def outgoing_prompt(event, command):
+    inp = event.tool_input if isinstance(event.tool_input, dict) else {}
+    if isinstance(inp.get("prompt"), str):
+        return inp["prompt"]
+    if not SALVO_RUN.search(command):
+        return ""
+    found = STDIN_FILE.search(HEREDOC.sub("", command))
+    if not found:
+        return ""
+    path = os.path.join(event.cwd or ".", os.path.expanduser(found.group(1)))
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def prompt_templates(cwd):
+    found = []
+    for root in skills.roots(cwd):
+        for path in glob.glob(str(root / "*" / "references" / "*-prompt.md")):
+            try:
+                text = pathlib.Path(path).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            blocks = text.split("```")
+            if len(blocks) < 3:
+                continue
+            block = blocks[1].split("\n", 1)[-1]
+            marker = next((line.strip() for line in block.splitlines() if line.strip()), "")
+            fills = sorted(set(FILL.findall(block)))
+            if marker and fills:
+                found.append((marker, fills))
+    return found
+
+
+def unfilled_template(text, cwd):
+    if not text:
+        return []
+    left = []
+    for marker, fills in prompt_templates(cwd):
+        if marker in text:
+            left += [fill for fill in fills if fill in text and fill not in left]
+    return left
+
+
+def detached_salvo(command):
+    bare = QUOTED.sub("", HEREDOC.sub("", command))
+    return bool(SALVO_RUN.search(bare) and DETACHED.search(bare))
 
 
 def reads_a_skill(event):

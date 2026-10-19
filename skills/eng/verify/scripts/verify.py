@@ -2,6 +2,10 @@
 """Hard checks for the verify skill. Each subcommand exits 0 only when its rule holds.
 
 usage: verify.py <command> [--dir DIR]
+       verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
+       verify.py rerun [--timeout SECONDS] [-- ARGS ...]
+       verify.py commits [<base>..<head>] [--cmd CMD] [--typecheck CMD] [--timeout SECONDS]
+       verify.py leftovers [--kill] [--root DIR ...]
 
   where       print this branch's verification directory
   plan        the plan is complete: checks with every field, and a perf decision
@@ -13,6 +17,28 @@ usage: verify.py <command> [--dir DIR]
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match
               the comparison
   decisions   the hillclimb decision log is well formed
+  units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
+              base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
+              else pytest or unittest for .py files), or --test-cmd gives it, with {files} for the spec path.
+              A spec file whose text contains "regression-guard" (in a title or a comment) guards behavior that
+              already works: it must pass at head but may pass on base. Keep guards in their own spec files.
+  rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
+              instance id) to each; one PASS or FAIL line per check from its exit code, and a summary. Exits 0
+              with a "no saved check scripts" line when there are none.
+  commits     check every commit in <base>..<head> (default like units), one at a time in a scratch tree: --typecheck
+              first when given, then --cmd (default: the project's test script, else pytest or unittest). One PASS or
+              FAIL line per commit; a commit that leaves a process running in its tree FAILs and the process is killed.
+              A spec-only commit (subject starting with "test", or only spec files) reports its result but does not
+              fail the run.
+  leftovers   list processes still running from this run's places: the verification directory,
+              ~/.cache/parlor-verify-hello, $PARLOR_VERIFY_HOME, $VERIFY_SCRATCHPAD (the agent scratchpad),
+              /tmp/salvo-*, each --root, and, when their parent is init, anything under a worktree of this repo
+              (the user's own shells and editors live there). A process counts when its working directory
+              (deleted ones included) or its command line is under one of them. The caller and its ancestors never
+              count. Exits 1 while any remain and 2 when the scan itself cannot run. --kill sends SIGTERM to each
+              process group, then SIGKILL to survivors, and rescans. When nothing remains but the 1-minute load
+              exceeds the core count, it also lists the busiest processes and flags those whose parent is init as
+              likely leftovers (the exit code is unaffected).
 
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
 the root, --dir overrides the whole path). It holds plan.md, plan.lock, report.md,
@@ -20,14 +46,21 @@ decision.tsv, and the evidence files. An oracle check <id> also has <id>.expecte
 agent that read only the spec and the seed data, and <id>.observed.json, read from the running app.
 """
 import argparse
+import contextlib
 import datetime
+import glob
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
 import re
+import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 CHECK_FIELDS = ("Scenario", "Surface", "Evidence", "Pass")
@@ -44,11 +77,29 @@ PLACEHOLDER = re.compile(r"<[^<>\n]* [^<>\n]*>")
 NA = re.compile(r"^n/a:\s*(.*)$")
 HEADER_FIELD = re.compile(r"^(Head|Main|Author|Verifier):\s*(.*)$", re.M)
 MIN_REASON = 10
-TRIAGE = re.compile(r"\bTriage:\s*(fixed|new check|pre-existing|dismissed)\b", re.I)
+TRIAGE = re.compile(r"\bTriage:\s*(fixed|new check|follow-up|pre-existing|dismissed)\b", re.I)
+
+
+SPEC_FILE = re.compile(r"(^|/)(test_[^/]*\.py|[^/]*_test\.(py|go)|[^/]*\.(test|spec)\.[cm]?[jt]sx?|[^/]*_spec\.rb|[^/]*Tests?\.(swift|kt|java))$")
+GUARD_MARK = "regression-guard"
+CHECK_SCRIPT = re.compile(r"^(.+)\.check\.[^.]+$")
+SCRIPT_RUNNERS = {".py": [sys.executable], ".sh": ["bash"], ".js": ["node"], ".mjs": ["node"], ".ts": ["npx", "tsx"]}
+NODE_LOCKS = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bunx", "bun.lockb": "bunx"}
+DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
+SCRIPT_TIMEOUT = 900
+GLOB_MAGIC = re.compile(r"[*?\[]")
+KILL_WAIT_S = 3.0
+TOP_CPU = 5
+SALVO_GLOBS = ("/tmp/salvo-*", "/private/tmp/salvo-*")
+TEST_SCRIPTS = {"pnpm-lock.yaml": "pnpm test", "yarn.lock": "yarn test", "bun.lock": "bun run test", "bun.lockb": "bun run test"}
 
 
 class Failed(Exception):
-    pass
+    code = 1
+
+
+class CannotScan(Failed):
+    code = 2
 
 
 def git(*args, cwd=None):
@@ -372,6 +423,67 @@ def table_rows(text):
     return rows
 
 
+def split_cell(text):
+    """Split an Evidence cell on commas outside braces."""
+    parts, depth, last = [], 0, 0
+    for i, c in enumerate(text):
+        depth += (c == "{") - (c == "}" and depth > 0)
+        if c == "," and depth == 0:
+            parts.append(text[last:i])
+            last = i + 1
+    return parts + [text[last:]]
+
+
+def expand_braces(pattern):
+    start = pattern.find("{")
+    depth, parts, last = 0, [], start + 1
+    for i in range(max(start, 0), len(pattern)):
+        c = pattern[i]
+        if c == "{":
+            depth += 1
+        elif c == "," and depth == 1:
+            parts.append(pattern[last:i])
+            last = i + 1
+        elif c == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                parts.append(pattern[last:i])
+                head, tail = pattern[:start], pattern[i + 1:]
+                return [x for part in parts for x in expand_braces(head + part + tail)]
+    return [pattern]
+
+
+def evidence_files(directory, pattern):
+    """(matched paths, their non-empty files) for one evidence pattern, relative to the verification directory."""
+    p = pathlib.Path(pattern).expanduser()
+    full = str(p if p.is_absolute() else directory / p)
+    if GLOB_MAGIC.search(pattern):
+        matches = [pathlib.Path(m) for m in glob.glob(full, recursive=True)]
+    else:
+        matches = [pathlib.Path(full)] if os.path.exists(full) else []
+    found = [f for m in matches for f in ([m] if m.is_file() else m.rglob("*")) if f.is_file() and f.stat().st_size]
+    return matches, found
+
+
+def evidence_problems(directory, check_id, spec, frozen_ts):
+    """Problems with one Evidence entry: a file, a directory, or a glob or brace pattern, each needing non-empty files made after the freeze."""
+    problems = []
+    for pattern in expand_braces(spec):
+        matches, found = evidence_files(directory, pattern)
+        plain = not GLOB_MAGIC.search(pattern) and pattern == spec
+        if found:
+            if min(f.stat().st_mtime for f in found) >= frozen_ts:
+                continue
+            single = plain and matches[0].is_file()
+            problems.append(f"evidence {pattern} {'predates' if single else 'holds files that predate'} the frozen plan; "
+                            "freeze the plan before a verifier runs, then verify again")
+        elif plain:
+            problems.append(f"evidence {pattern} is " + ("an empty directory" if matches and matches[0].is_dir() else "missing or empty"))
+        else:
+            problems.append(f"{check_id} evidence {pattern} " + ("matches only empty files" if matches else "matches nothing"))
+    return problems
+
+
 def cmd_report(directory, args):
     _, text, ids, oracles = load_plan(directory)
     lock = frozen_lock(directory, text)
@@ -400,7 +512,7 @@ def cmd_report(directory, args):
         findings = [line.strip() for line in exploration.group(1).splitlines() if re.match(r"^\s*[-*] ", line)]
         for finding in findings:
             if not TRIAGE.search(finding):
-                problems.append(f"exploration finding has no 'Triage: fixed | new check | pre-existing | dismissed': {finding[:80]}")
+                problems.append(f"exploration finding has no 'Triage: fixed | new check | follow-up | pre-existing | dismissed': {finding[:80]}")
     rows = {}
     for number, cells in table_rows(report):
         if len(cells) < 4:
@@ -414,22 +526,11 @@ def cmd_report(directory, args):
         number, (_, verdict, evidence, observed, *_) = rows[check_id]
         if verdict not in VERDICTS:
             problems.append(f"{number}: verdict must be one of {', '.join(VERDICTS)}")
-        files = [e.strip().strip("`") for e in evidence.split(",") if e.strip()]
+        files = [e.strip().strip("`") for e in split_cell(evidence) if e.strip()]
         if not files:
             problems.append(f"{number}: {check_id} names no evidence file")
         for f in files:
-            p = pathlib.Path(f).expanduser()
-            p = p if p.is_absolute() else directory / p
-            if p.is_dir():
-                files = [x for x in p.rglob("*") if x.is_file() and x.stat().st_size]
-                if not files:
-                    problems.append(f"{number}: evidence {f} is an empty directory")
-                elif min(x.stat().st_mtime for x in files) < lock["frozen_ts"]:
-                    problems.append(f"{number}: evidence {f} holds files that predate the frozen plan; freeze the plan before a verifier runs, then verify again")
-            elif not p.is_file() or p.stat().st_size == 0:
-                problems.append(f"{number}: evidence {f} is missing or empty")
-            elif p.stat().st_mtime < lock["frozen_ts"]:
-                problems.append(f"{number}: evidence {f} predates the frozen plan; freeze the plan before a verifier runs, then verify again")
+            problems += [f"{number}: {p}" for p in evidence_problems(directory, check_id, f, lock["frozen_ts"])]
         if check_id in oracles:
             file_problems, diffs = compare_oracle(directory, check_id, oracles[check_id], lock)
             problems += [f"{number}: {p}" for p in file_problems]
@@ -465,8 +566,384 @@ def cmd_decisions(directory, args):
     return f"decision log ok: {len(rows)} attempts, {kept} kept"
 
 
+def check_scripts(directory):
+    return sorted(p for p in directory.iterdir() if p.is_file() and CHECK_SCRIPT.match(p.name))
+
+
+def script_command(path):
+    if os.access(path, os.X_OK):
+        return [str(path)]
+    runner = SCRIPT_RUNNERS.get(path.suffix)
+    return [*runner, str(path)] if runner else None
+
+
+def cmd_rerun(directory, args):
+    scripts = check_scripts(directory)
+    if not scripts:
+        return f"no saved check scripts (<id>.check.<ext>) in {directory}; nothing to rerun"
+    env = {**os.environ, "VERIFY_DIR": str(directory)}
+    lines, failed = [], 0
+    for path in scripts:
+        check_id = CHECK_SCRIPT.match(path.name).group(1)
+        command = script_command(path)
+        started = time.time()
+        if not command:
+            verdict, detail = "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}"
+        else:
+            try:
+                r = run_in_group([*command, *args.rest], args.timeout, env=env)
+                output = (r.stdout + r.stderr).strip()
+                (directory / f"{check_id}.rerun.log").write_text(output + "\n")
+                verdict = "PASS" if r.returncode == 0 else "FAIL"
+                detail = "" if verdict == "PASS" else f"exit {r.returncode}"
+                if verdict == "FAIL" and output:
+                    detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
+            except subprocess.TimeoutExpired:
+                verdict, detail = "FAIL", f"timed out after {args.timeout}s"
+        failed += verdict == "FAIL"
+        head, _, rest = detail.partition("\n")
+        lines.append(f"{verdict:<5} {check_id}  ({time.time() - started:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
+    summary = f"rerun: {len(scripts)} checks, {len(scripts) - failed} PASS, {failed} FAIL"
+    lines.append(summary)
+    if failed:
+        raise Failed("\n" + "\n".join(lines))
+    return "\n".join(lines)
+
+
+def changed_specs(base, head):
+    names = git("diff", "--name-only", "--diff-filter=ACMR", base, head).splitlines()
+    return [n for n in names if SPEC_FILE.search(n)]
+
+
+def spec_command(top, spec, template):
+    if template:
+        return template.replace("{files}", shlex.quote(spec)) if "{files}" in template else f"{template} {shlex.quote(spec)}"
+    if spec.endswith(".py"):
+        module = "pytest" if importlib.util.find_spec("pytest") else "unittest"
+        return f"{shlex.quote(sys.executable)} -m {module} {shlex.quote(spec)}"
+    package = top / "package.json"
+    if package.is_file():
+        data = json.loads(package.read_text())
+        deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+        runner = next((r for r in ("vitest", "jest") if r in deps), None)
+        if runner:
+            launcher = next((cmd for lock, cmd in NODE_LOCKS.items() if (top / lock).exists()), "npx")
+            return f"{launcher} {runner}{' run' if runner == 'vitest' else ''} {shlex.quote(spec)}"
+    raise Failed(f"cannot detect how to run {spec}. Pass --test-cmd '<command>' with {{files}} where the spec path goes, "
+                 "for example --test-cmd 'pnpm vitest run {files}'.")
+
+
+def kill_group(pgid):
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def run_in_group(command, timeout, **kwargs):
+    """subprocess.run in its own session, so a timeout kills the command and everything it started."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, **kwargs) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(proc.pid)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=KILL_WAIT_S)
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def process_table():
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,pcpu=,command="], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise CannotScan(f"cannot list processes with ps: {e}")
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) == 7 and parts[0].isdigit():
+            rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "pgid": int(parts[2]), "stat": parts[3],
+                         "elapsed": parts[4], "cpu": float(parts[5]), "command": parts[6]})
+    return rows
+
+
+def process_cwds():
+    """Working directory of every process this user can see; a deleted one keeps the path it had."""
+    proc = pathlib.Path("/proc")
+    if (proc / "self" / "cwd").exists():
+        cwds = {}
+        for entry in proc.iterdir():
+            with contextlib.suppress(OSError):
+                cwds[int(entry.name)] = os.readlink(entry / "cwd").removesuffix(" (deleted)")
+        return cwds
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise CannotScan(f"cannot read process working directories with lsof: {e}")
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def lineage(table):
+    """This process and its ancestors, which must never count as leftovers."""
+    parents = {row["pid"]: row["ppid"] for row in table}
+    chain, pid = set(), os.getpid()
+    while pid and pid not in chain:
+        chain.add(pid)
+        pid = parents.get(pid)
+    return chain
+
+
+def worktree_paths():
+    try:
+        out = git("worktree", "list", "--porcelain")
+    except (Failed, OSError):
+        return []
+    return [line.removeprefix("worktree ") for line in out.splitlines() if line.startswith("worktree ")]
+
+
+def default_roots(directory):
+    named = [directory, "~/.cache/parlor-verify-hello", os.environ.get("PARLOR_VERIFY_HOME"), os.environ.get("VERIFY_SCRATCHPAD"), *SALVO_GLOBS]
+    return [str(pathlib.Path(r).expanduser()) for r in named if r]
+
+
+def root_patterns(roots):
+    """A test of (working directory, command line) against the roots and their real paths; * in a root matches within one path segment."""
+    skipped = {"/", str(pathlib.Path.home())}
+    paths = {p.rstrip("/") for r in roots for p in (r, os.path.realpath(r)) if p.rstrip("/") not in skipped | {""}}
+    body = "|".join("[^/]*".join(re.escape(piece) for piece in p.split("*")) for p in sorted(paths))
+    if not body:
+        return lambda cwd, command: False
+    in_cwd, in_command = re.compile(rf"^(?:{body})(?:/|$)"), re.compile(rf"(?<![\w./-])(?:{body})(?=/|$|[^\w.-])")
+    return lambda cwd, command: bool((cwd and in_cwd.search(cwd)) or in_command.search(command))
+
+
+def find_leftovers(roots, orphan_roots=()):
+    """Processes under any root, plus orphans (parent init) under orphan roots, where the user's own shells and editors live."""
+    under, orphaned_under = root_patterns(roots), root_patterns(orphan_roots)
+    table = process_table()
+    skip = lineage(table)
+    cwds = process_cwds()
+    return [{**row, "cwd": cwds.get(row["pid"])} for row in table
+            if row["pid"] not in skip and not row["stat"].startswith("Z")
+            and (under(cwds.get(row["pid"]), row["command"]) or (row["ppid"] == 1 and orphaned_under(cwds.get(row["pid"]), row["command"])))]
+
+
+def signal_processes(found, sig):
+    table = process_table()
+    skip = lineage(table)
+    protected = {row["pgid"] for row in table if row["pid"] in skip}
+    for proc in found:
+        group = proc["pgid"]
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            if group in protected or group <= 1:
+                os.kill(proc["pid"], sig)
+            else:
+                os.killpg(group, sig)
+
+
+def stop_processes(found):
+    """SIGTERM, then SIGKILL after a grace period, to each process group; returns when they are gone or the waits ran out."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        signal_processes(found, sig)
+        deadline = time.time() + KILL_WAIT_S
+        while found and time.time() < deadline:
+            time.sleep(0.1)
+            running = {row["pid"] for row in process_table() if not row["stat"].startswith("Z")}
+            found = [p for p in found if p["pid"] in running]
+        if not found:
+            return
+
+
+def reap(*roots):
+    """Kill whatever still runs under these paths; returns the processes it found."""
+    found = find_leftovers(roots)
+    if found:
+        stop_processes(found)
+    return found
+
+
+def describe(proc):
+    return f"pid {proc['pid']} ppid {proc['ppid']} pgid {proc['pgid']} elapsed {proc['elapsed']} cwd {proc.get('cwd') or '-'}  {proc['command'][:160]}"
+
+
+def load_report():
+    load, cores = os.getloadavg()[0], os.cpu_count() or 1
+    if load <= cores:
+        return ""
+    busiest = sorted((row for row in process_table() if row["cpu"] > 0), key=lambda row: -row["cpu"])[:TOP_CPU]
+    cwds = process_cwds()
+    lines = [f"load {load:.1f} exceeds {cores} cores and no leftovers matched; busiest processes:"]
+    for row in busiest:
+        flag = "  <- likely leftover: its parent is init" if row["ppid"] == 1 else ""
+        lines.append(f"  {describe({**row, 'cwd': cwds.get(row['pid'])})} cpu {row['cpu']:.0f}%{flag}")
+    return "\n".join(lines)
+
+
+def cmd_leftovers(directory, args):
+    roots, orphan_roots = [*default_roots(directory), *(args.root or [])], worktree_paths()
+    found = find_leftovers(roots, orphan_roots)
+    killed = len(found) if args.kill else 0
+    if found and args.kill:
+        stop_processes(found)
+        found = find_leftovers(roots, orphan_roots)
+    if found:
+        script = shlex.quote(str(pathlib.Path(__file__).resolve()))
+        raise Failed("\n" + "\n".join(describe(p) for p in found)
+                     + f"\n{len(found)} still running. Stop them with: python3 {script} leftovers --kill")
+    lines = [f"leftovers: " + (f"killed {killed}, " if killed else "") + "none remain"]
+    return "\n".join([*lines, load_report()]).strip()
+
+
+@contextlib.contextmanager
+def scratch_tree(top, rev, specs=(), specs_from=None):
+    """A temporary worktree at rev, optionally with the specs from another rev copied over it, sharing the checkout's installed dependencies."""
+    parent = tempfile.mkdtemp(prefix="verify-units-")
+    path = pathlib.Path(parent).resolve() / "tree"
+    git("worktree", "add", "--detach", str(path), rev, cwd=top)
+    links = []
+    try:
+        ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "--directory", cwd=top).splitlines()
+        for name in ignored:
+            source = top / name.rstrip("/")
+            if source.name in DEPENDENCY_DIRS and not (path / name.rstrip("/")).exists():
+                target = path / name.rstrip("/")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(source)
+                links.append(target)
+        if specs:
+            git("checkout", specs_from, "--", *specs, cwd=path)
+        yield path
+    finally:
+        reap(str(path))
+        for link in links:
+            link.unlink(missing_ok=True)
+        subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=top, capture_output=True)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def run_spec(tree, command, timeout):
+    try:
+        r = run_in_group(command, timeout, shell=True, cwd=tree)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    return r.returncode == 0, "\n".join((r.stdout + r.stderr).strip().splitlines()[-3:])
+
+
+def resolve_range(command, rest):
+    if len(rest) > 1:
+        raise Failed(f"{command} takes one <base>..<head> range")
+    given = rest[0] if rest else f"{git('merge-base', default_branch(), 'HEAD')}..HEAD"
+    base, sep, head = given.partition("..")
+    if not sep or not base or not head or head.startswith("."):
+        raise Failed(f"the range must read <base>..<head>, not {given!r}")
+    return git("rev-parse", "--verify", f"{base}^{{commit}}"), git("rev-parse", "--verify", f"{head}^{{commit}}")
+
+
+def cmd_units(directory, args):
+    top = pathlib.Path(git("rev-parse", "--show-toplevel"))
+    base, head = resolve_range("units", args.rest)
+    specs = args.spec or changed_specs(base, head)
+    if not specs:
+        raise Failed(f"no spec files were added or changed in {base[:12]}..{head[:12]}. A feature ships with specs that fail without it; "
+                     "write them, or name spec files with --spec when the project's test files do not follow the usual naming.")
+    commands = {s: spec_command(top, s, args.test_cmd) for s in specs}
+    guards = {s for s in specs if GUARD_MARK in git("show", f"{head}:{s}")}
+    with scratch_tree(top, base, specs, head) as tree:
+        on_base = {s: run_spec(tree, commands[s], args.timeout) for s in specs}
+    with scratch_tree(top, head) as tree:
+        at_head = {s: run_spec(tree, commands[s], args.timeout) for s in specs}
+    lines, tally = [], {"ok": 0, "guard": 0, "vacuous": 0, "broken": 0}
+    for s in specs:
+        (base_ok, base_tail), (head_ok, head_tail) = on_base[s], at_head[s]
+        if not head_ok:
+            tally["broken"] += 1
+            lines.append(f"FAILS AT HEAD  {s}\n" + indent(head_tail))
+        elif s in guards:
+            tally["guard"] += 1
+            lines.append(f"GUARD          {s}  marked {GUARD_MARK}, exempt from failing on base")
+        elif base_ok:
+            tally["vacuous"] += 1
+            lines.append(f"PASSES ON BASE {s}  passes without the implementation, so it does not show new behavior; "
+                         f"make it assert the new behavior, or mark a spec of behavior that already worked with '{GUARD_MARK}'")
+        else:
+            tally["ok"] += 1
+            lines.append(f"OK             {s}  fails on base, passes at head\n" + indent(base_tail))
+    lines.append(f"units: {len(specs)} specs, {tally['ok']} fail on base and pass at head, {tally['guard']} regression guards, "
+                 f"{tally['vacuous']} pass without the implementation, {tally['broken']} fail at head")
+    if tally["vacuous"] or tally["broken"]:
+        raise Failed("\n" + "\n".join(lines))
+    return "\n".join(lines)
+
+
+def default_test_command(top):
+    package = top / "package.json"
+    if package.is_file() and "test" in json.loads(package.read_text()).get("scripts", {}):
+        return next((cmd for lock, cmd in TEST_SCRIPTS.items() if (top / lock).exists()), "npm test")
+    if any(SPEC_FILE.search(n) for n in git("ls-files", "*.py", cwd=top).splitlines()):
+        python = shlex.quote(sys.executable)
+        if importlib.util.find_spec("pytest"):
+            return f"{python} -m pytest"
+        return f"{python} -m unittest discover" + (" -s tests" if (top / "tests").is_dir() else "")
+    raise Failed("cannot detect how to run the project's tests. Pass --cmd '<command>', for example --cmd 'pnpm test'.")
+
+
+def spec_only(commit, subject):
+    if subject.lower().startswith("test"):
+        return True
+    names = git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit).splitlines()
+    return bool(names) and all(SPEC_FILE.search(n) for n in names)
+
+
+def check_commit(tree, typecheck, command, timeout):
+    if typecheck:
+        ok, tail = run_spec(tree, typecheck, timeout)
+        if not ok:
+            return False, f"typecheck failed: {tail}"
+    return run_spec(tree, command, timeout)
+
+
+def cmd_commits(directory, args):
+    top = pathlib.Path(git("rev-parse", "--show-toplevel"))
+    base, head = resolve_range("commits", args.rest)
+    commits = git("rev-list", "--reverse", "--topo-order", f"{base}..{head}").splitlines()
+    if not commits:
+        raise Failed(f"no commits in {base[:12]}..{head[:12]}")
+    command = args.cmd or default_test_command(top)
+    verdicts = []
+    for commit in commits:
+        subject = git("log", "-1", "--format=%s", commit)
+        pin = spec_only(commit, subject)
+        with scratch_tree(top, commit) as tree:
+            ok, detail = check_commit(tree, args.typecheck, command, args.timeout)
+            strays = reap(str(tree))
+        if strays:
+            detail = "; ".join(filter(None, [detail.partition("\n")[0] if not ok else "",
+                                             "leftover processes killed: " + ", ".join(str(p["pid"]) for p in strays)]))
+        verdict = "PASS" if ok and not strays else "FAIL"
+        counted = verdict == "FAIL" and (strays or not pin)
+        verdicts.append((verdict, counted))
+        head_line, _, rest = detail.partition("\n")
+        note = "  (spec-only commit, not counted)" if verdict == "FAIL" and not counted else ""
+        print(f"{verdict:<5} {commit[:12]} {subject}" + (f"  {head_line}" if head_line else "") + note
+              + (f"\n{indent(rest)}" if rest and verdict == "FAIL" else ""), flush=True)
+    failed = sum(v == "FAIL" for v, _ in verdicts)
+    summary = f"commits: {len(commits)} checked, {len(commits) - failed} PASS, {failed} FAIL"
+    if any(counted for _, counted in verdicts):
+        raise Failed(summary)
+    return summary + (" (all failures were spec-only commits)" if failed else "")
+
+
+def indent(text):
+    return "\n".join(f"    {line}" for line in text.splitlines())
+
+
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
-            "report": cmd_report, "decisions": cmd_decisions}
+            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun,
+            "commits": cmd_commits, "leftovers": cmd_leftovers}
 
 
 def main():
@@ -474,9 +951,25 @@ def main():
     parser.add_argument("command", choices=["where", *COMMANDS])
     parser.add_argument("--dir")
     parser.add_argument("--revision")
+    parser.add_argument("--test-cmd")
+    parser.add_argument("--cmd")
+    parser.add_argument("--typecheck")
+    parser.add_argument("--kill", action="store_true")
+    parser.add_argument("--root", action="append")
+    parser.add_argument("--spec", action="append")
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("rest", nargs="*")
     args = parser.parse_args()
+    if args.rest and args.command not in ("units", "rerun", "commits"):
+        parser.error(f"{args.command} takes no arguments")
+    args.timeout = args.timeout or SCRIPT_TIMEOUT
     try:
-        directory = verification_dir(args.dir)
+        try:
+            directory = verification_dir(args.dir)
+        except Failed:
+            if args.command != "leftovers":
+                raise
+            directory = None
         if args.command == "where":
             directory.mkdir(parents=True, exist_ok=True)
             print(directory)
@@ -484,7 +977,7 @@ def main():
         print(COMMANDS[args.command](directory, args))
     except Failed as e:
         print(f"verify {args.command}: {e}")
-        sys.exit(1)
+        sys.exit(e.code)
 
 
 if __name__ == "__main__":
