@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Explore the codebase to answer "how does X work?" questions. Produce architectural explanations at the level of a senior engineer onboarding onto a subsystem, enough to build a working mental model, not so much that it reads like annotated source code.
 
-Every spawn is a read-only subagent. Explorers use an executor model and every explainer a planner model from the orchestrator config (`<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`): the first entry in that role your agent can run as a subagent. Without a config, or when your agent cannot choose a subagent's model, use its default model.
+Every spawn reads the repository and never edits it. Give an explainer that hands back a file an agent type that can write to the scratchpad, because a type without a write tool returns the whole explanation inline into the caller's context. Explorers use an executor model and every explainer a planner model from the orchestrator config (`<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`): the first entry in that role your agent can run as a subagent. Without a config, or when your agent cannot choose a subagent's model, use its default model.
 
 ## 1. Assess complexity
 
