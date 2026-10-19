@@ -333,6 +333,14 @@ class Guard(unittest.TestCase):
         self.todo("none", "--reason", "demo is only a reference here")
         self.assertIsNone(self.hook("PreToolUse", bash))
 
+    def test_a_step_continued_after_a_blank_line_keeps_its_citations(self):
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Settle the design.\n   - Case A: write a note.\n\n   When it reaches past the diff, run the demo skill (`../demo/SKILL.md`).\n2. Wrap up.\n")
+        self.todo("from", "flow")
+        self.assertIn("../demo/SKILL.md", self.todo("done", "1", ok=False))
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+        self.todo("done", "1")
+
     def test_reading_a_skill_that_no_item_cites_still_asks_for_a_todo_decision(self):
         self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Wrap up.\n")
         self.todo("from", "flow")

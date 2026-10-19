@@ -86,7 +86,7 @@ def _numbered(lines):
             found.append(current)
         elif current is not None and line.startswith((" ", "\t")) and line.strip():
             current[1] += " " + line.strip()
-        elif not line.startswith((" ", "\t")):
+        elif line.strip():
             current = None
     return found
 
