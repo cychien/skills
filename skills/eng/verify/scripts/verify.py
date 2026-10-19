@@ -988,12 +988,13 @@ def process_table():
     return rows
 
 
-def process_cwds():
+def process_cwds(proc=pathlib.Path("/proc")):
     """Working directory of every process this user can see; a deleted one keeps the path it had."""
-    proc = pathlib.Path("/proc")
-    if (proc / "self" / "cwd").exists():
+    if (proc / "self").is_dir():
         cwds = {}
         for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
             with contextlib.suppress(OSError):
                 cwds[int(entry.name)] = os.readlink(entry / "cwd").removesuffix(" (deleted)")
         return cwds
@@ -1324,7 +1325,10 @@ def main():
     parser.add_argument("--only", action="append")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("rest", nargs="*")
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
+    args = parser.parse_intermixed_args(argv[:len(argv) - len(passthrough) - 1] if "--" in argv else argv)
+    args.rest += passthrough
     if args.rest and args.command not in ("units", "rerun", "commits", "carry", "phases", "adopt"):
         parser.error(f"{args.command} takes no arguments")
     args.timeout = args.timeout or (RERUN_TIMEOUT if args.command == "rerun" else SCRIPT_TIMEOUT)

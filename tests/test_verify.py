@@ -1105,6 +1105,19 @@ class Leftovers(unittest.TestCase):
         self.assertNotIn("exceeds", out)
 
 
+class ProcCwds(unittest.TestCase):
+    def test_reads_only_numbered_process_entries_from_proc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = pathlib.Path(tmp)
+            for name, cwd in (("41", "/srv/app"), ("42", "/srv/gone (deleted)")):
+                (proc / name).mkdir()
+                (proc / name / "cwd").symlink_to(cwd)
+            (proc / "self").symlink_to(proc / "41")
+            (proc / "thread-self").mkdir()
+            (proc / "sys").mkdir()
+            self.assertEqual(verify.process_cwds(proc), {41: "/srv/app", 42: "/srv/gone"})
+
+
 class Capacity(unittest.TestCase):
     BUSY = {"pid": 900, "ppid": 1, "pgid": 900, "stat": "R", "elapsed": "01:00", "cpu": 200.0, "command": "node vitest"}
 
