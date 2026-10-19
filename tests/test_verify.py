@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -753,6 +755,79 @@ class Leftovers(unittest.TestCase):
                 mock.patch.object(verify, "default_roots", return_value=[]), mock.patch.object(verify, "worktree_paths", return_value=[]):
             out = verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=False))
         self.assertNotIn("exceeds", out)
+
+
+class Capacity(unittest.TestCase):
+    BUSY = {"pid": 900, "ppid": 1, "pgid": 900, "stat": "R", "elapsed": "01:00", "cpu": 200.0, "command": "node vitest"}
+
+    def row(self, pid, command):
+        return {"pid": pid, "ppid": 4242, "pgid": pid, "stat": "R", "elapsed": "00:30", "cpu": 50.0, "command": command}
+
+    def capacity(self, load, table, *, native=False, cores=10, env=None):
+        with mock.patch.object(verify, "process_table", return_value=table), mock.patch.object(verify, "process_cwds", return_value={}), \
+                mock.patch.object(verify.os, "getloadavg", return_value=(load, load, load)), mock.patch.object(verify.os, "cpu_count", return_value=cores), \
+                mock.patch.dict(os.environ):
+            os.environ.pop("VERIFY_MAX_LOAD_RATIO", None)
+            os.environ.update(env or {})
+            return verify.cmd_capacity(None, mock.Mock(native=native))
+
+    def test_passes_below_the_threshold_with_no_native_build(self):
+        out = self.capacity(3.0, [self.BUSY])
+        self.assertEqual(out, "capacity: load 3.0, cores 10, threshold 7.0, native builds running: none")
+
+    def test_refuses_at_or_above_the_threshold_and_names_the_busiest_processes(self):
+        with self.assertRaises(verify.Failed) as raised:
+            self.capacity(7.0, [self.BUSY])
+        message = str(raised.exception)
+        self.assertIn("load 7.0, cores 10, threshold 7.0", message)
+        self.assertIn("node vitest", message)
+        self.assertIn("likely leftover", message)
+
+    def test_the_ratio_comes_from_the_environment(self):
+        self.assertIn("threshold 9.0", self.capacity(8.0, [], env={"VERIFY_MAX_LOAD_RATIO": "0.9"}))
+        with self.assertRaises(verify.Failed):
+            self.capacity(8.0, [], env={"VERIFY_MAX_LOAD_RATIO": "0.5"})
+        with self.assertRaises(verify.CannotScan):
+            self.capacity(1.0, [], env={"VERIFY_MAX_LOAD_RATIO": "lots"})
+
+    def test_a_native_build_is_only_reported_without_native(self):
+        table = [self.row(31, "/usr/bin/xcodebuild -scheme App build"), self.row(32, "cargo build --release")]
+        out = self.capacity(1.0, table)
+        self.assertIn("native builds running: 2 (pids 31, 32)", out)
+
+    def test_a_native_build_refuses_with_native(self):
+        table = [self.row(31, "node /app/node_modules/.bin/tauri build"), self.row(32, "./gradlew assembleDebug"), self.row(33, "npx cap sync ios")]
+        with self.assertRaises(verify.Failed) as raised:
+            self.capacity(1.0, table, native=True)
+        self.assertIn("native builds running: 3 (pids 31, 32, 33)", str(raised.exception))
+        self.assertIn("a native build is running", str(raised.exception))
+
+    def test_shells_and_this_process_tree_never_count_as_builds(self):
+        table = [self.row(41, "bash -c cargo build"), self.row(42, "grep xcodebuild"), self.row(43, "cargo test"),
+                 {**self.row(os.getpid(), "python3 verify.py capacity --native cap run"), "ppid": 1}]
+        self.assertIn("native builds running: none", self.capacity(1.0, table, native=True))
+
+    def test_the_command_exits_1_on_refusal(self):
+        r = subprocess.run([sys.executable, "-I", str(VERIFY), "capacity"], capture_output=True, text=True,
+                           env={**os.environ, "VERIFY_MAX_LOAD_RATIO": "0.0001"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("capacity: load", r.stdout)
+
+
+class RerunTimeout(unittest.TestCase):
+    def rerun_timeout(self, *extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "B1.check.sh").write_text("exit 0\n")
+            done = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(verify, "run_in_group", return_value=done) as run, \
+                    mock.patch.object(sys, "argv", ["verify.py", "rerun", "--dir", tmp, *extra]), contextlib.redirect_stdout(io.StringIO()):
+                verify.main()
+            return run.call_args.args[1]
+
+    def test_defaults_to_300_seconds_and_timeout_raises_it(self):
+        self.assertEqual(self.rerun_timeout(), 300)
+        self.assertEqual(self.rerun_timeout("--timeout", "600"), 600)
 
 
 class RunGroup(unittest.TestCase):

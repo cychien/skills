@@ -18,6 +18,7 @@ Rules:
 - Do not edit code, tests, baselines, or the harness. When a check cannot run, report it INCONCLUSIVE with the blocker.
 - Drive the real user path. Capture the action and the resulting state, and read side effects back.
 - Compare `uptime` with `sysctl -n hw.ncpu` before you start, and start browser sessions one at a time, because a loaded machine gives false failures. When the load exceeds the cores, run `<verify.py path> leftovers`, which lists the busiest processes with pid, ppid, elapsed time, and cwd, and report them to the lead instead of starting.
+- Bound every wait by a deadline from the predicate plus a small margin (a 59 s server deadline: wait at most 75 s) and set the shell call's timeout to match. When it passes, record the state and grade the check instead of waiting longer, because an open-ended wait loop burns ten minutes per stuck check.
 - Sample a time-windowed assertion inside the page (a MutationObserver or raw CDP), never by polling through the driver, because each driver call adds its own delay.
 - Run each regression check on main and on head. For a perf check, alternate main and head, at least 5 runs each, report the median and range, and measure where the "Where to measure" section of <benchmark-checklist SKILL.md path> says.
 - The feature map tells you how to reach and drive a feature. These checks tell you what counts as correct. When the two disagree, grade by the checks and report the disagreement.

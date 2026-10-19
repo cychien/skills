@@ -6,6 +6,7 @@ usage: verify.py <command> [--dir DIR]
        verify.py rerun [--timeout SECONDS] [-- ARGS ...]
        verify.py commits [<base>..<head>] [--cmd CMD] [--typecheck CMD] [--timeout SECONDS]
        verify.py leftovers [--kill] [--root DIR ...]
+       verify.py capacity [--native]
 
   where       print this branch's verification directory
   plan        the plan is complete: checks with every field, and a perf decision
@@ -23,8 +24,9 @@ usage: verify.py <command> [--dir DIR]
               A spec file whose text contains "regression-guard" (in a title or a comment) guards behavior that
               already works: it must pass at head but may pass on base. Keep guards in their own spec files.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
-              instance id) to each; one PASS or FAIL line per check from its exit code, and a summary. Exits 0
-              with a "no saved check scripts" line when there are none.
+              instance id) to each; one PASS or FAIL line per check from its exit code, and a summary. Each script
+              gets 300 seconds unless --timeout raises it. Exits 0 with a "no saved check scripts" line when there
+              are none.
   commits     check every commit in <base>..<head> (default like units), one at a time in a scratch tree: --typecheck
               first when given, then --cmd (default: the project's test script, else pytest or unittest). One PASS or
               FAIL line per commit; a commit that leaves a process running in its tree FAILs and the process is killed.
@@ -39,6 +41,11 @@ usage: verify.py <command> [--dir DIR]
               process group, then SIGKILL to survivors, and rescans. When nothing remains but the 1-minute load
               exceeds the core count, it also lists the busiest processes and flags those whose parent is init as
               likely leftovers (the exit code is unaffected).
+  capacity    the machine has room for another heavy run: exits 0 when the 1-minute load is below ratio x cores
+              (ratio 0.7, $VERIFY_MAX_LOAD_RATIO overrides) and no native app build is running, else exits 1. Native
+              builds are xcodebuild, tauri build, cargo build, cap run, cap sync and gradle in the process table;
+              without --native a running one is only reported, with --native it also refuses. Prints one line with
+              load, cores, threshold and native builds running (pids); a refusal adds the busiest processes.
 
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
 the root, --dir overrides the whole path). It holds plan.md, plan.lock, report.md,
@@ -87,6 +94,16 @@ SCRIPT_RUNNERS = {".py": [sys.executable], ".sh": ["bash"], ".js": ["node"], ".m
 NODE_LOCKS = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bunx", "bun.lockb": "bunx"}
 DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
 SCRIPT_TIMEOUT = 900
+RERUN_TIMEOUT = 300
+LOAD_RATIO = 0.7
+NATIVE_BUILDS = {
+    "xcodebuild": re.compile(r"(?:^|/)xcodebuild(?:\s|$)"),
+    "tauri build": re.compile(r"\btauri build\b"),
+    "cargo build": re.compile(r"(?:^|/)cargo build\b"),
+    "cap run/sync": re.compile(r"\bcap (?:run|sync)\b"),
+    "gradle": re.compile(r"(?:^|/)gradlew?(?:\s|$)|org\.gradle\.(?:wrapper\.GradleWrapperMain|launcher\.GradleMain)"),
+}
+SHELLS = {"sh", "bash", "zsh", "dash", "fish"}
 GLOB_MAGIC = re.compile(r"[*?\[]")
 KILL_WAIT_S = 3.0
 TOP_CPU = 5
@@ -770,17 +787,18 @@ def describe(proc):
     return f"pid {proc['pid']} ppid {proc['ppid']} pgid {proc['pgid']} elapsed {proc['elapsed']} cwd {proc.get('cwd') or '-'}  {proc['command'][:160]}"
 
 
+def busiest_lines():
+    busiest = sorted((row for row in process_table() if row["cpu"] > 0), key=lambda row: -row["cpu"])[:TOP_CPU]
+    cwds = process_cwds()
+    return [f"  {describe({**row, 'cwd': cwds.get(row['pid'])})} cpu {row['cpu']:.0f}%"
+            + ("  <- likely leftover: its parent is init" if row["ppid"] == 1 else "") for row in busiest]
+
+
 def load_report():
     load, cores = os.getloadavg()[0], os.cpu_count() or 1
     if load <= cores:
         return ""
-    busiest = sorted((row for row in process_table() if row["cpu"] > 0), key=lambda row: -row["cpu"])[:TOP_CPU]
-    cwds = process_cwds()
-    lines = [f"load {load:.1f} exceeds {cores} cores and no leftovers matched; busiest processes:"]
-    for row in busiest:
-        flag = "  <- likely leftover: its parent is init" if row["ppid"] == 1 else ""
-        lines.append(f"  {describe({**row, 'cwd': cwds.get(row['pid'])})} cpu {row['cpu']:.0f}%{flag}")
-    return "\n".join(lines)
+    return "\n".join([f"load {load:.1f} exceeds {cores} cores and no leftovers matched; busiest processes:", *busiest_lines()])
 
 
 def cmd_leftovers(directory, args):
@@ -937,13 +955,51 @@ def cmd_commits(directory, args):
     return summary + (" (all failures were spec-only commits)" if failed else "")
 
 
+def load_ratio():
+    raw = os.environ.get("VERIFY_MAX_LOAD_RATIO")
+    if raw is None:
+        return LOAD_RATIO
+    try:
+        ratio = float(raw)
+    except ValueError:
+        ratio = 0.0
+    if ratio <= 0:
+        raise CannotScan(f"VERIFY_MAX_LOAD_RATIO must be a positive number, got {raw!r}")
+    return ratio
+
+
+def native_builds(table):
+    skip = lineage(table)
+    found = []
+    for row in table:
+        words = row["command"].split()
+        if row["pid"] in skip or not words or pathlib.PurePath(words[0]).name in SHELLS:
+            continue
+        if any(pattern.search(row["command"]) for pattern in NATIVE_BUILDS.values()):
+            found.append(row)
+    return found
+
+
+def cmd_capacity(directory, args):
+    load, cores = os.getloadavg()[0], os.cpu_count() or 1
+    threshold = load_ratio() * cores
+    builds = native_builds(process_table())
+    running = ", ".join(str(row["pid"]) for row in builds)
+    line = f"capacity: load {load:.1f}, cores {cores}, threshold {threshold:.1f}, native builds running: " + (f"{len(builds)} (pids {running})" if builds else "none")
+    reasons = [reason for refused, reason in ((load >= threshold, "load is at or above the threshold"),
+                                              (bool(builds) and args.native, "a native build is running")) if refused]
+    if reasons:
+        raise Failed("\n" + "\n".join([f"{line}\nrefused: " + "; ".join(reasons), "busiest processes:", *busiest_lines()]))
+    return line
+
+
 def indent(text):
     return "\n".join(f"    {line}" for line in text.splitlines())
 
 
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
             "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun,
-            "commits": cmd_commits, "leftovers": cmd_leftovers}
+            "commits": cmd_commits, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
 
 
 def main():
@@ -955,6 +1011,7 @@ def main():
     parser.add_argument("--cmd")
     parser.add_argument("--typecheck")
     parser.add_argument("--kill", action="store_true")
+    parser.add_argument("--native", action="store_true")
     parser.add_argument("--root", action="append")
     parser.add_argument("--spec", action="append")
     parser.add_argument("--timeout", type=int)
@@ -962,12 +1019,12 @@ def main():
     args = parser.parse_args()
     if args.rest and args.command not in ("units", "rerun", "commits"):
         parser.error(f"{args.command} takes no arguments")
-    args.timeout = args.timeout or SCRIPT_TIMEOUT
+    args.timeout = args.timeout or (RERUN_TIMEOUT if args.command == "rerun" else SCRIPT_TIMEOUT)
     try:
         try:
             directory = verification_dir(args.dir)
         except Failed:
-            if args.command != "leftovers":
+            if args.command not in ("leftovers", "capacity"):
                 raise
             directory = None
         if args.command == "where":
