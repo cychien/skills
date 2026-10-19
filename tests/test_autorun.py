@@ -128,6 +128,17 @@ class AutorunFlow(Harness):
         self.assertEqual(out["decision"], "block")
         self.assertIn("ended on a question", out["reason"])
 
+    def test_guard_todo_wait_is_refused_in_a_run_and_points_to_ask(self):
+        run = self.start_run()
+        self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        guard = [sys.executable, str(SCRIPT.parents[2] / "guard" / "scripts" / "guard.py"), "todo"]
+        session = ["--session", "claude:s-root"]
+        subprocess.run([*guard, "add", "Pick the format", *session], env=self.env, check=True, capture_output=True)
+        r = subprocess.run([*guard, "wait", "1", "--reason", "format", *session], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f"autorun.py ask --run {run}", r.stderr)
+        self.assertNotIn("[?]", subprocess.run([*guard, "list", *session], env=self.env, capture_output=True, text=True).stdout)
+
     def test_detail_and_confident_choice_are_decided_and_logged(self):
         run = self.start_run()
         self.assertIn("DECIDED", self.ask(run, "detail"))
@@ -562,6 +573,7 @@ class Policy(unittest.TestCase):
                 self.assertEqual(os.path.realpath(store.proc_cwd(child.pid)), os.path.realpath(d))
             finally:
                 child.kill()
+                child.wait()
 
     def test_question_endings(self):
         from autorun_lib import policy
