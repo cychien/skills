@@ -340,6 +340,19 @@ class Guard(unittest.TestCase):
         unrelated = {"tool_name": "Agent", "tool_input": {"prompt": "Summarize <head SHA> notes."}}
         self.assertIsNone(self.hook("PreToolUse", unrelated))
 
+    def test_an_item_closes_without_reading_a_named_skill_that_did_not_run_and_records_why(self):
+        self.write_skill("alpha", "---\nname: alpha\ndescription: x\n---\n")
+        self.write_skill("beta", "---\nname: beta\ndescription: x\n---\n")
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Settle the design. Run alpha (`../alpha/SKILL.md`) when it spans modules, and beta (`../beta/SKILL.md`) when a prototype helps.\n2. Wrap up.\n")
+        self.todo("from", "flow")
+        self.assertIn("--not-run", self.todo("done", "1", ok=False))
+        self.assertIn("--reason", self.todo("done", "1", "--not-run", "alpha", ok=False))
+        self.assertIn("../beta/SKILL.md", self.todo("done", "1", "--not-run", "alpha", "--reason", "single module", ok=False))
+        self.assertIn("../gamma/SKILL.md", self.todo("done", "1", "--not-run", "gamma", "--reason", "x", ok=False))
+        out = self.todo("done", "1", "--not-run", "alpha", "--not-run", "beta", "--reason", "single module, no premise to test")
+        self.assertIn("not run: alpha, beta - single module, no premise to test", out)
+        self.assertIn("not run: alpha, beta", self.todo("list"))
+
     def test_an_item_naming_a_skill_needs_it_read_and_the_reply_skill_is_enforced(self):
         self.write_skill("reply", "---\nname: reply\ndescription: x\n---\n\n# Writing the reply\n")
         self.write_skill("helper", "---\nname: helper\ndescription: x\n---\n\n# Helper\n")

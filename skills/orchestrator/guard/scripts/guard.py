@@ -4,7 +4,7 @@
 usage:
   guard.py todo from <skill> [--session AGENT:ID]        copy a skill's steps in, verbatim
   guard.py todo add <text> [<text> ...] [--session AGENT:ID]
-  guard.py todo done <n> [<n> ...] [--note TEXT] [--session AGENT:ID]
+  guard.py todo done <n> [<n> ...] [--note TEXT] [--not-run SKILL ... --reason TEXT] [--session AGENT:ID]
   guard.py todo skip <n> [<n> ...] --reason TEXT [--session AGENT:ID]
   guard.py todo wait <n> [<n> ...] --reason TEXT [--session AGENT:ID]  end the turn on a question only the user can answer
   guard.py todo none --reason TEXT [--session AGENT:ID]  this task needs no list
@@ -42,7 +42,7 @@ def show(data):
     return "\n".join(lines)
 
 
-def resolve(data, n, status, note):
+def resolve(data, n, status, note, not_run=()):
     item = next((i for i in data["todo"] if i["n"] == n), None)
     if not item:
         sys.exit(f"guard: the todo list has no item {n}.")
@@ -51,10 +51,11 @@ def resolve(data, n, status, note):
     if status == "waiting" and item["status"] in ("done", "skipped"):
         sys.exit(f"guard: item {n} is already {item['status']}, so it has nothing to wait on.")
     if status == "done":
-        unread = sorted(set(skills.SKILL_REF.findall(item["text"])) - set(data["skills"]))
+        unread = sorted(set(skills.SKILL_REF.findall(item["text"])) - set(data["skills"]) - set(not_run))
         if unread:
-            sys.exit("guard: item {} names skills you have not read this session: {}. Read them first.".format(
-                n, ", ".join(f"../{u}/SKILL.md" for u in unread)))
+            sys.exit("guard: item {} names skills you have not read this session: {}. Read them first, or when the step did not run one "
+                     "(its condition did not hold), close the item with `todo done {} --not-run <skill> --reason \"<why>\"`.".format(
+                         n, ", ".join(f"../{u}/SKILL.md" for u in unread), n))
         if "every principle file" in item["text"]:
             missing = sorted(set(skills.principles(os.getcwd()).values()) - set(data["principles_read"]))
             if missing:
@@ -86,6 +87,8 @@ def main():
     p = todo.add_parser("done")
     p.add_argument("n", type=int, nargs="+")
     p.add_argument("--note")
+    p.add_argument("--not-run", action="append", default=[], metavar="SKILL")
+    p.add_argument("--reason")
     p = todo.add_parser("skip")
     p.add_argument("n", type=int, nargs="+")
     p.add_argument("--reason", required=True)
@@ -137,7 +140,18 @@ def main():
         else:
             status = {"done": "done", "skip": "skipped", "wait": "waiting"}[args.action]
             note = args.note if args.action == "done" else args.reason
-            message = "\n".join(resolve(data, n, status, note) for n in args.n)
+            not_run = args.not_run if args.action == "done" else []
+            if args.action == "done" and not_run:
+                if not args.reason:
+                    sys.exit("guard: --not-run needs --reason, the user reads why the skill did not run.")
+                named = {s for i in data["todo"] if i["n"] in args.n for s in skills.SKILL_REF.findall(i["text"])}
+                stray = sorted(set(not_run) - named)
+                if stray:
+                    sys.exit("guard: {} not named by the item(s) being closed.".format(", ".join(f"../{s}/SKILL.md" for s in stray)))
+                note = " - ".join(filter(None, [f"not run: {', '.join(not_run)}", args.reason, args.note]))
+            elif args.action == "done" and args.reason:
+                sys.exit("guard: --reason on done only goes with --not-run. Use --note to annotate.")
+            message = "\n".join(resolve(data, n, status, note, not_run) for n in args.n)
             if data["todo"] and not state.unresolved(data):
                 message += "\nEvery item is resolved; list them with their marks in your final reply."
             elif status == "waiting" and not state.open_items(data):
