@@ -32,6 +32,14 @@ SALVO_DETACHED = ("salvo runs every model and blocks until all finish. Detaching
                   "(Claude Code: Bash with run_in_background) and wait for its completion notification.")
 
 
+POLL_LOOP = re.compile(r"\b(while|until|for)\b")
+POLL_SLEEP = re.compile(r"\bsleep\b|select\s*\(\s*undef|Start-Sleep")
+POLL_TARGET = re.compile(r"/tasks/[\w.-]+\.output|stop_reason|end_turn")
+POLLING_DENIED = ("Do not wait for a subagent by polling. A subagent finishes with a SubagentHandback tool call (stop_reason tool_use), "
+                  "so a loop that greps for end_turn never matches and runs to its cap. ")
+POLLING_INTERACTIVE = "Its hand-back arrives on its own as a message, so end the turn or do other work."
+POLLING_HEADLESS = ("This session is non-interactive, so ending the turn ends the process and kills the subagent. Run the subagent in the "
+                    "foreground (not in the background), so its hand-back is the tool result.")
 SPAWN_TOOLS = {"agent", "task"}
 LEFTOVERS_TIMEOUT = 30
 LEFTOVERS_DENIED = ("Processes from earlier delegates or tasks are still running. Spawning another agent on top of them hides which one "
@@ -233,9 +241,14 @@ def on_pre_tool(event):
         swept = sweep_leftovers(event)
         if swept and swept[0] == 1:
             return "deny", LEFTOVERS_DENIED + swept[1]
+        if not event.agent_id:
+            with state.update(event.agent, event.session) as data:
+                data["spawned"] = data.get("spawned", 0) + 1
     if not state.exists(event.agent, event.session):
         return PASS
     data = state.load(event.agent, event.session)
+    if data.get("spawned") and not event.agent_id and polls_for_subagent(command):
+        return "deny", POLLING_DENIED + (POLLING_HEADLESS if headless() else POLLING_INTERACTIVE)
     skill = data.get("todo_undecided")
     if skill and not event.agent_id and not DECISION.search(command) and not reads_a_skill(event):
         return "deny", todo_hint(skill, event)
@@ -245,6 +258,10 @@ def on_pre_tool(event):
     if not found:
         return PASS
     return "deny", "The open-pr skill's PR rules reject this command:\n- " + "\n- ".join(found) + "\nFix the command and run it again."
+
+
+def polls_for_subagent(command):
+    return all(p.search(command) for p in (POLL_LOOP, POLL_SLEEP, POLL_TARGET))
 
 
 def outgoing_prompt(event, command):

@@ -388,6 +388,25 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}}))
         self.todo("done", "1")
 
+    def test_polling_for_a_subagent_is_denied_once_one_was_spawned(self):
+        poll = {"tool_name": "Bash", "tool_input": {"command": "for i in $(seq 1 60); do grep -q end_turn /tmp/x/tasks/abc123.output && break; sleep 10; done"}}
+        by_file = {"tool_name": "Bash", "tool_input": {"command": "until [ -s /tmp/x/tasks/abc123.output ]; do sleep 5; done; cat /tmp/x/tasks/abc123.output"}}
+        server = {"tool_name": "Bash", "tool_input": {"command": "until curl -sf localhost:3000/health; do sleep 1; done"}}
+        self.assertIsNone(self.hook("PreToolUse", poll))
+        self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "Summarize the notes."}})
+        for command in (poll, by_file):
+            out = self.hook("PreToolUse", command)["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("SubagentHandback", out["permissionDecisionReason"])
+            self.assertIn("end the turn or do other work", out["permissionDecisionReason"])
+        self.env["GUARD_HEADLESS"] = "1"
+        reason = self.hook("PreToolUse", poll)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("foreground", reason)
+        self.assertNotIn("end the turn or do other work", reason)
+        self.env["GUARD_HEADLESS"] = "0"
+        self.assertIsNone(self.hook("PreToolUse", server))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "sleep 5"}}))
+
     def test_reading_a_skill_that_no_item_cites_still_asks_for_a_todo_decision(self):
         self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Wrap up.\n")
         self.todo("from", "flow")
