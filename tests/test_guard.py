@@ -5,7 +5,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HOOK = ROOT / "skills" / "orchestrator" / "autorun" / "scripts" / "autorun.py"
@@ -193,6 +195,38 @@ class Guard(unittest.TestCase):
             f.write_text("---\nname: x\ndescription: x\n---\n\n" + body)
             self.assertEqual([t for _, t, _, _ in steps(f)], expected, name)
         self.assertIn("todo add", self.todo("from", "rules", ok=False))
+
+    def test_a_timed_out_gate_is_stopped_with_everything_it_started(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import gates
+        scripts = self.skills / "slow" / "scripts"
+        scripts.mkdir(parents=True)
+        self.write_skill("slow", "---\nname: slow\ndescription: x\n---\n")
+        pidfile = pathlib.Path(self.tmp.name, "grandchild.pid")
+        (scripts / "hang.py").write_text(
+            "import pathlib, subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"pathlib.Path({str(pidfile)!r}).write_text(str(child.pid))\n"
+            "time.sleep(60)\n")
+        with mock.patch.dict(os.environ, {"GUARD_SKILL_ROOTS": str(self.skills)}), mock.patch.object(gates, "TIMEOUT", 2):
+            started = time.monotonic()
+            why = gates.run("slow", "hang.py", ["go"], self.tmp.name)
+        grandchild = int(pidfile.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(grandchild)], capture_output=True))
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("did not finish within 2 seconds", why)
+        self.assertIn(f"python3 {scripts / 'hang.py'} go", why)
+        self.assertIn("yourself", why)
+        self.assertIn("mark the item done again", why)
+        for _ in range(50):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the gate's grandchild is still running")
 
     def test_an_item_naming_a_check_script_closes_only_when_it_passes(self):
         scripts = self.skills / "checker" / "scripts"
