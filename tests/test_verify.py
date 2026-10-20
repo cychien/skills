@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -165,7 +166,11 @@ class Verify(unittest.TestCase):
         self.write("plan.md", plan(CHECKS, CHECKS.split("## Checks\n")[1], PERF_NA))
         self.assertIn("used more than once", self.run_verify("plan", ok=False))
 
+    def new_prove(self):
+        (self.dir / "scripts.lock.json").unlink(missing_ok=True)
+
     def passing_scripts(self, *ids):
+        self.new_prove()
         for check_id in ids:
             self.check_script(f"{check_id}.check.sh", "exit 0\n")
         self.run_verify("rerun")
@@ -403,6 +408,7 @@ class Verify(unittest.TestCase):
             'for i in $(seq 30); do [ -e "$d/{other}.started" ] && exit 0; sleep 0.1; done\necho "{other} never ran beside it"; exit 1\n')
 
     def meeting_checks(self):
+        self.new_prove()
         for name in self.dir.glob("*.started"):
             name.unlink()
         self.check_script("B1.check.sh", self.MEET.format(me="B1", other="B2"))
@@ -440,6 +446,7 @@ class Verify(unittest.TestCase):
         self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
         self.assertEqual((self.dir / "B1.rerun.log").read_text(), "rerun: PASS\n")
         (self.dir / "B1.rerun.log").unlink()
+        self.new_prove()
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; touch "$d/B1.readied"\n')
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.rerun.log" ] || { echo "started beside a script that never printed ready"; exit 1; }\n')
         self.assertRegex(self.run_verify("rerun", "--jobs", "2", "--force", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"PASS\s+B1 .*\nPASS\s+B2 ")
@@ -481,6 +488,7 @@ class Verify(unittest.TestCase):
         out = self.run_verify("rerun", "--jobs", "2", ok=False, env={"VERIFY_MAX_LOAD_RATIO": "1000"})
         self.assertRegex(out, r"FAIL\s+B1 .*files that are not its own were deleted or emptied while it ran beside B2: evidence/W1/walk.png\n")
         self.assertRegex(out, r"FAIL\s+B2 .*while it ran beside B1: evidence/W1/walk.png\n")
+        self.new_prove()
         self.check_script("B2.check.sh", "sleep 1.2\n")
         self.assertRegex(self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"PASS\s+B1 .*\nPASS\s+B2 ")
 
@@ -514,7 +522,8 @@ class Verify(unittest.TestCase):
         os.utime(self.dir / "B1.rerun.log", (1, 1))
         self.assertIn("B1.rerun.log is missing or predates the frozen plan", self.run_verify("report", ok=False))
         self.check_script("B1.check.sh", "echo 2 records\nexit 1\n")
-        self.run_verify("rerun", ok=False)
+        self.run_verify("script-fix", "B1.check.sh", "--reason", "the fixture now holds 2 records; agreed by the user")
+        self.run_verify("rerun", "--only", "B1", ok=False)
         self.assertEqual((self.dir / "B1.rerun.log").read_text(), "2 records\nrerun: FAIL (exit 1)\n")
         self.assertIn("B1.rerun.log records a failing run; a PASS needs a passing `verify.py rerun`", self.run_verify("report", ok=False))
         self.write("report.md", plan(REPORT).replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
@@ -640,6 +649,7 @@ class Verify(unittest.TestCase):
         out = self.run_verify("rerun")
         self.assertRegex(out, r"FAIL\s+B2 .*left FAIL: its fix budget is spent and report.md marks it FAIL; exit 1")
         self.assertIn("rerun: 2 checks, 1 PASS, 1 FAIL (1 left FAIL after the fix budget)", out)
+        self.new_prove()
         self.check_script("B1.check.sh", "exit 1\n")
         self.assertIn("rerun: 2 checks, 0 PASS, 2 FAIL (1 left FAIL after the fix budget)", self.run_verify("rerun", ok=False))
 
@@ -650,6 +660,15 @@ class Verify(unittest.TestCase):
         self.check_script("B2.check.sh", "exit 0\n")
         self.assertNotIn("fix attempt", self.run_verify("rerun", "--only", "B2"))
         self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 1})
+
+    def test_the_report_lists_each_full_rerun_and_script_fix(self):
+        self.ready_report()
+        self.check_script("B1.check.sh", "exit 0\n# waits for the port\n")
+        self.run_verify("script-fix", "B1.check.sh", "--reason", "it read the port before the server bound it")
+        self.run_verify("rerun", "--full-reason", "the driver changed its seed; agreed by the user")
+        self.assertRegex(self.run_verify("report"), r"^report ok: 2 checks have verdicts backed by evidence\n"
+                         r"  full rerun \S+: the driver changed its seed; agreed by the user\n"
+                         r"  script fix \S+ B1.check.sh: it read the port before the server bound it\n$")
 
     def test_decision_log_needs_its_header_and_a_verdict_per_attempt(self):
         header = "id\thypothesis\tchange\tbefore\tafter\tdelta\tgate\tverdict\tnote\n"
@@ -882,9 +901,18 @@ class RerunStamp(unittest.TestCase):
         self.assertRegex(out, r"^rerun: 1 checks passed at \S+ on this tree; nothing changed since \(pass --force to run again\)\n$")
         self.assertEqual(self.runs(), 1)
 
+    def script_fix(self, name, ok=True):
+        r = subprocess.run([sys.executable, "-I", str(VERIFY), "script-fix", name, "--reason", "it read the port before the server bound it",
+                            "--dir", str(self.dir)], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout
+
+    REASON = ("--full-reason", "regrade the whole tree; agreed by the user")
+
     def test_force_runs_again_and_restamps(self):
         self.rerun()
-        self.assertIn("1 PASS", self.rerun("--force"))
+        self.assertIn("the prove's full rerun already ran at", self.rerun("--force", ok=False))
+        self.assertIn("1 PASS", self.rerun("--force", *self.REASON))
         self.assertEqual(self.runs(), 2)
         self.assertIn("nothing changed", self.rerun())
 
@@ -896,21 +924,23 @@ class RerunStamp(unittest.TestCase):
     def test_a_changed_tree_diff_script_helper_or_args_run_again(self):
         self.rerun()
         (self.repo / "app.py").write_text("print('edited')\n")
-        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
         self.assertIn("nothing changed", self.rerun())
         (self.repo / "app.py").write_text("print('edited again')\n")
-        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
         self.git("commit", "-qam", "Edit")
-        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
         self.assertIn("nothing changed", self.rerun())
         (self.dir / "drive.mjs").write_text("export const a = 1\n")
-        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
         self.assertIn("nothing changed", self.rerun())
         (self.dir / "drive.mjs").write_text("export const a = 2\n")
-        self.assertIn("1 PASS", self.rerun())
+        self.script_fix("drive.mjs")
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
         self.script("B1.check.sh", 'echo run >> "$(dirname "$0")/runs.txt"\n# edited\n')
-        self.assertIn("1 PASS", self.rerun())
-        self.assertIn("1 PASS", self.rerun("--", "inst-1"))
+        self.script_fix("B1.check.sh")
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
+        self.assertIn("1 PASS", self.rerun(*self.REASON, "--", "inst-1"))
         self.assertIn("nothing changed", self.rerun("--", "inst-1"))
         self.assertEqual(self.runs(), 8)
 
@@ -925,10 +955,63 @@ class RerunStamp(unittest.TestCase):
         self.rerun()
         self.assertTrue((self.dir / "rerun.stamp.json").exists())
         self.script("B2.check.sh", "exit 1\n")
-        self.rerun(ok=False)
+        self.rerun(*self.REASON, ok=False)
         self.assertFalse((self.dir / "rerun.stamp.json").exists())
         (self.dir / "B2.check.sh").unlink()
-        self.assertIn("1 PASS", self.rerun())
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
+
+    def lock(self):
+        return json.loads((self.dir / "scripts.lock.json").read_text())
+
+    def test_the_prove_locks_its_scripts_and_a_later_full_rerun_needs_an_agreed_reason(self):
+        self.rerun("--only", "B1")
+        self.assertFalse((self.dir / "scripts.lock.json").exists())
+        self.rerun()
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        lock = self.lock()
+        digest = hashlib.sha256((self.dir / "B1.check.sh").read_bytes()).hexdigest()
+        self.assertEqual((lock["head"], lock["files"], lock["full_reruns"], lock["script_fixes"]), (head, {"B1.check.sh": digest}, [], []))
+        (self.repo / "app.py").write_text("print('fixed')\n")
+        refusal = (f"verify rerun: the prove's full rerun already ran at {lock['at']}. Grade later changes with "
+                   "`verify.py rerun --only $(verify.py affected)`, which reruns only the checks a change can break. A full rerun "
+                   "needs --full-reason \"<why; agreed by whom>\", and the report lists it.\n")
+        self.assertEqual(self.rerun(ok=False), refusal)
+        self.assertEqual(self.rerun("--full-reason", "rebuilt", ok=False), refusal)
+        self.assertIn("1 PASS", self.rerun("--only", "B1"))
+        self.assertIn("1 PASS", self.rerun(*self.REASON))
+        self.assertEqual([r["why"] for r in self.lock()["full_reruns"]], ["regrade the whole tree; agreed by the user"])
+        self.assertEqual(self.runs(), 4)
+
+    def test_a_script_edit_after_the_prove_needs_a_recorded_script_fix_before_any_rerun(self):
+        self.assertIn("verify script-fix: no scripts.lock.json in", self.script_fix("B1.check.sh", ok=False))
+        self.rerun()
+        self.script("B1.check.sh", 'echo run >> "$(dirname "$0")/runs.txt"\nsleep 0\n')
+        script = shlex.quote(str(VERIFY))
+        refusal = ("verify rerun: B1.check.sh changed since scripts.lock.json recorded it, so a rerun would grade an edit nobody "
+                   f"explained. Record why each one changed with: python3 {script} script-fix B1.check.sh --reason "
+                   "\"<why it crashed before its predicate>\"\n")
+        self.assertEqual(self.rerun("--only", "B1", ok=False), refusal)
+        self.assertEqual(self.rerun(*self.REASON, ok=False), refusal)
+        self.assertIn("verify script-fix: nope.sh is not a check script or helper that scripts.lock.json recorded; locked: B1.check.sh",
+                      self.script_fix("nope.sh", ok=False))
+        before = self.lock()["files"]["B1.check.sh"]
+        self.assertEqual(self.script_fix("B1.check.sh"), "script fix recorded for B1.check.sh: it read the port before the server bound it\n")
+        fix = self.lock()["script_fixes"]
+        self.assertEqual([(f["file"], f["before"], f["after"], f["why"]) for f in fix],
+                         [("B1.check.sh", before, self.lock()["files"]["B1.check.sh"], "it read the port before the server bound it")])
+        self.assertNotEqual(before, fix[0]["after"])
+        self.assertIn("verify script-fix: B1.check.sh is unchanged since scripts.lock.json recorded it; script-fix records an edit, so "
+                      "edit it first", self.script_fix("B1.check.sh", ok=False))
+        self.assertIn("1 PASS", self.rerun("--only", "B1"))
+        self.assertIn("the prove's full rerun already ran", self.rerun(ok=False))
+
+    def test_a_script_added_after_the_prove_is_locked_on_its_first_run(self):
+        self.rerun()
+        self.script("B2.check.sh", "exit 0\n")
+        self.rerun("--only", "B2")
+        self.assertIn("B2.check.sh", self.lock()["files"])
+        self.script("B2.check.sh", "exit 0\n# edited\n")
+        self.assertIn("B2.check.sh changed since scripts.lock.json recorded it", self.rerun("--only", "B2", ok=False))
 
     def test_only_runs_the_named_checks_and_leaves_the_stamp_alone(self):
         self.script("B2.check.sh", 'echo two >> "$(dirname "$0")/runs2.txt"\n')

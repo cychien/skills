@@ -3,7 +3,8 @@
 
 usage: verify.py <command> [--dir DIR]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
-       verify.py rerun [--only ID ...] [--jobs N] [--timeout SECONDS] [--force] [-- ARGS ...]
+       verify.py rerun [--only ID ...] [--jobs N] [--timeout SECONDS] [--force] [--full-reason "<why; agreed by whom>"] [-- ARGS ...]
+       verify.py script-fix <file> --reason "<why it crashed before its predicate>"
        verify.py phases [<plan folder>]
        verify.py adopt <phase folder>
        verify.py leftovers [--kill] [--root DIR ...] [--running-since EPOCH]
@@ -39,7 +40,8 @@ usage: verify.py <command> [--dir DIR]
               findings, each triaged, or 'none found'. In a git repository, review.md's 'Head:' line names the commit the
               reviewer read; when the diff from it to HEAD changes more than 200 lines or touches a path the plan's
               '## Sensitive paths' lists, review.md needs a '## Fix review' section, written after HEAD's commit, every
-              finding triaged.
+              finding triaged. A passing report lists each plan revision, each full rerun after the prove, and each
+              script fix, with its reason.
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
               base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
@@ -70,12 +72,21 @@ usage: verify.py <command> [--dir DIR]
               rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff, and a sha256 per check script
               and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS and an unchanged stamp prints one
               line and exits 0 without running; --force always runs. Any run deletes the stamp first, so a failed or
-              interrupted run leaves none. --only ID (repeatable) runs just those checks, for grading a fix; it neither
+              interrupted run leaves none. The first full rerun is the prove's: before it runs, it writes scripts.lock.json
+              with the time, HEAD, and a sha256 per check script and helper. A later full rerun is refused, because later
+              changes are graded with `rerun --only $(verify.py affected)`; --full-reason "<why; agreed by whom>" allows
+              one, records it in the lock, and relocks the hashes. Any rerun, --only included, refuses while a locked file
+              differs from its hash, until `script-fix` records why it changed; a script or helper added later is locked
+              on its first run. --only ID (repeatable) runs just those checks, for grading a fix; it neither
               reads nor writes the stamp, so the full rerun still decides the gate. Once report.md marks a check FAIL,
               each --only run in which it still fails is one failed fix attempt, counted in fix-attempts.json; after 2,
               --only refuses it, and the full rerun reports it as left FAIL without failing, because it goes to the
               user or the backlog. A check script finds the repository from its working directory, never a hard-coded
               worktree path.
+  script-fix  record why a check script or helper that scripts.lock.json locked changed after the prove: <file> in the
+              verification directory and --reason "<why it crashed before its predicate>". It appends the time, the file,
+              its old and new sha256, and the reason to the lock's script fixes and locks the new hash, so a rerun may
+              grade it again. Refuses a file the lock does not hold or one whose hash did not change.
   phases      every phase of a feature plan has a sound verification plan: <plan folder>/phases/<phase>/plan.md for
               each phase, each passing the plan rules (the Drive contract and the 10 e2e cap among them), check ids unique across the whole feature (the feature
               plan's Acceptance list names each check by id), and, when <plan folder>/skeleton.patch exists, every
@@ -100,7 +111,7 @@ usage: verify.py <command> [--dir DIR]
 
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
 the root, --dir overrides the whole path). It holds plan.md, plan.lock, report.md, review.md,
-decision.tsv, units.json, fix-attempts.json, and the evidence files. An oracle check <id> also has <id>.expected.json, written by an
+decision.tsv, units.json, fix-attempts.json, scripts.lock.json, and the evidence files. An oracle check <id> also has <id>.expected.json, written by an
 agent that read only the spec and the seed data, and <id>.observed.json, read from the running app.
 """
 import argparse
@@ -163,6 +174,7 @@ DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
 SCRIPT_TIMEOUT = 900
 RERUN_TIMEOUT = 300
 RERUN_STAMP = "rerun.stamp.json"
+SCRIPTS_LOCK = "scripts.lock.json"
 RERUN_PASS = "rerun: PASS"
 FIX_ATTEMPTS = 2
 FIX_LEDGER = "fix-attempts.json"
@@ -898,8 +910,11 @@ def cmd_report(directory, args):
             problems.append(f"{number}: {check_id} is INCONCLUSIVE; start its Observed cell with 'blocker:' and what stopped it")
     if problems:
         raise Failed("\n".join(f"{path}: {p}" for p in problems))
-    revisions = "".join(f"\n  revision {r['at']}: {r['why']}" for r in lock["revisions"])
-    return f"report ok: {len(ids)} checks have verdicts backed by evidence" + (f"\n  {same_tree}" if same_tree else "") + revisions
+    scripts_lock = load_scripts_lock(directory) or {}
+    notes = [f"revision {r['at']}: {r['why']}" for r in lock["revisions"]]
+    notes += [f"full rerun {r['at']}: {r['why']}" for r in scripts_lock.get("full_reruns", [])]
+    notes += [f"script fix {r['at']} {r['file']}: {r['why']}" for r in scripts_lock.get("script_fixes", [])]
+    return "\n  ".join([f"report ok: {len(ids)} checks have verdicts backed by evidence", *([same_tree] if same_tree else []), *notes])
 
 
 def cmd_decisions(directory, args):
@@ -939,14 +954,99 @@ def helper_files(directory):
             if p.is_file() and p.suffix in HELPER_SUFFIXES and not skipped & set(p.relative_to(directory).parts[:-1])]
 
 
+def script_hashes(directory, scripts):
+    return {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted({*scripts, *helper_files(directory)})}
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def head_sha():
+    try:
+        return git("rev-parse", "HEAD")
+    except Failed:
+        return None
+
+
+def load_scripts_lock(directory):
+    path = directory / SCRIPTS_LOCK
+    return load_json(path) if path.is_file() else None
+
+
+def write_scripts_lock(directory, lock):
+    (directory / SCRIPTS_LOCK).write_text(json.dumps(lock, indent=2) + "\n")
+
+
+def unrecorded_edits(directory, lock):
+    """Locked files whose content changed since the lock recorded them; a deleted file runs nothing, so it is not one."""
+    return sorted(name for name, digest in lock["files"].items()
+                  if (directory / name).is_file() and hashlib.sha256((directory / name).read_bytes()).hexdigest() != digest)
+
+
+def hold_script_lock(directory, lock):
+    """Refuse to run while a locked file holds an unrecorded edit, and lock any check script or helper that is new since."""
+    if lock is None:
+        return
+    edited = unrecorded_edits(directory, lock)
+    if edited:
+        script = shlex.quote(str(pathlib.Path(__file__).resolve()))
+        raise Failed(f"{', '.join(edited)} changed since {SCRIPTS_LOCK} recorded {'it' if len(edited) == 1 else 'them'}, so a "
+                     "rerun would grade an edit nobody explained. Record why each one changed with: "
+                     + "; ".join(f"python3 {script} script-fix {shlex.quote(name)} --reason \"<why it crashed before its predicate>\""
+                                 for name in edited))
+    current = script_hashes(directory, check_scripts(directory))
+    if new := {name: digest for name, digest in current.items() if name not in lock["files"]}:
+        lock["files"].update(new)
+        write_scripts_lock(directory, lock)
+
+
+def claim_full_rerun(directory, lock, scripts, args):
+    """Write the scripts lock for the prove's full rerun, or record an agreed later one; refuse any other."""
+    if lock is None:
+        write_scripts_lock(directory, {"at": now_iso(), "head": head_sha(), "files": script_hashes(directory, scripts),
+                                       "full_reruns": [], "script_fixes": []})
+        return
+    if not args.full_reason or len(args.full_reason.strip()) < MIN_REASON:
+        raise Failed(f"the prove's full rerun already ran at {lock['at']}. Grade later changes with "
+                     "`verify.py rerun --only $(verify.py affected)`, which reruns only the checks a change can break. A full "
+                     "rerun needs --full-reason \"<why; agreed by whom>\", and the report lists it.")
+    lock.setdefault("full_reruns", []).append({"at": now_iso(), "why": args.full_reason.strip()})
+    lock["files"] = script_hashes(directory, scripts)
+    write_scripts_lock(directory, lock)
+
+
+def cmd_script_fix(directory, args):
+    if len(args.rest) != 1:
+        raise Failed("script-fix takes one <file>: a check script or helper in the verification directory")
+    if not args.reason or len(args.reason.strip()) < MIN_REASON:
+        raise Failed("script-fix needs --reason \"<why it crashed before its predicate>\"")
+    lock = load_scripts_lock(directory)
+    if lock is None:
+        raise Failed(f"no {SCRIPTS_LOCK} in {directory}; the prove's full `verify.py rerun` writes it, and until then a "
+                     "script changes freely")
+    given = pathlib.Path(args.rest[0]).expanduser()
+    path = (given if given.is_absolute() else directory / given).resolve()
+    name = str(path.relative_to(directory.resolve())) if under(str(path), str(directory.resolve())) else str(given)
+    if name not in lock["files"] or not path.is_file():
+        raise Failed(f"{name} is not a check script or helper that {SCRIPTS_LOCK} recorded; locked: {', '.join(sorted(lock['files']))}")
+    after = hashlib.sha256(path.read_bytes()).hexdigest()
+    if after == lock["files"][name]:
+        raise Failed(f"{name} is unchanged since {SCRIPTS_LOCK} recorded it; script-fix records an edit, so edit it first")
+    lock.setdefault("script_fixes", []).append({"at": now_iso(), "file": name, "before": lock["files"][name], "after": after,
+                                                "why": args.reason.strip()})
+    lock["files"][name] = after
+    write_scripts_lock(directory, lock)
+    return f"script fix recorded for {name}: {args.reason.strip()}"
+
+
 def rerun_inputs(directory, scripts, rest, left):
     """What a passing rerun depends on, or None outside a git repository."""
     tree = tree_of("HEAD")
     diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True)
     if not tree or diff.returncode:
         return None
-    files = {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted({*scripts, *helper_files(directory)})}
-    return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": files, "left": left}
+    return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": script_hashes(directory, scripts), "left": left}
 
 
 def file_sizes(directory):
@@ -1135,6 +1235,8 @@ def cmd_rerun(directory, args):
                      "budget. Stop fixing: take each to the user with its repro, what each fix changed, and the premise the fixes "
                      "shared, or in an autonomous run put it in the project's backlog with the fix you recommend and leave it FAIL "
                      f"in report.md. Only the user grants another attempt, by deleting its entry from {FIX_LEDGER}.")
+    lock = load_scripts_lock(directory)
+    hold_script_lock(directory, lock)
     stamp_path = directory / RERUN_STAMP
     inputs = None if args.only else rerun_inputs(directory, scripts, args.rest, left)
     if inputs and not args.force and stamp_path.exists():
@@ -1148,6 +1250,7 @@ def cmd_rerun(directory, args):
                     + (f" except {', '.join(known)}, left FAIL after the fix budget" if known else "")
                     + "; nothing changed since (pass --force to run again)")
     if not args.only:
+        claim_full_rerun(directory, lock, check_scripts(directory), args)
         stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
     results, requeued = run_checks(directory, scripts, args, env)
@@ -1176,8 +1279,7 @@ def cmd_rerun(directory, args):
     if len(failed) > len(known):
         raise Failed("\n" + "\n".join(lines))
     if inputs:
-        at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-        stamp_path.write_text(json.dumps({**inputs, "at": at, "known": known}, indent=2) + "\n")
+        stamp_path.write_text(json.dumps({**inputs, "at": now_iso(), "known": known}, indent=2) + "\n")
     return "\n".join(lines)
 
 
@@ -1626,7 +1728,7 @@ def indent(text):
 
 
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
-            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun,
+            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "script-fix": cmd_script_fix,
             "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
 
 
@@ -1635,6 +1737,8 @@ def main():
     parser.add_argument("command", choices=["where", *COMMANDS])
     parser.add_argument("--dir")
     parser.add_argument("--revision")
+    parser.add_argument("--reason")
+    parser.add_argument("--full-reason")
     parser.add_argument("--test-cmd")
     parser.add_argument("--kill", action="store_true")
     parser.add_argument("--native", action="store_true")
@@ -1650,7 +1754,7 @@ def main():
     passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
     args = parser.parse_intermixed_args(argv[:len(argv) - len(passthrough) - 1] if "--" in argv else argv)
     args.rest += passthrough
-    if args.rest and args.command not in ("units", "rerun", "phases", "adopt"):
+    if args.rest and args.command not in ("units", "rerun", "phases", "adopt", "script-fix"):
         parser.error(f"{args.command} takes no arguments")
     if args.jobs < 1:
         parser.error("--jobs needs at least 1")
