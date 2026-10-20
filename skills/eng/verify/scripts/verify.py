@@ -21,7 +21,10 @@ usage: verify.py <command> [--dir DIR]
               override: keep the riskiest, move the rest to unit or drop them, or split the phase. An optional
               '## Sensitive paths' section lists paths or globs (auth, permissions, crypto) where the reviewer looks
               hardest. Prints the count per tier.
-  driver      a project verification skill is on main, or was committed before any product change
+  driver      a project verification skill is on main, or was committed before any product change, or HEAD holds a
+              driver-only commit whose patch (git patch-id) matches a commit on a local branch whose commits since the
+              phase base (the commit `adopt` recorded, else the merge-base with main) touch only the driver: the
+              verifier built or extended it there, on the unchanged app, and cherry-picked it onto the change
   freeze      record the plan's hash, the Drive contract and Sensitive paths included, before a verifier runs;
               --revision "<why; agreed by>" records a deliberate change to an already frozen plan
   lock        freeze the plan before any code exists: refuses while the working tree changes product files since the
@@ -477,25 +480,53 @@ def has_driver(rev):
     return any(is_driver_path(p) and p.endswith("/SKILL.md") for p in git("ls-tree", "-r", "--name-only", rev).splitlines())
 
 
+def driver_only(commit):
+    files = git("diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit).splitlines()
+    return bool(files) and all(is_driver_path(f) for f in files)
+
+
+def patch_id(commit):
+    patch = subprocess.run(["git", "show", commit], capture_output=True).stdout
+    words = subprocess.run(["git", "patch-id", "--stable"], input=patch, capture_output=True).stdout.split()
+    return words[0].decode() if words else None
+
+
+def driver_branch(base):
+    """The local branch whose commits since base touch only driver paths and match a driver-only commit in HEAD by patch, or None."""
+    picked = {patch_id(c) for c in git("rev-list", f"{base}..HEAD").splitlines() if driver_only(c)} - {None}
+    if not picked:
+        return None
+    for ref in git("for-each-ref", "--format=%(refname)", "refs/heads").splitlines():
+        commits = git("rev-list", f"{base}..{ref}").splitlines()
+        if commits and all(driver_only(c) for c in commits) and any(patch_id(c) in picked for c in commits):
+            return ref.removeprefix("refs/heads/")
+    return None
+
+
 def cmd_driver(directory, args):
     top = pathlib.Path(git("rev-parse", "--show-toplevel"))
     drivers = sorted(str(p.parent.relative_to(top)) for d in DRIVER_DIRS for p in top.glob(d + "*/SKILL.md"))
     if not drivers:
         raise Failed("no verification skill in this worktree (.agents/skills/verify-<app>/ or .claude/skills/verify-<app>/). "
                      "Run the create-verification-skill skill in a clean worktree off main, then base this branch on it.")
-    base = default_branch()
-    if has_driver(base):
-        return f"driver ok: {', '.join(drivers)} is on {base}"
+    main = default_branch()
+    if has_driver(main):
+        return f"driver ok: {', '.join(drivers)} is on {main}"
     if not has_driver("HEAD"):
         raise Failed("the verification skill is not committed. Commit it before any product change, so the history shows "
                      "it was built from the unchanged app.")
-    for commit in git("rev-list", "--reverse", "--topo-order", f"{base}..HEAD").splitlines():
+    for commit in git("rev-list", "--reverse", "--topo-order", f"{main}..HEAD").splitlines():
         files = git("diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit).splitlines()
         if any(not is_driver_path(f) for f in files):
-            if not has_driver(f"{commit}^"):
-                raise Failed(f"commit {commit[:12]} changed product files before any commit added the verification skill, "
-                             "so the driver may have been fitted to the change. Build it from main first.")
-            break
+            if has_driver(f"{commit}^"):
+                break
+            base = phase_base(base_record(directory))
+            if branch := driver_branch(base):
+                return (f"driver ok: {', '.join(drivers)} was cherry-picked from {branch}, which holds only driver commits since "
+                        f"the phase base {base[:12]}")
+            raise Failed(f"commit {commit[:12]} changed product files before any commit added the verification skill, "
+                         "so the driver may have been fitted to the change. Build it from main first, or on the phase base "
+                         "in a branch of driver commits only, and cherry-pick it.")
     return f"driver ok: {', '.join(drivers)} was committed before any product change"
 
 
@@ -555,6 +586,15 @@ def product_changes(base, skip):
     return sorted(n for n in names if n and not n.startswith(DRIVER_DIRS) and not any(n == d or n.startswith(d + "/") for d in skipped))
 
 
+def base_record(directory):
+    path = directory / BASE_RECORD
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def phase_base(record):
+    return record.get("base") or git("merge-base", default_branch(), "HEAD")
+
+
 def cmd_lock(directory, args):
     _, text, _, _, _ = load_plan(directory)
     lock_path = directory / "plan.lock"
@@ -564,8 +604,8 @@ def cmd_lock(directory, args):
                          "Write the plan before the code on the next change.")
         frozen_lock(directory, text)
         return "plan locked before code, unchanged since or changed only by recorded revisions"
-    record = json.loads((directory / BASE_RECORD).read_text()) if (directory / BASE_RECORD).is_file() else {}
-    base = record.get("base") or git("merge-base", default_branch(), "HEAD")
+    record = base_record(directory)
+    base = phase_base(record)
     changed = product_changes(base, [record["plan"]] if record.get("plan") else [])
     if changed:
         raise Failed(f"product files already changed since {base[:12]}: {listed(changed)}. Lock the plan before any code: "

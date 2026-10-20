@@ -733,6 +733,29 @@ class Driver(unittest.TestCase):
         self.commit("Add the shop verification skill")
         self.assertIn("before any commit added the verification skill", self.driver(ok=False))
 
+    def driver_base_branch(self, *product):
+        (self.repo / "app.py").write_text("print('search')\n")
+        self.commit("Add search")
+        self.git("checkout", "-qb", "verify-base", "main")
+        self.add_driver()
+        self.commit("Add the shop verification skill")
+        for name in product:
+            (self.repo / name).write_text("print('fitted')\n")
+            self.commit("Change the product on the driver branch")
+        built = subprocess.run(["git", "rev-list", "-1", "HEAD", "--", ".agents"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        self.git("checkout", "-q", "feature/search")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "cherry-pick", built)
+
+    def test_passes_when_the_driver_was_cherry_picked_from_a_branch_of_driver_commits_on_the_base(self):
+        self.driver_base_branch()
+        base = subprocess.run(["git", "rev-parse", "main"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(self.driver(), f"driver ok: .agents/skills/verify-shop was cherry-picked from verify-base, which holds only "
+                                        f"driver commits since the phase base {base[:12]}\n")
+
+    def test_a_cherry_picked_driver_from_a_branch_that_also_changed_the_product_fails(self):
+        self.driver_base_branch("app.py")
+        self.assertIn("changed product files before any commit added the verification skill", self.driver(ok=False))
+
     def test_a_driver_on_main_always_counts(self):
         self.git("checkout", "-q", "main")
         self.add_driver()
