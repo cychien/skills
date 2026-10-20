@@ -31,3 +31,11 @@
 - Probe: <the command or procedure, run on main and head, interleaved>
 - Baseline: <main, or none: why main lacks the path>
 - Rule: <the number that fails: a limit against main, or absolute budgets for the added work and the end state>
+
+## Drive contract
+
+- <kind: test id, accessible name, route, HTTP path, CLI command or flag, wire or event name, or file path>: `<the exact name>`, <what it is and which checks drive it>
+
+## Sensitive paths
+
+- `<path or glob>`: <why a fix there needs a second review: auth, permissions, crypto, or similar>

@@ -12,7 +12,7 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [principles](./skills/eng/principles/) - the engineering principles playbooks read before they design or build
 - [code-comments](./skills/eng/code-comments/) - how code is commented in every file a playbook produces
 - [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements, design, phases, and every phase's verification plan before any code
-- [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground, design, lock the plan before code, delegate, verify once, open a PR; builds a plan-feature plan phase by phase as stacked PRs
+- [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground, design, lock the plan before code, delegate, verify once, open a PR; builds a plan-feature plan one phase per session as stacked PRs
 - [quick-feature](./skills/eng/quick-feature/) - build a small feature in one PR with the same verification floor: plan locked before code, fresh verifier, oracle, fail-first specs
 - [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, verify, land the failing repro before the fix
 - [perf-issue](./skills/eng/perf-issue/) - fix a slowness against a vetted baseline, cheapest performance mantra first

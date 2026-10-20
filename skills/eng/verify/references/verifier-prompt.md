@@ -26,6 +26,8 @@ Rules for both stages:
 - Save every artifact in the evidence directory under a name that starts with the check id.
 
 Stage scripts. For every check whose Tier is e2e, perf checks included, write a script, `<id>.check.<ext>`, in the evidence directory, from the plan, the skeleton, and the driver only. Do not read the implementation (the change's branch, its diff, or product source the skeleton does not show), because a script written from the code checks the code.
+- Drive only the names in the plan's Drive contract: test ids, accessible names, routes, HTTP paths, commands, flags, wire and event names, file paths. When a check needs a name the contract lacks, stop and report it to the lead instead of guessing it, because a guessed name tests the guess.
+- Bound the setup (provisioning, seeding, starting the instance) on its own, generously, then print the line `verify: ready` on stdout, flushed, once the instance is up, and start every predicate deadline only after it, so a slow start never counts against the behavior under test. `rerun --jobs` starts the next script only after this line.
 - The script reruns the check, writes its evidence, asserts the check's predicate itself, prints PASS or FAIL, and exits non-zero on FAIL, so it grades the check without an agent.
 - It runs with zero arguments: it provisions and tears down whatever instance it needs through the project driver itself (optional arguments may reuse a running instance), because the gate runs every script with none. It loads the check's Seed dataset through the driver.
 - It cleans only its own evidence (`evidence/<id>/` or files starting with `<id>`), never a shared folder, because another check's cited evidence lives there.

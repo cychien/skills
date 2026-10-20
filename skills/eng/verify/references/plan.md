@@ -1,19 +1,20 @@
 # Verification plan
 
-Write the plan before the design, with the requirements. A pass predicate and a perf budget are product decisions as much as the spec is, and a check or budget written after the code tends to describe the code instead of the requirement.
+Write the checks before the design, with the requirements. A pass predicate and a perf budget are product decisions as much as the spec is, and a check or budget written after the code tends to describe the code instead of the requirement. Add the Drive contract and the Sensitive paths once the design settles, because they name what the design builds, and lock all of it before any code.
 
 Write it as `plan.md` in the verification directory that `python3 ../scripts/verify.py where` prints (a path beside this file's folder), from `plan-template.md` beside this file. `verify.py plan` checks its shape, and the playbook step that writes the plan closes only when that passes, so a check without a predicate or a plan without a perf decision cannot reach a verifier.
 
 ## Terms
 
 - **Check.** One acceptance condition, written in the plan before any code and locked. Its fields are Scenario, Surface, Evidence, Pass, Oracle, and Tier.
+- **Drive contract.** Every name an e2e or walk check drives, settled before any code: DOM test ids and accessible names, routes and HTTP paths, CLI commands and flags, wire and event names, and the file paths the checks read. The executor builds those names exactly, and the verifier writes its scripts against them alone.
 - **Verify.** Proving the checks: an agent that did not write the code runs every check and records PASS, FAIL, or INCONCLUSIVE with its evidence in `report.md`.
 - **Tier.** How a check is proved, one of:
   - `e2e`: isolation, permissions, revocation, wire compatibility, perf budgets, and cross-surface flows, what a unit test cannot see and what costs most when broken. Proved by a zero-argument `<id>.check.<ext>` script the verifier writes and `verify.py rerun` runs on the real app, so it regrades the check without an agent whenever the code changes.
   - `unit`: logic. Proved by a spec the executor writes, graded fail-first by `verify.py units`, with the check id in its test title so `units` records which spec proves it.
   - `walk`: UI look and interaction. The verifier walks it once on the real app and saves a screenshot or video in `evidence/<id>/`; no script.
 
-Pick `e2e` only where its definition holds, because each script is an instance started on every rerun; logic a spec can reach is `unit`.
+Pick `e2e` only where its definition holds, because each script is an instance started on every rerun; logic a spec can reach is `unit`. A plan holds at most 10 `e2e` checks, perf checks included, and `verify.py plan` refuses more with no override: rank them by risk, keep the riskiest and costliest-to-break behavior, and move the rest to `unit` or drop them, or split the phase.
 
 ## Checks
 
@@ -45,6 +46,14 @@ Cover:
 1. **Behavior.** Every behavior the change adds or alters, including the edges settled with the user: empty input, errors, boundaries, permissions.
 2. **Regression.** The load-bearing existing behavior the change could break, run on the base (main, or the previous phase's tip in a stacked feature) and on head. Name what must stay identical, such as byte-identical output or the same screen. When main lacks the feature, say so and gate head on its own predicates. In a stacked feature these checks are the only regrade an earlier phase's behavior gets, because no phase reruns another phase's scripts, so name each earlier behavior this phase could break.
 3. **Unit.** Unit-tier checks for logic with a cheap local test path, each a spec written to fail before the change and pass after, with the check id in its test title. Assert behavior per the Test Behavior, Not Implementation principle (`../../principles/references/principles/test-behavior-not-implementation.md`). Prefer no new test over a test of mocks, timing, or internals. Tests are one part of the plan, never all of it. Grade fail-first with `python3 ../scripts/verify.py units`: each spec file added or changed in the range, which defaults to the merge-base with the default branch through HEAD, fails on base plus the spec and passes at head, never judged from commit order, so commits group freely and no history is rewritten for evidence. A spec that already passes on base must be a regression guard in its own spec file containing the marker `regression-guard`. Compile-time type tests, import guards, and regression tests that pin behavior main already has cannot fail first: they land in the commit with the code they guard and are exempt from the fail-first predicate, so say so in the check.
+
+## Drive contract
+
+Every plan with an `e2e` or `walk` check lists, under `## Drive contract`, each name those checks drive, one per line with what it is and which checks use it, and `verify.py plan` refuses the plan without it. It comes from the design: the skeleton's routes and commands, the design note's screens and events. A name stays fixed once locked: the executor implements it exactly, and a change it needs stops it and goes through `verify.py freeze --revision` with the user's agreement, like a skeleton deviation. The verifier drives only these names, so a script never depends on what the author happened to call something.
+
+## Sensitive paths
+
+Name, under `## Sensitive paths`, the paths or globs where a defect costs most: authentication, permissions, crypto, and similar. After the fix loop, a fix diff that touches one, or that changes more than 200 lines, gets one more review of that diff, and the `report` gate refuses a report without it. Write `n/a: <reason>` when the change touches none.
 
 ## Perf
 

@@ -692,12 +692,12 @@ class ShippedPlaybooks(unittest.TestCase):
 
     def test_quick_feature_freezes_the_plan_before_code_delegates_and_cannot_skip_verification(self):
         mandatory = self.gated_mandatory_steps("quick-feature")
-        self.assertEqual(mandatory, {1: {"plan", "lock"}, 3: {"driver"}, 4: set(), 6: {"oracles"}, 7: set(), 8: {"rerun", "report", "leftovers"}})
+        self.assertEqual(mandatory, {1: set(), 3: {"driver"}, 4: {"plan", "lock"}, 5: set(), 7: {"oracles"}, 9: {"rerun", "report", "leftovers"}})
 
     def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_final_rerun_and_report(self):
         mandatory = self.gated_mandatory_steps("feature")
-        self.assertEqual(mandatory, {1: {"plan"}, 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units"}, 10: {"oracles"},
-                                     12: set(), 13: {"rerun", "report", "leftovers"}})
+        self.assertEqual(mandatory, {1: set(), 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units"}, 10: {"oracles"},
+                                     11: set(), 13: {"rerun", "report", "leftovers"}})
 
     def test_the_step_that_opens_the_pr_is_the_one_the_final_run_gates(self):
         sys.path.insert(0, str(GUARD.parent))

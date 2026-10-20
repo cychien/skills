@@ -11,10 +11,15 @@ usage: verify.py <command> [--dir DIR]
 
   where       print this branch's verification directory
   plan        the plan is complete: checks with every field, a Tier of e2e, unit, or walk on each (a perf check is
-              always e2e), and a perf decision. Prints the count per tier.
+              always e2e), and a perf decision. A plan with any e2e or walk check needs a non-empty '## Drive contract'
+              section: every name those checks drive (test ids, accessible names, routes, HTTP paths, CLI commands and
+              flags, wire and event names, file paths), settled before code. At most 10 e2e checks per plan, with no
+              override: keep the riskiest, move the rest to unit or drop them, or split the phase. An optional
+              '## Sensitive paths' section lists paths or globs (auth, permissions, crypto) whose fixes need a fix
+              review. Prints the count per tier.
   driver      a project verification skill is on main, or was committed before any product change
-  freeze      record the plan's hash before a verifier runs; --revision "<why; agreed by>"
-              records a deliberate change to an already frozen plan
+  freeze      record the plan's hash, the Drive contract and Sensitive paths included, before a verifier runs;
+              --revision "<why; agreed by>" records a deliberate change to an already frozen plan
   lock        freeze the plan before any code exists: refuses while the working tree changes product files since the
               base (the commit `adopt` recorded, else the merge-base with main), leaving the project's verification
               skill and the adopted plan folder aside. Once locked, passes while the plan is unchanged or every change
@@ -29,7 +34,10 @@ usage: verify.py <command> [--dir DIR]
               rerun after the freeze; unit by the last `units` result, after the freeze, passing, on HEAD's tree, with
               a spec that names the check id; walk by a screenshot or video in evidence/<id>/ written after the freeze.
               A '## Review' section in report.md, or review.md, written after the freeze, holds the code review's
-              findings, each triaged, or 'none found'.
+              findings, each triaged, or 'none found'. In a git repository, review.md's 'Head:' line names the commit the
+              reviewer read; when the diff from it to HEAD changes more than 200 lines or touches a path the plan's
+              '## Sensitive paths' lists, review.md needs a '## Fix review' section, written after HEAD's commit, every
+              finding triaged.
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
               base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
@@ -40,10 +48,16 @@ usage: verify.py <command> [--dir DIR]
               titled "U2: ..." proves unit check U2) and units.log in the verification directory, for `report`.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
               instance id) to each; one PASS or FAIL line per check from its exit code, in id order, and a summary. Each
-              script gets 300 seconds unless --timeout raises it. --jobs N runs up to N scripts at once, admitting the
-              next one only while `capacity` would pass (one always runs, so a busy machine slows the run instead of
-              stalling it); the plan's perf checks always run alone after the rest, because concurrent instances skew
-              every timing. Under --jobs, a file owned by a check that ran at the same time is not held against the
+              script gets 300 seconds unless --timeout raises it. --jobs N runs up to N scripts at once, starting them one
+              at a time: the next starts only once every running script has printed the line "verify: ready" (its
+              instance is up; the line stays out of its log) and while `capacity` would pass, because the 1-minute load
+              lags an instance start; a script that never prints it runs alone (one always runs, so a busy machine slows
+              the run instead of stalling it). A watchdog samples the load every 3 seconds; once it stays above 1.0 x
+              cores for 15 seconds, it stops the most recently started script with its process group and the detached
+              processes it started, queues it again, prints it as REQUEUED with the load, and lowers the jobs to the
+              scripts still running, never below one. A requeued run is neither a FAIL nor a fix attempt, and a script
+              that finishes FAIL is never retried. The plan's perf checks always run alone after the rest, because
+              concurrent instances skew every timing. Under --jobs, a file owned by a check that ran at the same time is not held against the
               other, because that check may be rewriting its own evidence, and a loss seen while checks ran side by
               side FAILs each of them with the names of the others, so `--only` finds the culprit. Exits 0 with a "no saved check scripts"
               line when there are none. A check script runs with zero arguments and provisions and tears down its own instance through
@@ -61,7 +75,7 @@ usage: verify.py <command> [--dir DIR]
               user or the backlog. A check script finds the repository from its working directory, never a hard-coded
               worktree path.
   phases      every phase of a feature plan has a sound verification plan: <plan folder>/phases/<phase>/plan.md for
-              each phase, each passing the plan rules, check ids unique across the whole feature (the feature
+              each phase, each passing the plan rules (the Drive contract and the 10 e2e cap among them), check ids unique across the whole feature (the feature
               plan's Acceptance list names each check by id), and, when <plan folder>/skeleton.patch exists, every
               phase holding a conformance check with a Skeleton field naming the skeleton files and symbols it implements. Given a plan folder, it records it in
               this branch's verification directory, so the bare command (a gate) checks the same folder later.
@@ -88,8 +102,10 @@ decision.tsv, units.json, fix-attempts.json, and the evidence files. An oracle c
 agent that read only the spec and the seed data, and <id>.observed.json, read from the running app.
 """
 import argparse
+import collections
 import contextlib
 import datetime
+import fnmatch
 import glob
 import hashlib
 import importlib.util
@@ -125,6 +141,12 @@ TIERS = ("e2e", "unit", "walk")
 TIER_HELP = ("write e2e (isolation, permissions, revocation, wire compatibility, perf, or a cross-surface flow: a script the "
              "verifier writes, run on the real app), unit (logic: a spec the executor writes, graded by `verify.py units`), or "
              "walk (UI look and interaction: walked once on the real app, saved as a screenshot or video)")
+MAX_E2E = 10
+DRIVEN_TIERS = ("e2e", "walk")
+CONTRACT = "Drive contract"
+SENSITIVE = "Sensitive paths"
+FIX_REVIEW = "Fix review"
+FIX_REVIEW_LINES = 200
 MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"}
 
 
@@ -158,6 +180,10 @@ SHELLS = {"sh", "bash", "zsh", "dash", "fish"}
 GLOB_MAGIC = re.compile(r"[*?\[]")
 KILL_WAIT_S = 3.0
 ADMIT_POLL_S = 1.0
+READY_LINE = "verify: ready"
+OVERLOAD_RATIO = 1.0
+OVERLOAD_S = 15.0
+WATCH_POLL_S = 3.0
 # ps rounds elapsed time to the second, so a start can read up to a second early.
 ELAPSED_SLACK_S = 1.0
 ELAPSED = re.compile(r"^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$")
@@ -342,7 +368,39 @@ def lint_plan(text):
         if check_id and check_id in seen:
             problems.append(f"{line}: id {check_id!r} is used more than once")
         seen.setdefault(check_id, line)
+    problems += contract_problems(found, tiers) + e2e_cap_problems(tiers)
+    problems += [f"{n}: {SENSITIVE} still holds a template placeholder" for n, line in found.get(SENSITIVE, []) if PLACEHOLDER.search(line)]
     return problems, [i for i, _ in ids if i], oracles, tiers
+
+
+def contract_problems(found, tiers):
+    driven = [i for i, t in tiers.items() if t in DRIVEN_TIERS]
+    lines = [(n, line) for n, line in found.get(CONTRACT, []) if line.strip()]
+    problems = [f"{n}: {CONTRACT} still holds a template placeholder" for n, line in lines if PLACEHOLDER.search(line)]
+    if driven and not lines:
+        problems.append(f"1: {', '.join(driven)} {'is an e2e or walk check' if len(driven) == 1 else 'are e2e or walk checks'}, "
+                        f"but the plan has no '## {CONTRACT}' listing what they drive. Settle every name before any code: DOM "
+                        "test ids and accessible names, routes and HTTP paths, CLI commands and flags, wire and event names, "
+                        "and the file paths the checks read")
+    return problems
+
+
+def e2e_cap_problems(tiers):
+    e2e = [i for i, t in tiers.items() if t == "e2e"]
+    if len(e2e) <= MAX_E2E:
+        return []
+    return [f"1: {len(e2e)} e2e checks ({', '.join(e2e)}), more than {MAX_E2E}. Keep the {MAX_E2E} most important, the "
+            "riskiest and costliest-to-break behavior, and move the rest to the unit tier or drop them, or split the phase"]
+
+
+def sensitive_paths(text):
+    found = sections(text.splitlines()).get(SENSITIVE, [])
+    words = [line[2:].split(None, 1) for _, line in found if line.startswith(("- ", "* "))]
+    return [w[0].strip("`,:") for w in words if w and not PLACEHOLDER.search(w[0])]
+
+
+def is_sensitive(path, patterns):
+    return any(fnmatch.fnmatchcase(path, p) if GLOB_MAGIC.search(p) else under(path, p.rstrip("/")) for p in patterns)
 
 
 def load_plan(directory):
@@ -665,6 +723,40 @@ def review_problems(directory, report, frozen_ts):
     return problems
 
 
+def fix_review_problems(directory, plan_text):
+    """The fixes made after the review: past FIX_REVIEW_LINES changed lines or on a sensitive path, they need a triaged fix review."""
+    path = directory / REVIEW
+    text = path.read_text() if path.is_file() else ""
+    m = re.search(r"^Head:\s*(\S+)", text, re.M)
+    if not m:
+        return [f"{REVIEW} names no 'Head:' line; the reviewer writes the commit it read, so `report` can measure the fixes "
+                "made after it"]
+    reviewed = m.group(1)
+    try:
+        numstat = git("diff", "--numstat", "--no-renames", reviewed, "HEAD")
+    except Failed:
+        return [f"{REVIEW} reviewed Head {reviewed}, which is not a commit in this repository"]
+    changed, count = [], 0
+    for row in numstat.splitlines():
+        added, deleted, name = row.split("\t", 2)
+        count += sum(int(n) for n in (added, deleted) if n.isdigit())
+        changed.append(name)
+    touched = [n for n in changed if is_sensitive(n, sensitive_paths(plan_text))]
+    reasons = ([f"change {count} lines, over {FIX_REVIEW_LINES}"] if count > FIX_REVIEW_LINES else []) + \
+              ([f"touch the plan's {SENSITIVE} ({', '.join(touched[:5])})"] if touched else [])
+    if not reasons:
+        return []
+    why = f"the fixes since the reviewed Head {reviewed[:12]} " + " and ".join(reasons)
+    body = section(text, FIX_REVIEW)
+    if not body:
+        return [f"{why}, so they need a fix review: the reviewer reviews that diff once into a '## {FIX_REVIEW}' section of "
+                f"{REVIEW}, and every finding is triaged"]
+    problems = [f"fix review finding {p}" for p in untriaged(body)]
+    if path.stat().st_mtime < int(git("log", "-1", "--format=%ct", "HEAD")):
+        problems.append(f"the fix review in {REVIEW} predates the last fix commit; review the fix diff that ships")
+    return problems
+
+
 def load_units(directory):
     try:
         return json.loads((directory / UNITS_RECORD).read_text())
@@ -743,6 +835,8 @@ def cmd_report(directory, args):
     if header.get("Author", "").strip() and header.get("Author", "").strip() == header.get("Verifier", "").strip():
         problems.append("the Verifier is the Author; a fresh agent must produce the verdicts")
     problems += review_problems(directory, report, lock["frozen_ts"])
+    if current_head:
+        problems += fix_review_problems(directory, text)
     units = load_units(directory)
     scripts = {script_id(p) for p in check_scripts(directory)}
     rows = {}
@@ -881,17 +975,19 @@ def fix_attempts(directory):
         return {}
 
 
-def run_check(directory, path, args, env, concurrent=set):
-    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log. concurrent() names the checks that ran beside it."""
+def run_check(directory, path, args, env, concurrent=set, run=None):
+    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log. concurrent() names the checks
+    that ran beside it. run, when given, learns the script's pid and readiness, and a run the watchdog evicted is REQUEUED."""
     check_id = script_id(path)
     command = script_command(path)
     before = file_sizes(directory)
     output = ""
+    hooks = {"on_start": lambda pid: run.update(pid=pid), "on_ready": run["ready"]} if run else {}
     if not command:
         verdict, detail = "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}"
     else:
         try:
-            r = run_in_group([*command, *args.rest], args.timeout, env=env)
+            r = run_in_group([*command, *args.rest], args.timeout, env=env, **hooks)
             output = (r.stdout + r.stderr).strip()
             verdict = "PASS" if r.returncode == 0 else "FAIL"
             detail = "" if verdict == "PASS" else f"exit {r.returncode}"
@@ -899,6 +995,8 @@ def run_check(directory, path, args, env, concurrent=set):
                 detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
         except subprocess.TimeoutExpired:
             verdict, detail = "FAIL", f"timed out after {args.timeout}s"
+    if run and run["evicted"]:
+        return "REQUEUED", ""
     beside = sorted(concurrent())
     lost = lost_files(before, file_sizes(directory), {check_id, *beside})
     if lost:
@@ -912,43 +1010,91 @@ def run_check(directory, path, args, env, concurrent=set):
 
 
 def run_checks(directory, scripts, args, env):
-    """{check id: (verdict, detail, seconds)}: up to --jobs scripts at once while the machine has capacity, then perf checks alone."""
+    """({check id: (verdict, detail, seconds)}, [requeue lines]). Under --jobs a script starts only while every running one
+    has printed READY_LINE and the machine has capacity; the watchdog evicts the newest while the load stays overloaded.
+    Perf checks run alone at the end."""
     perf = perf_ids(directory)
     batches = (([p for p in scripts if script_id(p) not in perf], args.jobs), ([p for p in scripts if script_id(p) in perf], 1))
-    results, beside, running = {}, {}, set()
+    results, beside, running, requeued = {}, {}, {}, []
+    queue = collections.deque()
     turn = threading.Condition()
-    if args.jobs > 1:
+    jobs = args.jobs
+    if jobs > 1:
         load_ratio()
 
     def beside_of(check_id):
         with turn:
             return set(beside[check_id])
 
-    def work(path, check_id):
+    def ready(run):
+        with turn:
+            run["is_ready"] = True
+            turn.notify_all()
+
+    def work(check_id, run):
         started = time.time()
         try:
-            verdict, detail = run_check(directory, path, args, env, lambda: beside_of(check_id))
+            verdict, detail = run_check(directory, run["path"], args, env, lambda: beside_of(check_id), run)
         except Exception as e:
             verdict, detail = "FAIL", f"rerun could not run it: {type(e).__name__}: {e}"
         with turn:
-            results[check_id] = (verdict, detail, time.time() - started)
-            running.discard(check_id)
+            running.pop(check_id, None)
+            if verdict == "REQUEUED":
+                queue.appendleft(run["path"])
+            else:
+                results[check_id] = (verdict, detail, time.time() - started)
             turn.notify_all()
 
+    def admissible(width):
+        if not running:
+            return True
+        return len(running) < min(width, jobs) and all(r["is_ready"] for r in running.values()) and has_capacity()
+
+    over_since, sampled = None, 0.0
     with turn:
         for batch, width in batches:
-            for path in batch:
-                while running and (len(running) >= width or not has_capacity()):
-                    turn.wait(ADMIT_POLL_S)
-                check_id = script_id(path)
-                beside[check_id] = set(running)
-                for other in running:
-                    beside[other].add(check_id)
-                running.add(check_id)
-                threading.Thread(target=work, args=(path, check_id), daemon=True).start()
-            while running:
-                turn.wait()
-    return results
+            queue.extend(batch)
+            while queue or running:
+                now = time.monotonic()
+                if args.jobs > 1 and now - sampled >= WATCH_POLL_S:
+                    sampled = now
+                    load, cores = os.getloadavg()[0], os.cpu_count() or 1
+                    over_since = (over_since or now) if load > OVERLOAD_RATIO * cores else None
+                    if over_since is not None and now - over_since >= OVERLOAD_S and len(running) > 1:
+                        check_id, run = max(running.items(), key=lambda item: item[1]["started"])
+                        if run["pid"] and not run["evicted"]:
+                            run["evicted"] = True
+                            others = {r["pid"] for r in running.values() if r is not run}
+                            threading.Thread(target=evict, args=(directory, run, others), daemon=True).start()
+                            jobs = len(running) - 1
+                            over_since = now
+                            requeued.append(f"REQUEUED {check_id}  load {load:.1f} on {cores} cores for {OVERLOAD_S:.0f}s; "
+                                            f"stopped and queued again, --jobs now {jobs}")
+                if queue and admissible(width):
+                    path = queue.popleft()
+                    check_id = script_id(path)
+                    beside[check_id] = set(running)
+                    for other in running:
+                        beside[other].add(check_id)
+                    run = {"path": path, "started": time.time(), "pid": None, "is_ready": False, "evicted": False}
+                    run["ready"] = lambda run=run: ready(run)
+                    running[check_id] = run
+                    threading.Thread(target=work, args=(check_id, run), daemon=True).start()
+                    continue
+                turn.wait(min(ADMIT_POLL_S, WATCH_POLL_S))
+    return results, requeued
+
+
+def evict(directory, run, others):
+    """Stop an evicted script's process group, then the detached processes it started under this run's places."""
+    with contextlib.suppress(CannotScan):
+        stop_processes([row for row in process_table() if row["pgid"] == run["pid"]])
+        # Admission waits for every running script's ready line, so a detached process started after this one began is its own.
+        stray = [row for row in find_leftovers(default_roots(directory)) if row["ppid"] == 1 and row["pgid"] not in others
+                 and row["started"] is not None and row["started"] >= run["started"] - ELAPSED_SLACK_S]
+        if stray:
+            stop_processes(stray)
+    kill_group(run["pid"])
 
 
 def cmd_rerun(directory, args):
@@ -979,8 +1125,8 @@ def cmd_rerun(directory, args):
     if not args.only:
         stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
-    results = run_checks(directory, scripts, args, env)
-    lines, failed, known = [], [], []
+    results, requeued = run_checks(directory, scripts, args, env)
+    lines, failed, known = list(requeued), [], []
     for path in scripts:
         check_id = script_id(path)
         verdict, detail, seconds = results[check_id]
@@ -993,6 +1139,7 @@ def cmd_rerun(directory, args):
         lines.append(f"{verdict:<5} {check_id}  ({seconds:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
     summary = f"rerun: {len(scripts)} checks, {len(scripts) - len(failed)} PASS, {len(failed)} FAIL"
     summary += f" ({len(known)} left FAIL after the fix budget)" if known else ""
+    summary += f", {len(requeued)} requeued under load" if requeued else ""
     lines.append(summary + (" (--only: no stamp; the full rerun decides the gate)" if args.only else ""))
     if args.only:
         for check_id in (i for i in failed if i in failing):
@@ -1100,17 +1247,40 @@ def kill_group(pgid):
         os.killpg(pgid, signal.SIGKILL)
 
 
-def run_in_group(command, timeout, **kwargs):
-    """subprocess.run in its own session, so a timeout kills the command and everything it started."""
+def run_in_group(command, timeout, on_start=None, on_ready=None, **kwargs):
+    """subprocess.run in its own session, so a timeout kills the command and everything it started. on_start gets the
+    pid (the process group), and on_ready runs when stdout prints READY_LINE."""
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, **kwargs) as proc:
+        if on_start:
+            on_start(proc.pid)
+        out, err = [], []
+
+        def drain(stream, sink, ready):
+            for line in stream:
+                if ready and line.rstrip("\n") == READY_LINE:
+                    ready()
+                else:
+                    sink.append(line)
+
+        readers = [threading.Thread(target=drain, args=(proc.stdout, out, on_ready), daemon=True),
+                   threading.Thread(target=drain, args=(proc.stderr, err, None), daemon=True)]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
         try:
-            out, err = proc.communicate(timeout=timeout)
+            proc.wait(timeout=timeout)
+            for reader in readers:
+                reader.join(max(0.0, deadline - time.monotonic()))
+            if any(reader.is_alive() for reader in readers):
+                raise subprocess.TimeoutExpired(command, timeout)
         except subprocess.TimeoutExpired:
             kill_group(proc.pid)
             with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=KILL_WAIT_S)
+                proc.wait(timeout=KILL_WAIT_S)
+            for reader in readers:
+                reader.join(KILL_WAIT_S)
             raise
-    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, "".join(out), "".join(err))
 
 
 def started_at(elapsed, now):

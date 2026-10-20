@@ -22,9 +22,14 @@ spec = importlib.util.spec_from_file_location("verify", VERIFY)
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
 
+CONTRACT = """
+    ## Drive contract
+
+    - `export --json`: the CLI command B1 runs, printing the records to stdout
+    """
 CHECKS = """\
     # Verification plan: json export
-
+    """ + CONTRACT + """
     ## Checks
 
     ### B1. Export writes JSON
@@ -391,7 +396,7 @@ class Verify(unittest.TestCase):
         self.assertNotIn("B1-own", out)
         self.assertNotIn("evidence/B1", out)
 
-    MEET = ('d="$(dirname "$0")"; touch "$d/{me}.started"\n'
+    MEET = ('d="$(dirname "$0")"; touch "$d/{me}.started"; echo "verify: ready"\n'
             'for i in $(seq 30); do [ -e "$d/{other}.started" ] && exit 0; sleep 0.1; done\necho "{other} never ran beside it"; exit 1\n')
 
     def meeting_checks(self):
@@ -424,11 +429,51 @@ class Verify(unittest.TestCase):
         out = self.run_verify("rerun", "--jobs", "3", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
         self.assertRegex(out, r"^PASS\s+A0 .*\nPASS\s+B1 .*\nPASS\s+B2 ")
 
+    def test_rerun_jobs_admits_the_next_script_only_once_the_running_ones_print_ready(self):
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; touch "$d/B1.readied"; echo "verify: ready"; sleep 1\n')
+        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.readied" ] || { echo "started before B1 was ready"; exit 1; }\n'
+                                         '[ -e "$d/B1.rerun.log" ] && { echo "waited for B1 to end"; exit 1; }; exit 0\n')
+        out = self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
+        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "rerun: PASS\n")
+        (self.dir / "B1.rerun.log").unlink()
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; touch "$d/B1.readied"\n')
+        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.rerun.log" ] || { echo "started beside a script that never printed ready"; exit 1; }\n')
+        self.assertRegex(self.run_verify("rerun", "--jobs", "2", "--force", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"PASS\s+B1 .*\nPASS\s+B2 ")
+
+    def test_rerun_jobs_requeues_the_newest_script_while_the_load_stays_over_the_cores_and_never_retries_a_fail(self):
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; echo "verify: ready"; sleep 1.5; touch "$d/B1.done"\n')
+        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; n=$(cat "$d/B2.count" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/B2.count"\n'
+                                         'echo "verify: ready"; [ "$n" = 0 ] && { sleep 5; echo "never stopped"; exit 1; }\n'
+                                         '[ -e "$d/B1.done" ] || { echo "ran beside B1 after the requeue"; exit 1; }; exit 0\n')
+        self.check_script("B3.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B3.runs"; exit 1\n')
+
+        def load():
+            path = self.dir / "B2.count"
+            overloaded = path.exists() and path.read_text().strip() == "1"
+            return (100.0 if overloaded else 0.0,) * 3
+
+        args = mock.Mock(only=None, rest=[], jobs=3, timeout=30, force=False)
+        with mock.patch.multiple(verify, WATCH_POLL_S=0.05, OVERLOAD_S=0.3, ADMIT_POLL_S=0.05), \
+                mock.patch.object(verify, "default_roots", lambda d: [str(d)]), \
+                mock.patch.object(verify.os, "getloadavg", side_effect=load), mock.patch.object(verify.os, "cpu_count", return_value=4), \
+                mock.patch.dict(os.environ):
+            os.environ.pop("VERIFY_MAX_LOAD_RATIO", None)
+            with self.assertRaises(verify.Failed) as raised:
+                verify.cmd_rerun(self.dir, args)
+        out = str(raised.exception)
+        self.assertRegex(out, r"REQUEUED B2  load 100\.0 on 4 cores for 0s; stopped and queued again, --jobs now 1\n")
+        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 .*\nFAIL\s+B3 ")
+        self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL, 1 requeued under load", out)
+        self.assertEqual((self.dir / "B2.count").read_text(), "2\n")
+        self.assertEqual((self.dir / "B3.runs").read_text(), "x\n")
+        self.assertFalse((self.dir / "fix-attempts.json").exists())
+
     def test_rerun_jobs_never_blames_a_check_for_the_evidence_a_concurrent_check_is_rewriting(self):
         for name in ("evidence/B1/shot.png", "evidence/W1/walk.png"):
             (self.dir / name).parent.mkdir(parents=True, exist_ok=True)
             (self.dir / name).write_text("png")
-        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; rm "$d/evidence/B1/shot.png"; sleep 1.5; echo png > "$d/evidence/B1/shot.png"\n')
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; echo "verify: ready"; sleep 0.5; rm "$d/evidence/B1/shot.png"; sleep 1.5; echo png > "$d/evidence/B1/shot.png"\n')
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; sleep 1.2; rm "$d/evidence/W1/walk.png"\n')
         out = self.run_verify("rerun", "--jobs", "2", ok=False, env={"VERIFY_MAX_LOAD_RATIO": "1000"})
         self.assertRegex(out, r"FAIL\s+B1 .*files that are not its own were deleted or emptied while it ran beside B2: evidence/W1/walk.png\n")
@@ -473,8 +518,54 @@ class Verify(unittest.TestCase):
                    .replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |", "| B1 | FAIL | B1.rerun.log | defect: 2 records |"))
         self.run_verify("report")
 
-    def test_a_walk_pass_needs_a_screenshot_or_video_in_its_evidence_folder(self):
+    WALK_CONTRACT = """
+    ## Drive contract
+
+    - button "Export": the button W1 looks at, beside button "Share"
+    """
+
+    def test_an_e2e_or_walk_check_needs_a_drive_contract_settled_before_code(self):
+        bare = CHECKS.replace(CONTRACT, "\n")
+        self.write("plan.md", plan(bare, PERF_NA))
+        out = self.run_verify("plan", ok=False)
+        self.assertIn("B1 is an e2e or walk check, but the plan has no '## Drive contract' listing what they drive", out)
+        self.assertIn("DOM test ids and accessible names, routes and HTTP paths, CLI commands and flags", out)
         self.write("plan.md", plan("# Verification plan: export button\n\n## Checks\n", WALK, PERF_NA))
+        self.assertIn("W1 is an e2e or walk check", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(bare, PERF_MAIN))
+        self.assertIn("B1, P1 are e2e or walk checks", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(bare.replace("## Checks", "## Drive contract\n\n    ## Checks"), PERF_NA))
+        self.assertIn("no '## Drive contract'", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(bare.replace("## Checks", "## Drive contract\n\n    - <test id or route>: <what it is>\n\n    ## Checks"), PERF_NA))
+        self.assertIn("Drive contract still holds a template placeholder", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan("# Verification plan: mul\n\n## Checks\n", UNIT, PERF_NA))
+        self.run_verify("plan")
+        self.write("plan.md", plan(CHECKS, WALK, PERF_MAIN))
+        self.run_verify("plan")
+
+    def e2e_checks(self, count):
+        body = CHECKS.split("## Checks\n")[1]
+        return [body.replace("B1", f"E{n}") for n in range(1, count + 1)]
+
+    def test_a_plan_holds_at_most_ten_e2e_checks(self):
+        head = CHECKS.split("## Checks\n")[0] + "## Checks\n"
+        self.write("plan.md", plan(head, *self.e2e_checks(10), UNIT, WALK, PERF_NA))
+        self.assertIn("tiers: e2e 10, unit 1, walk 1", self.run_verify("plan"))
+        self.write("plan.md", plan(head, *self.e2e_checks(11), PERF_NA))
+        out = self.run_verify("plan", ok=False)
+        self.assertIn("11 e2e checks (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11), more than 10. Keep the 10 most important, "
+                      "the riskiest and costliest-to-break behavior, and move the rest to the unit tier or drop them, or split the phase", out)
+        self.write("plan.md", plan(head, *self.e2e_checks(10), PERF_MAIN))
+        self.assertIn("11 e2e checks", self.run_verify("plan", ok=False))
+
+    def test_sensitive_paths_cannot_keep_the_template_placeholder(self):
+        self.write("plan.md", plan(CHECKS, PERF_NA, "\n## Sensitive paths\n\n- <path or glob>: <why>\n"))
+        self.assertIn("Sensitive paths still holds a template placeholder", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, PERF_NA, "\n## Sensitive paths\n\n- `src/auth/`: sessions and tokens\n"))
+        self.run_verify("plan")
+
+    def test_a_walk_pass_needs_a_screenshot_or_video_in_its_evidence_folder(self):
+        self.write("plan.md", plan("# Verification plan: export button\n", self.WALK_CONTRACT, "\n## Checks\n", WALK, PERF_NA))
         self.run_verify("freeze")
         report = plan(REPORT).replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |\n", "").replace(
             "| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |", "| W1 | PASS | evidence/W1/ | Export right of Share |")
@@ -627,6 +718,7 @@ class Driver(unittest.TestCase):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
         (d / "report.md").write_text(report)
+        (d / "review.md").write_text(f"# Code review\n\nHead: {head}\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\nnone found\n")
         self.assertEqual(run("report").returncode, 0, run("report").stdout)
         (self.repo / "app.py").write_text("print('later fix')\n")
         self.commit("Fix after verification")
@@ -648,6 +740,7 @@ class Driver(unittest.TestCase):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
         (d / "report.md").write_text(report)
+        (d / "review.md").write_text(f"# Code review\n\nHead: {head}\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\nnone found\n")
         self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "Regroup commits")
         out = run("report")
         self.assertEqual(out.returncode, 0, out.stdout)
@@ -657,6 +750,71 @@ class Driver(unittest.TestCase):
         out = run("report")
         self.assertEqual(out.returncode, 1)
         self.assertIn("but HEAD is now", out.stdout)
+
+    def reviewed_report(self, sensitive=""):
+        d = pathlib.Path(self.tmp.name) / "verification"
+        d.mkdir()
+        (d / "plan.md").write_text(plan(CHECKS, PERF_NA) + sensitive)
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        def run(*a):
+            return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
+        run("freeze")
+        (d / "B1.check.sh").write_text("exit 0\n")
+        run("rerun")
+        (d / "B1-terminal.txt").write_text("[{...}]\n")
+        reviewed = self.head()
+        (d / "review.md").write_text(f"# Code review\n\nHead: {reviewed}\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\nnone found\n")
+        def report():
+            (d / "report.md").write_text(plan(REPORT).replace("Head: abc123", f"Head: {self.head()}")
+                                         .replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", ""))
+            return run("report")
+        return d, report
+
+    def head(self):
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
+
+    def test_a_fix_diff_over_200_lines_after_the_review_needs_a_triaged_fix_review(self):
+        d, report = self.reviewed_report()
+        (self.repo / "app.py").write_text("".join(f"print({n})\n" for n in range(199)))
+        self.commit("Fix the empty search")
+        out = report()
+        self.assertEqual(out.returncode, 0, out.stdout)
+        (self.repo / "app.py").write_text("".join(f"print({n})\n" for n in range(200)))
+        self.commit("Fix paging")
+        out = report()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("the fixes since the reviewed Head", out.stdout)
+        self.assertIn("change 201 lines, over 200, so they need a fix review: the reviewer reviews that diff once into a "
+                      "'## Fix review' section of review.md", out.stdout)
+        review = (d / "review.md").read_text()
+        (d / "review.md").write_text(review + "\n## Fix review\n\n- app.py:3 paging skips the last row.\n")
+        self.assertIn("fix review finding has no 'Triage:", report().stdout)
+        (d / "review.md").write_text(review + "\n## Fix review\n\n- app.py:3 paging skips the last row. Triage: dismissed, row 200 is the sentinel\n")
+        out = report()
+        self.assertEqual(out.returncode, 0, out.stdout)
+        os.utime(d / "review.md", (1, 1))
+        self.assertIn("the fix review in review.md predates the last fix commit", report().stdout)
+
+    def test_a_fix_on_a_sensitive_path_needs_a_fix_review_at_any_size(self):
+        d, report = self.reviewed_report("\n## Sensitive paths\n\n- `auth/`: sessions and tokens\n- `*.sql`: migrations\n")
+        (self.repo / "search.py").write_text("print('fixed')\n")
+        self.commit("Fix search")
+        self.assertEqual(report().returncode, 0)
+        (self.repo / "auth").mkdir()
+        (self.repo / "auth" / "token.py").write_text("print('revoke')\n")
+        (self.repo / "db").mkdir()
+        (self.repo / "db" / "001.sql").write_text("select 1;\n")
+        self.commit("Revoke the token on sign-out")
+        out = report()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("touch the plan's Sensitive paths (auth/token.py, db/001.sql), so they need a fix review", out.stdout)
+
+    def test_the_review_must_name_the_head_it_read(self):
+        d, report = self.reviewed_report()
+        (d / "review.md").write_text("# Code review\n\n## Review\n\nnone found\n")
+        self.assertIn("review.md names no 'Head:' line", report().stdout)
+        (d / "review.md").write_text("# Code review\n\nHead: 0123456789ab\n\n## Review\n\nnone found\n")
+        self.assertIn("review.md reviewed Head 0123456789ab, which is not a commit in this repository", report().stdout)
 
     def test_where_names_the_repo_and_branch(self):
         env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
@@ -832,6 +990,14 @@ class Phases(unittest.TestCase):
         self.write_phase("01-json", plan(CHECKS))
         self.assertIn("missing '## Perf' section", self.phases(str(self.root), ok=False))
 
+    def test_refuses_a_phase_without_a_drive_contract_or_over_the_e2e_cap(self):
+        self.write_phase("01-json", plan(CHECKS.replace(CONTRACT, "\n"), PERF_NA))
+        self.assertIn("01-json/plan.md:1: B1 is an e2e or walk check, but the plan has no '## Drive contract'",
+                      self.phases(str(self.root), ok=False))
+        head, body = CHECKS.split("## Checks\n")
+        self.write_phase("01-json", plan(head, "## Checks\n", *(body.replace("B1", f"E{n}") for n in range(1, 12)), PERF_NA))
+        self.assertIn("01-json/plan.md:1: 11 e2e checks", self.phases(ok=False))
+
     def test_refuses_a_check_id_reused_by_another_phase(self):
         self.write_phase("01-json", plan(CHECKS, PERF_NA))
         self.write_phase("02-csv", plan(CHECKS, PERF_NA))
@@ -919,6 +1085,15 @@ class Lock(RepoFixture):
         self.write_plan(plan(CHECKS.replace("3 records", "4 records"), PERF_NA))
         self.assertIn("plan changed after it was frozen", self.verify("lock", ok=False))
         self.verify("freeze", "--revision", "export holds 4 records now; agreed by the user")
+        self.verify("lock")
+
+    def test_the_drive_contract_is_locked_with_the_checks(self):
+        self.write_plan()
+        self.verify("lock")
+        self.feature()
+        self.write_plan(plan(CHECKS.replace("`export --json`", "`export --format json`"), PERF_NA))
+        self.assertIn("plan changed after it was frozen", self.verify("lock", ok=False))
+        self.verify("freeze", "--revision", "the flag is --format json to match import; agreed by the user")
         self.verify("lock")
 
     def test_refuses_once_product_code_has_changed(self):
@@ -1021,6 +1196,7 @@ class Units(RepoFixture):
 class UnitTier(RepoFixture):
     def report(self, ok=True):
         head = self.rev()
+        (self.where / "review.md").write_text(f"# Code review\n\nHead: {head}\n\n## Review\n\nnone found\n")
         (self.where / "report.md").write_text(textwrap.dedent(f"""\
             # Verification report: mul
 
