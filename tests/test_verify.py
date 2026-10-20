@@ -1056,8 +1056,8 @@ class RerunStamp(unittest.TestCase):
         self.rerun()
         stamp = (self.dir / "rerun.stamp.json").read_text()
         out = self.rerun("--only", "B2", "--only", "B2")
-        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the ledger records it, and `verify.py affected` lists what is "
-                      "still stale)", out)
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the ledger records these runs, and `verify.py affected` lists "
+                      "what is still stale)", out)
         self.assertNotIn("B1", out)
         self.assertEqual(self.runs(), 1)
         self.assertEqual(len((self.dir / "runs2.txt").read_text().split()), 2)

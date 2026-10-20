@@ -37,9 +37,10 @@ usage: verify.py <command> [--dir DIR]
   compare     every oracle check's observed value matches its expected value
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match
               the comparison; the report's Head is HEAD or a commit with HEAD's tree (a regrouped history). A PASS
-              is backed by its tier's evidence: e2e by its <id>.check.<ext> script and an <id>.rerun.log from a passing
-              rerun after the freeze, and not listed by `affected`; unit by the last `units` result, after the freeze, passing, on HEAD's tree, with
-              a spec that names the check id; walk by a screenshot or video in evidence/<id>/ written after the freeze.
+              is backed by its tier's evidence: e2e by its <id>.check.<ext> script, an <id>.rerun.log from a passing
+              rerun after the freeze, and no listing by `affected`; unit by the last `units` result, after the freeze,
+              passing, on HEAD's tree, with a spec that names the check id; walk by a screenshot or video in
+              evidence/<id>/ written after the freeze.
               A '## Review' section in report.md, or review.md, written after the freeze, holds the code review's
               findings, each triaged, or 'none found'. In a git repository, review.md's 'Head:' line names the commit the
               reviewer read; when the diff from it to HEAD changes more than 200 lines, review.md needs a '## Fix review'
@@ -75,7 +76,7 @@ usage: verify.py <command> [--dir DIR]
               "rerun: PASS" or "rerun: FAIL (<why>)". After a run where every script passes, rerun stamps
               rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff, and a sha256 per check script
               and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS and an unchanged stamp prints one
-              line and exits 0 without running; --force always runs. Any run deletes the stamp first, so a failed or
+              line and exits 0 without running; --force skips that check. Any run deletes the stamp first, so a failed or
               interrupted run leaves none. The first full rerun is the prove's: before it runs, it writes scripts.lock.json
               with the time, HEAD, and a sha256 per check script and helper. A later full rerun is refused, because later
               changes are graded with `rerun --only $(verify.py affected)`; --full-reason "<why; agreed by whom>" allows
@@ -85,10 +86,9 @@ usage: verify.py <command> [--dir DIR]
               `rerun --only $(verify.py affected)`; it neither reads nor writes the stamp, and given no ids it runs
               nothing. Every rerun, --only included, records per check it ran the HEAD, a hash of the tracked working-tree
               diff (null when clean), the verdict, and the time in rerun.ledger.json, keeping each check's latest run, for
-              `affected` and `report`. Once report.md marks a check FAIL,
-              each --only run in which it still fails is one failed fix attempt, counted in fix-attempts.json; after 2,
-              --only refuses it, and the full rerun reports it as left FAIL without failing, because it goes to the
-              user or the backlog. A check script finds the repository from its working directory, never a hard-coded
+              `affected` and `report`. Once report.md marks a check FAIL, each --only run in which it still fails is one
+              failed fix attempt, counted in fix-attempts.json; after 2, --only refuses it, and a full rerun reports it
+              as left FAIL without failing, because it goes to the user or the backlog. A check script finds the repository from its working directory, never a hard-coded
               worktree path.
   affected    print, space separated on one line, the e2e checks with a saved script that need a rerun: no run of it in
               rerun.ledger.json, a failing latest run, or a path matching its Touches changed between the commit its
@@ -118,8 +118,8 @@ usage: verify.py <command> [--dir DIR]
               spared, started by the lead, and neither counted nor killed. Linux exposes another process's environment
               and macOS does not, so the marker also counts anywhere in a command line: start a watcher as
               sh -c 'VERIFY_LEAD=1 ...'. Set it on the watcher's own command, never in the session's environment,
-              or every process the session starts is spared. Exits 1 while any remain and 2 when the scan itself cannot run. --kill sends
-              SIGTERM to each process group, then SIGKILL to survivors, and rescans. When nothing remains but the
+              or every process the session starts is spared. Exits 1 while any remain and 2 when the scan itself cannot
+              run. --kill sends SIGTERM to each process group, then SIGKILL to survivors, and rescans. When nothing remains but the
               1-minute load exceeds the core count, it also lists the busiest processes and flags those whose parent is init as
               likely leftovers (the exit code is unaffected).
   capacity    the machine has room for another heavy run: exits 0 when the 1-minute load is below ratio x cores
@@ -202,7 +202,7 @@ UNITS_LOG = "units.log"
 REVIEW = "review.md"
 HELPER_SUFFIXES = {".mjs", ".cjs", ".js", ".ts", ".py", ".sh"}
 EVIDENCE_DIR = "evidence"
-LISTED_LOSSES = 5
+LISTED_NAMES = 5
 LOAD_RATIO = 0.7
 NATIVE_BUILDS = {
     "xcodebuild": re.compile(r"(?:^|/)xcodebuild(?:\s|$)"),
@@ -585,7 +585,7 @@ def cmd_adopt(directory, args):
 
 
 def listed(names):
-    return ", ".join(names[:LISTED_LOSSES]) + (f" and {len(names) - LISTED_LOSSES} more" if len(names) > LISTED_LOSSES else "")
+    return ", ".join(names[:LISTED_NAMES]) + (f" and {len(names) - LISTED_NAMES} more" if len(names) > LISTED_NAMES else "")
 
 
 def product_changes(base, skip):
@@ -1217,8 +1217,8 @@ def owned_by(path, check_id):
 
 def lost_files(before, after, owners):
     lost = sorted(str(p) for p, size in before.items() if size and not after.get(p) and not any(owned_by(p, o) for o in owners))
-    if len(lost) > LISTED_LOSSES:
-        lost = [*lost[:LISTED_LOSSES], f"and {len(lost) - LISTED_LOSSES} more"]
+    if len(lost) > LISTED_NAMES:
+        lost = [*lost[:LISTED_NAMES], f"and {len(lost) - LISTED_NAMES} more"]
     return lost
 
 
@@ -1420,7 +1420,7 @@ def cmd_rerun(directory, args):
     summary = f"rerun: {len(scripts)} checks, {len(scripts) - len(failed)} PASS, {len(failed)} FAIL"
     summary += f" ({len(known)} left FAIL after the fix budget)" if known else ""
     summary += f", {len(requeued)} requeued under load" if requeued else ""
-    lines.append(summary + (" (--only: no stamp; the ledger records it, and `verify.py affected` lists what is still stale)" if args.only else ""))
+    lines.append(summary + (" (--only: no stamp; the ledger records these runs, and `verify.py affected` lists what is still stale)" if args.only else ""))
     if args.only:
         for check_id in (i for i in failed if i in failing):
             attempts[check_id] = attempts.get(check_id, 0) + 1
