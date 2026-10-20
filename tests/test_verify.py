@@ -40,6 +40,7 @@ CHECKS = """\
     - Pass: stdout parses as JSON and holds 3 records
     - Oracle: n/a: the output format is checked, no value is computed
     - Tier: e2e
+    - Touches: `src/export/**`, `bin/export`
     """
 PERF_NA = "\n## Perf\n\nn/a: only the help text changes, nothing a user waits on\n"
 PERF_MAIN = """
@@ -52,6 +53,7 @@ PERF_MAIN = """
     - Probe: hyperfine 'export --json' on main and head, interleaved
     - Baseline: main
     - Rule: fails when p50 is more than 5% slower than main or any query is added
+    - Touches: `src/export/**`
     """
 REPORT = """\
     # Verification report: json export
@@ -283,13 +285,14 @@ class Verify(unittest.TestCase):
     - Seed: tiers dataset
     - Shape: {"<tier>": <revenue in cents>}
     - Tier: e2e
+    - Touches: `src/revenue/**`
     """
 
     def oracle_plan(self, oracle=ORACLE):
         self.write("plan.md", plan(CHECKS, oracle, PERF_NA))
 
     def test_every_check_states_its_oracle(self):
-        bare = self.ORACLE.split("    - Oracle:")[0] + "    - Tier: e2e\n"
+        bare = self.ORACLE.split("    - Oracle:")[0] + "    - Tier: e2e\n    - Touches: `src/revenue/**`\n"
         self.oracle_plan(bare)
         self.assertIn("missing '- Oracle:'", self.run_verify("plan", ok=False))
         self.oracle_plan(bare + "    - Oracle: n/a: x\n")
@@ -557,6 +560,23 @@ class Verify(unittest.TestCase):
                       "the riskiest and costliest-to-break behavior, and move the rest to the unit tier or drop them, or split the phase", out)
         self.write("plan.md", plan(head, *self.e2e_checks(10), PERF_MAIN))
         self.assertIn("11 e2e checks", self.run_verify("plan", ok=False))
+
+    def test_every_e2e_check_names_the_path_globs_it_touches(self):
+        self.write("plan.md", plan(CHECKS.replace("    - Touches: `src/export/**`, `bin/export`\n", ""), PERF_NA))
+        self.assertIn(":9: B1 is an e2e check but has no '- Touches:'. List the repository paths its scenario runs through as "
+                      "globs in backticks, comma separated, like `packages/server/src/**`, so `verify.py affected` reruns it when "
+                      "a later change touches one", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS.replace("`src/export/**`, `bin/export`", ""), PERF_NA))
+        self.assertIn(":17: B1's Touches is empty; list the path globs its scenario runs through", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS.replace("`src/export/**`, `bin/export`", "`src/export/**`, bin/export"), PERF_NA))
+        self.assertIn(":17: B1's Touches must list path globs in backticks, comma separated, like `packages/agent-host/**`, "
+                      "`packages/server/src/**`", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS.replace("`src/export/**`, `bin/export`", "`<path glob>`"), PERF_NA))
+        self.assertIn(":17: Touches still holds a template placeholder", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, PERF_MAIN.replace("    - Touches: `src/export/**`\n", "")))
+        self.assertIn("P1 is an e2e check but has no '- Touches:'", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, UNIT, WALK, PERF_MAIN))
+        self.run_verify("plan")
 
     def test_sensitive_paths_cannot_keep_the_template_placeholder(self):
         self.write("plan.md", plan(CHECKS, PERF_NA, "\n## Sensitive paths\n\n- <path or glob>: <why>\n"))
@@ -947,6 +967,7 @@ class Phases(unittest.TestCase):
     - Pass: the diff against skeleton.patch is empty, or each difference is in the design addendum with the user's agreement
     - Oracle: n/a: compares signatures, no value is computed
     - Tier: e2e
+    - Touches: `src/export.ts`
     - Skeleton: src/export.ts: exportJson, ExportOptions
     """
 

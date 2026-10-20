@@ -11,7 +11,9 @@ usage: verify.py <command> [--dir DIR]
 
   where       print this branch's verification directory
   plan        the plan is complete: checks with every field, a Tier of e2e, unit, or walk on each (a perf check is
-              always e2e), and a perf decision. A plan with any e2e or walk check needs a non-empty '## Drive contract'
+              always e2e), and a perf decision. Every e2e check has a '- Touches:' field listing the repository paths its
+              scenario runs through as globs in backticks, comma separated (* matches within one path segment, ** across
+              segments), which `affected` reads. A plan with any e2e or walk check needs a non-empty '## Drive contract'
               section: every name those checks drive (test ids, accessible names, routes, HTTP paths, CLI commands and
               flags, wire and event names, file paths), settled before code. At most 10 e2e checks per plan, with no
               override: keep the riskiest, move the rest to unit or drop them, or split the phase. An optional
@@ -132,6 +134,8 @@ DECISION_VERDICTS = ("kept", "reverted")
 DRIVER_DIRS = (".agents/skills/verify-", ".claude/skills/verify-")
 FIELD = re.compile(r"^- ([A-Z][a-z]+):\s*(.*)$")
 HEADING = re.compile(r"^### (\S+)\. \S")
+TOUCHES_LIST = re.compile(r"`[^`]+`(?:\s*,\s*`[^`]+`)*")
+TOUCHES_GLOB = re.compile(r"`([^`]+)`")
 PLACEHOLDER = re.compile(r"<[^<>\n]* [^<>\n]*>")
 NA = re.compile(r"^n/a:\s*(.*)$")
 HEADER_FIELD = re.compile(r"^(Head|Main|Author|Verifier):\s*(.*)$", re.M)
@@ -328,6 +332,25 @@ def check_tier(entry, problems, tiers, oracles):
         tiers[check_id] = value
 
 
+def check_touches(entry, tier, problems):
+    field = entry["fields"].get("Touches")
+    if field and PLACEHOLDER.search(field[1]):
+        problems.append(f"{field[0]}: Touches still holds a template placeholder")
+        return
+    if tier != "e2e":
+        return
+    check_id = entry_id(entry) or "this check"
+    if field is None:
+        problems.append(f"{entry['line']}: {check_id} is an e2e check but has no '- Touches:'. List the repository paths its "
+                        "scenario runs through as globs in backticks, comma separated, like `packages/server/src/**`, so "
+                        "`verify.py affected` reruns it when a later change touches one")
+    elif not field[1]:
+        problems.append(f"{field[0]}: {check_id}'s Touches is empty; list the path globs its scenario runs through")
+    elif not TOUCHES_LIST.fullmatch(field[1]):
+        problems.append(f"{field[0]}: {check_id}'s Touches must list path globs in backticks, comma separated, like "
+                        "`packages/agent-host/**`, `packages/server/src/**`")
+
+
 def lint_plan(text):
     """Return (problems, check ids, {oracle check id: tolerance}, {check id: tier}) for a plan's text."""
     problems, ids, oracles, tiers = [], [], {}, {}
@@ -342,6 +365,7 @@ def lint_plan(text):
             check_entry(entry, CHECK_FIELDS, problems)
             check_oracle(entry, problems, oracles)
             check_tier(entry, problems, tiers, oracles)
+            check_touches(entry, tiers.get(entry_id(entry)), problems)
             ids.append((entry_id(entry), entry["line"]))
     if "Perf" not in found:
         problems.append("1: missing '## Perf' section: add perf checks, or 'n/a: <reason>'")
@@ -362,6 +386,7 @@ def lint_plan(text):
                 problems.append(f"{tier[0]}: a perf check is always e2e: a script that measures and compares against its Rule")
             if check_id := entry_id(entry):
                 tiers[check_id] = "e2e"
+            check_touches(entry, "e2e", problems)
             ids.append((check_id, entry["line"]))
     seen = {}
     for check_id, line in ids:
