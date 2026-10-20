@@ -12,7 +12,7 @@ Paths like `../how/SKILL.md` point to skills installed beside this one, relative
 
 **Worktree.** Work from a git worktree off main. Subagents inherit it. Multiple subagents on the same branch each get their own worktree, or `git fetch && git reset --hard origin/<branch>` between them. Dirty branch with unrelated work: patch out, fresh worktree, apply. Snarled worktree: reset from main, redo minimally.
 
-**Commits.** Commit liberally. Rebase into small, ordered commits before opening PRs. Each commit is landable and ordered to tell the story. Amend when the fix belongs in a just-made commit. New commit when separable. Commit bodies don't restate the subject.
+**Commits.** Commit liberally. Rebase into small, ordered commits before opening PRs, unless the calling playbook keeps the commits as they were made (the feature and quick-feature skills do, because their final run proved that tree and a regroup would cost another). Each commit is landable and ordered to tell the story. Amend when the fix belongs in a just-made commit. New commit when separable. Commit bodies don't restate the subject.
 
 **PRs.** Confirm the **no-comments** skill (`../no-comments/SKILL.md`) ran on the diff before the verification freeze, and run it now only if it did not, because a pass after the freeze rewrites verified commits. Write every PR title, description, and commit body with the **technical-writing** skill (`../technical-writing/SKILL.md`) (every layer except Diátaxis, and apply the STE vocabulary rules: one word per action, keep articles, a plain verb over `-ing` where one works), then apply the **unslop** skill (`../unslop/SKILL.md`).
 
@@ -39,4 +39,4 @@ After the sections, attach videos or screenshots when they prove a claim. Full S
 
 **Babysit.** Opening a PR does not start a babysit. Post the URL and keep building. Finish the phase or stack first. Run a separate babysit pass only when the user asks for one after the whole stack exists. A babysit for each new PR stalls the build and spends checks on commits later waves restart. Push back when feedback drifts from intent.
 
-A subagent that opens a PR runs the **interrogate** skill (`../interrogate/SKILL.md`), confirms the **no-comments** pass ran, posts the URL, and returns to the parent without babysitting.
+A subagent that opens a PR runs the **interrogate** skill (`../interrogate/SKILL.md`) unless its playbook already had a fresh reviewer review the diff, confirms the **no-comments** pass ran, posts the URL, and returns to the parent without babysitting.

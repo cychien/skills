@@ -1,4 +1,4 @@
-"""Per-session guard state: skills loaded, principle files read, and the agent's todo list."""
+"""Per-session guard state: skills loaded, principle files read, and the todo lists of the lead and each subagent."""
 import contextlib
 import fcntl
 import json
@@ -26,6 +26,17 @@ def exists(agent, session):
 def fresh():
     return {"skills": [], "principles_read": [], "todo": [], "todo_undecided": None, "archived": [],
             "activity": 0, "activity_at_block": -1, "idle_blocks": 0}
+
+
+def fresh_list():
+    return {"todo": [], "archived": [], "todo_undecided": None, "activity": 0, "activity_at_block": -1, "idle_blocks": 0}
+
+
+def own_list(data, agent_id):
+    """The todo list of one agent in the session: the lead's when agent_id is None, else that subagent's own."""
+    if not agent_id:
+        return data
+    return data.setdefault("agents", {}).setdefault(agent_id, fresh_list())
 
 
 def load(agent, session):

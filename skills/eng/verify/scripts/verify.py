@@ -7,12 +7,13 @@ usage: verify.py <command> [--dir DIR]
        verify.py carry <branch or directory>
        verify.py phases [<plan folder>]
        verify.py adopt <phase folder>
-       verify.py commits [<base>..<head>] [--cmd CMD] [--typecheck CMD] [--timeout SECONDS]
        verify.py leftovers [--kill] [--root DIR ...]
        verify.py capacity [--native]
 
   where       print this branch's verification directory
-  plan        the plan is complete: checks with every field, and a perf decision
+  plan        the plan is complete: checks with every field, a Tier of e2e, unit, or walk on each (a perf check is
+              always e2e), and a perf decision. Prints the count per tier. An optional '- Exploration: <n> minutes'
+              line above '## Checks' replaces the 20-minute exploration timebox.
   driver      a project verification skill is on main, or was committed before any product change
   freeze      record the plan's hash before a verifier runs; --revision "<why; agreed by>"
               records a deliberate change to an already frozen plan
@@ -25,26 +26,37 @@ usage: verify.py <command> [--dir DIR]
   oracles     every oracle check has its expected value, computed from the spec after the freeze
   compare     every oracle check's observed value matches its expected value
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match
-              the comparison; the report's Head is HEAD or a commit with HEAD's tree (a regrouped history)
+              the comparison; the report's Head is HEAD or a commit with HEAD's tree (a regrouped history). A PASS
+              is backed by its tier's evidence: e2e by its <id>.check.<ext> script and an <id>.rerun.log from a passing
+              rerun after the freeze; unit by the last `units` result, after the freeze, passing, on HEAD's tree, with
+              a spec that names the check id; walk by a screenshot or video in evidence/<id>/ written after the freeze.
+              The files in evidence/explore/ span at most the plan's exploration timebox (20 minutes by default), and
+              every Exploration finding is triaged. A '## Review' section in report.md, or review.md, written after
+              the freeze, holds the code review's findings, each triaged, or 'none found'.
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
               base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
               else pytest or unittest for .py files), or --test-cmd gives it, with {files} for the spec path.
               A spec file whose text contains "regression-guard" (in a title or a comment) guards behavior that
               already works: it must pass at head but may pass on base. Keep guards in their own spec files.
+              Each run records units.json (per spec its verdict and the plan check ids its text names, so a test
+              titled "U2: ..." proves unit check U2) and units.log in the verification directory, for `report`.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
               instance id) to each; one PASS or FAIL line per check from its exit code, and a summary. Each script
               gets 300 seconds unless --timeout raises it. Exits 0 with a "no saved check scripts" line when there
               are none. A check script runs with zero arguments and provisions and tears down its own instance through
               the project driver (optional ARGS may reuse a running instance); it cleans only its own evidence
               (evidence/<id>/ or files starting with <id>), never a shared folder, and a script that deletes or empties
-              another check's file FAILs; the report cites <id>.rerun.log, not the script. After a run where every
-              script passes, rerun stamps rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff,
-              and a sha256 per check script and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS
-              and an unchanged stamp prints one line and exits 0 without running; --force always runs. Any run deletes
-              the stamp first, so a failed or interrupted run leaves none. --only ID (repeatable) runs just those checks,
-              for a fix executor proving its own checks; it neither reads nor writes the stamp, so the full rerun still
-              decides the gate. A check script finds the repository from its working directory, never a hard-coded
+              another check's file FAILs; the report cites <id>.rerun.log, not the script, and the log's last line is
+              "rerun: PASS" or "rerun: FAIL (<why>)". After a run where every script passes, rerun stamps
+              rerun.stamp.json with HEAD's tree, a hash of the tracked working-tree diff, and a sha256 per check script
+              and helper (.mjs .cjs .js .ts .py .sh). A later rerun with the same ARGS and an unchanged stamp prints one
+              line and exits 0 without running; --force always runs. Any run deletes the stamp first, so a failed or
+              interrupted run leaves none. --only ID (repeatable) runs just those checks, for grading a fix; it neither
+              reads nor writes the stamp, so the full rerun still decides the gate. Once report.md marks a check FAIL,
+              each --only run in which it still fails is one failed fix attempt, counted in fix-attempts.json; after 2,
+              --only refuses it, and the full rerun reports it as left FAIL without failing, because it goes to the
+              user or the backlog. A check script finds the repository from its working directory, never a hard-coded
               worktree path, so a later phase can carry it.
   carry       copy the saved check scripts and their helpers from an earlier phase's verification directory (a branch
               name, resolved beside this one, or a path) into this one, so rerun regrades that phase's checks without an
@@ -57,11 +69,6 @@ usage: verify.py <command> [--dir DIR]
               their ids), and, when <plan folder>/skeleton.patch exists, every phase holding a conformance check with a
               Skeleton field naming the skeleton files and symbols it implements. Given a plan folder, it records it in
               this branch's verification directory, so the bare command (a gate) checks the same folder later.
-  commits     check every commit in <base>..<head> (default like units), one at a time in a scratch tree: --typecheck
-              first when given, then --cmd (default: the project's test script, else pytest or unittest). One PASS or
-              FAIL line per commit; a commit that leaves a process running in its tree FAILs and the process is killed.
-              A spec-only commit (subject starting with "test", or only spec files) reports its result but does not
-              fail the run.
   leftovers   list processes still running from this run's places: the verification directory,
               ~/.cache/parlor-verify-hello, $PARLOR_VERIFY_HOME, $VERIFY_SCRATCHPAD (the agent scratchpad),
               /tmp/salvo-*, each --root, and, when their parent is init, anything under a worktree of this repo
@@ -78,8 +85,8 @@ usage: verify.py <command> [--dir DIR]
               load, cores, threshold and native builds running (pids); a refusal adds the busiest processes.
 
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
-the root, --dir overrides the whole path). It holds plan.md, plan.lock, report.md,
-decision.tsv, and the evidence files. An oracle check <id> also has <id>.expected.json, written by an
+the root, --dir overrides the whole path). It holds plan.md, plan.lock, report.md, review.md,
+decision.tsv, units.json, fix-attempts.json, and the evidence files. An oracle check <id> also has <id>.expected.json, written by an
 agent that read only the spec and the seed data, and <id>.observed.json, read from the running app.
 """
 import argparse
@@ -115,6 +122,13 @@ NA = re.compile(r"^n/a:\s*(.*)$")
 HEADER_FIELD = re.compile(r"^(Head|Main|Author|Verifier):\s*(.*)$", re.M)
 MIN_REASON = 10
 TRIAGE = re.compile(r"\bTriage:\s*(fixed|new check|follow-up|pre-existing|dismissed)\b", re.I)
+TIERS = ("e2e", "unit", "walk")
+TIER_HELP = ("write e2e (isolation, permissions, revocation, wire compatibility, perf, or a cross-surface flow: a script the "
+             "verifier writes, run on the real app), unit (logic: a spec the executor writes, graded by `verify.py units`), or "
+             "walk (UI look and interaction: walked once on the real app, saved as a screenshot or video)")
+EXPLORE_MINUTES = 20
+EXPLORE_BOX = re.compile(r"^(\d+) minutes?$")
+MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"}
 
 
 SPEC_FILE = re.compile(r"(^|/)(test_[^/]*\.py|[^/]*_test\.(py|go)|[^/]*\.(test|spec)\.[cm]?[jt]sx?|[^/]*_spec\.rb|[^/]*Tests?\.(swift|kt|java))$")
@@ -126,8 +140,15 @@ DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
 SCRIPT_TIMEOUT = 900
 RERUN_TIMEOUT = 300
 RERUN_STAMP = "rerun.stamp.json"
+RERUN_PASS = "rerun: PASS"
+FIX_ATTEMPTS = 2
+FIX_LEDGER = "fix-attempts.json"
+UNITS_RECORD = "units.json"
+UNITS_LOG = "units.log"
+REVIEW = "review.md"
 HELPER_SUFFIXES = {".mjs", ".cjs", ".js", ".ts", ".py", ".sh"}
 EVIDENCE_DIR = "evidence"
+EXPLORE_DIR = "explore"
 LISTED_LOSSES = 5
 LOAD_RATIO = 0.7
 NATIVE_BUILDS = {
@@ -145,7 +166,6 @@ SALVO_GLOBS = ("/tmp/salvo-*", "/private/tmp/salvo-*")
 ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/[^\s'\"`;,()<>|&]+")
 # A scratch tree borrows the checkout's installed dependencies through symlinks, which pnpm 11's pre-run deps check rejects.
 SCRATCH_ENV = {"pnpm_config_verify_deps_before_run": "false"}
-TEST_SCRIPTS = {"pnpm-lock.yaml": "pnpm test", "yarn.lock": "yarn test", "bun.lock": "bun run test", "bun.lockb": "bun run test"}
 
 
 class Failed(Exception):
@@ -267,9 +287,39 @@ def check_oracle(entry, problems, oracles):
         oracles[check_id] = slack
 
 
+def check_tier(entry, problems, tiers, oracles):
+    field = entry["fields"].get("Tier")
+    if field is None:
+        problems.append(f"{entry['line']}: missing '- Tier:'; {TIER_HELP}")
+        return
+    number, value = field
+    if value not in TIERS:
+        problems.append(f"{number}: Tier must be e2e, unit, or walk, not {value!r}; {TIER_HELP}")
+        return
+    check_id = entry_id(entry)
+    if value == "unit" and check_id in oracles:
+        problems.append(f"{number}: an oracle check reads its value from the running app, so its Tier is e2e or walk")
+    if check_id:
+        tiers[check_id] = value
+
+
+def explore_minutes(text, problems=None):
+    """The exploration timebox: a '- Exploration: <n> minutes' line above the plan's first section, else the default."""
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("## "):
+            break
+        if (m := FIELD.match(line)) and m.group(1) == "Exploration":
+            if box := EXPLORE_BOX.match(m.group(2).strip()):
+                return int(box.group(1))
+            if problems is not None:
+                problems.append(f"{number}: Exploration must read '<n> minutes'")
+    return EXPLORE_MINUTES
+
+
 def lint_plan(text):
-    """Return (problems, check ids, {oracle check id: tolerance}) for a plan's text."""
-    problems, ids, oracles = [], [], {}
+    """Return (problems, check ids, {oracle check id: tolerance}, {check id: tier}) for a plan's text."""
+    problems, ids, oracles, tiers = [], [], {}, {}
+    explore_minutes(text, problems)
     found = sections(text.splitlines())
     if "Checks" not in found:
         problems.append("1: missing '## Checks' section")
@@ -280,6 +330,7 @@ def lint_plan(text):
         for entry in checks:
             check_entry(entry, CHECK_FIELDS, problems)
             check_oracle(entry, problems, oracles)
+            check_tier(entry, problems, tiers, oracles)
             ids.append((entry_id(entry), entry["line"]))
     if "Perf" not in found:
         problems.append("1: missing '## Perf' section: add perf checks, or 'n/a: <reason>'")
@@ -295,27 +346,33 @@ def lint_plan(text):
         for entry in perf:
             check_entry(entry, PERF_FIELDS, problems)
             check_perf_entry(entry, problems)
-            ids.append((entry_id(entry), entry["line"]))
+            tier = entry["fields"].get("Tier")
+            if tier and tier[1] != "e2e":
+                problems.append(f"{tier[0]}: a perf check is always e2e: a script that measures and compares against its Rule")
+            if check_id := entry_id(entry):
+                tiers[check_id] = "e2e"
+            ids.append((check_id, entry["line"]))
     seen = {}
     for check_id, line in ids:
         if check_id and check_id in seen:
             problems.append(f"{line}: id {check_id!r} is used more than once")
         seen.setdefault(check_id, line)
-    return problems, [i for i, _ in ids if i], oracles
+    return problems, [i for i, _ in ids if i], oracles, tiers
 
 
 def load_plan(directory):
     path = directory / "plan.md"
     text = read(path, "plan (write it from the verify skill's references/plan-template.md)")
-    problems, ids, oracles = lint_plan(text)
+    problems, ids, oracles, tiers = lint_plan(text)
     if problems:
         raise Failed("\n".join(f"{path}:{p}" for p in problems))
-    return path, text, ids, oracles
+    return path, text, ids, oracles, tiers
 
 
 def cmd_plan(directory, args):
-    path, _, ids, oracles = load_plan(directory)
-    return f"{path}: plan ok, {len(ids)} checks, {len(oracles)} oracle checks"
+    path, _, ids, oracles, tiers = load_plan(directory)
+    counts = ", ".join(f"{t} {list(tiers.values()).count(t)}" for t in TIERS)
+    return f"{path}: plan ok, {len(ids)} checks, {len(oracles)} oracle checks; tiers: {counts}"
 
 
 def default_branch():
@@ -368,7 +425,7 @@ def sha(text):
 
 
 def cmd_freeze(directory, args):
-    _, text, _, _ = load_plan(directory)
+    _, text, _, _, _ = load_plan(directory)
     lock_path = directory / "plan.lock"
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     if not lock_path.exists():
@@ -395,7 +452,7 @@ def cmd_adopt(directory, args):
         raise Failed("adopt takes one <phase folder> from the feature plan")
     folder = pathlib.Path(args.rest[0]).expanduser().resolve()
     text = read(folder / "plan.md", "phase plan")
-    problems, ids, _ = lint_plan(text)
+    problems, ids, _, _ = lint_plan(text)
     if problems:
         raise Failed("\n".join(f"{folder / 'plan.md'}:{p}" for p in problems))
     directory.mkdir(parents=True, exist_ok=True)
@@ -416,7 +473,7 @@ def product_changes(base, skip):
 
 
 def cmd_lock(directory, args):
-    _, text, _, _ = load_plan(directory)
+    _, text, _, _, _ = load_plan(directory)
     lock_path = directory / "plan.lock"
     if lock_path.exists():
         if not json.loads(lock_path.read_text()).get("before_code"):
@@ -493,7 +550,7 @@ def compare_oracle(directory, check_id, slack, lock):
 
 
 def cmd_oracles(directory, args):
-    _, text, _, oracles = load_plan(directory)
+    _, text, _, oracles, _ = load_plan(directory)
     lock = frozen_lock(directory, text)
     problems = []
     for check_id in oracles:
@@ -510,7 +567,7 @@ def cmd_oracles(directory, args):
 
 
 def cmd_compare(directory, args):
-    _, text, _, oracles = load_plan(directory)
+    _, text, _, oracles, _ = load_plan(directory)
     lock = frozen_lock(directory, text)
     lines, failed = [], False
     for check_id, slack in oracles.items():
@@ -595,8 +652,98 @@ def evidence_problems(directory, check_id, spec, frozen_ts):
     return problems
 
 
+def section(text, name):
+    m = re.search(rf"^## {re.escape(name)}\s*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def untriaged(body):
+    findings = [line.strip() for line in body.splitlines() if re.match(r"^\s*[-*] ", line)]
+    return [f"has no 'Triage: fixed | new check | follow-up | pre-existing | dismissed': {f[:80]}" for f in findings if not TRIAGE.search(f)]
+
+
+def explore_problems(directory, minutes):
+    folder = directory / EVIDENCE_DIR / EXPLORE_DIR
+    times = [p.stat().st_mtime for p in folder.rglob("*") if p.is_file()] if folder.is_dir() else []
+    span = (max(times) - min(times)) / 60 if times else 0
+    if span <= minutes:
+        return []
+    return [f"exploration ran {span:.0f} minutes by its files in {EVIDENCE_DIR}/{EXPLORE_DIR}/, past its {minutes}-minute timebox. "
+            "End exploration at the box: move what was found after it out of that folder and triage it follow-up, or, when the "
+            "user agreed to a longer box, write '- Exploration: <n> minutes' above the plan's '## Checks' and record it with "
+            "`verify.py freeze --revision`"]
+
+
+def review_problems(directory, report, frozen_ts):
+    """The code review: report.md's '## Review' section and review.md, written after the freeze, every finding triaged."""
+    sources = [(directory / "report.md", section(report, "Review"))]
+    if (directory / REVIEW).is_file():
+        text = (directory / REVIEW).read_text()
+        sources.append((directory / REVIEW, section(text, "Review") or text.strip()))
+    found = [(path, body) for path, body in sources if body]
+    if not found:
+        return ["missing the code review: a '## Review' section in report.md or review.md with a fresh reviewer's findings, "
+                "or 'none found'"]
+    problems = []
+    for path, body in found:
+        problems += [f"review finding {p}" for p in untriaged(body)]
+        if path.stat().st_mtime < frozen_ts:
+            problems.append(f"the review in {path.name} predates the frozen plan; review the code that ships, after the freeze")
+    return problems
+
+
+def load_units(directory):
+    try:
+        return json.loads((directory / UNITS_RECORD).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def last_line(path):
+    return path.read_text(errors="replace").rstrip("\n").rpartition("\n")[2]
+
+
+def units_gap(check_id, frozen_ts, units):
+    if not units:
+        return "no `verify.py units` result is recorded; run it once the code lands"
+    if units.get("at", 0) < frozen_ts:
+        return "the recorded `verify.py units` result predates the frozen plan; run it again"
+    if not units.get("passed"):
+        return "the last `verify.py units` run failed; fix what it reports and run it again"
+    head_tree = tree_of("HEAD")
+    if head_tree and units.get("tree") != head_tree:
+        return "the last `verify.py units` ran on another tree than HEAD; run it again on the code that ships"
+    if not any(check_id in spec["checks"] and spec["verdict"] in ("ok", "guard") for spec in units.get("specs", {}).values()):
+        return (f"no spec in the last `verify.py units` run names {check_id}; put the check id in the title of the test that "
+                "proves it, then run units again")
+    return None
+
+
+def tier_gap(directory, check_id, tier, frozen_ts, scripts, units):
+    """Why a PASS lacks the evidence its tier needs, or None."""
+    if tier == "unit":
+        return units_gap(check_id, frozen_ts, units)
+    if tier == "e2e":
+        log = directory / f"{check_id}.rerun.log"
+        if check_id not in scripts:
+            return (f"no {check_id}.check.<ext> script is saved; the verifier writes it from the plan and the driver, and "
+                    "`verify.py rerun` grades it")
+        if not log.is_file() or log.stat().st_mtime < frozen_ts:
+            return f"{log.name} is missing or predates the frozen plan; run `verify.py rerun` after the freeze"
+        if last_line(log) != RERUN_PASS:
+            return f"{log.name} records a failing run; a PASS needs a passing `verify.py rerun`"
+        return None
+    folder = directory / EVIDENCE_DIR / check_id
+    media = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
+             and p.stat().st_size and p.stat().st_mtime >= frozen_ts] if folder.is_dir() else []
+    if not media:
+        return (f"{EVIDENCE_DIR}/{check_id}/ holds no screenshot or video written after the freeze; walk it on the real app "
+                "and save one there")
+    return None
+
+
 def cmd_report(directory, args):
-    _, text, ids, oracles = load_plan(directory)
+    _, text, ids, oracles, tiers = load_plan(directory)
     lock = frozen_lock(directory, text)
     path = directory / "report.md"
     report = read(path, "report (write it from the verify skill's references/report-template.md)")
@@ -617,18 +764,19 @@ def cmd_report(directory, args):
         if reported_tree and reported_tree == tree_of("HEAD"):
             same_tree = f"Head {reported_head} has the same tree as HEAD {current_head[:12]}"
         else:
-            problems.append(f"the report covers Head {reported_head}, but HEAD is now {current_head[:12]}; verify the code that ships, "
-                            "sending the checks the later commits could touch to a fresh verifier")
+            problems.append(f"the report covers Head {reported_head}, but HEAD is now {current_head[:12]}; regrade the code that ships "
+                            "with `verify.py rerun` and `verify.py units`, walk again each walk check the later commits touch, "
+                            "then set Head")
     if header.get("Author", "").strip() and header.get("Author", "").strip() == header.get("Verifier", "").strip():
         problems.append("the Verifier is the Author; a fresh agent must produce the verdicts")
-    exploration = re.search(r"^## Exploration\s*\n(.*?)(?=^## |\Z)", report, re.M | re.S)
-    if not exploration or not exploration.group(1).strip():
-        problems.append("missing '## Exploration' section with the verifier's findings, or 'none found'")
-    else:
-        findings = [line.strip() for line in exploration.group(1).splitlines() if re.match(r"^\s*[-*] ", line)]
-        for finding in findings:
-            if not TRIAGE.search(finding):
-                problems.append(f"exploration finding has no 'Triage: fixed | new check | follow-up | pre-existing | dismissed': {finding[:80]}")
+    exploration = section(report, "Exploration")
+    if not exploration:
+        problems.append("missing '## Exploration' section with the explorer's findings, or 'none found'")
+    problems += [f"exploration finding {p}" for p in untriaged(exploration)]
+    problems += explore_problems(directory, explore_minutes(text))
+    problems += review_problems(directory, report, lock["frozen_ts"])
+    units = load_units(directory)
+    scripts = {script_id(p) for p in check_scripts(directory)}
     rows = {}
     for number, cells in table_rows(report):
         if len(cells) < 4:
@@ -652,6 +800,11 @@ def cmd_report(directory, args):
             problems += [f"{number}: {p}" for p in file_problems]
             if diffs and verdict == "PASS":
                 problems.append(f"{number}: {check_id} is PASS, but its observed value differs from the oracle's: {diffs[0]}")
+        if verdict == "PASS" and check_id in tiers:
+            tier = tiers[check_id]
+            gap = tier_gap(directory, check_id, tier, lock["frozen_ts"], scripts, units)
+            if gap:
+                problems.append(f"{number}: {check_id} is {'an' if tier == 'e2e' else 'a'} {tier} check marked PASS, but {gap}")
         if verdict == "FAIL" and not observed.lower().startswith(("defect:", "blocker:")):
             problems.append(f"{number}: {check_id} is FAIL; start its Observed cell with 'defect:' and the repro")
         if verdict == "INCONCLUSIVE" and not observed.lower().startswith("blocker:"):
@@ -699,14 +852,14 @@ def helper_files(directory):
             if p.is_file() and p.suffix in HELPER_SUFFIXES and not skipped & set(p.relative_to(directory).parts[:-1])]
 
 
-def rerun_inputs(directory, scripts, rest):
+def rerun_inputs(directory, scripts, rest, left):
     """What a passing rerun depends on, or None outside a git repository."""
     tree = tree_of("HEAD")
     diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True)
     if not tree or diff.returncode:
         return None
     files = {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted({*scripts, *helper_files(directory)})}
-    return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": files}
+    return {"args": rest, "tree": tree, "diff": hashlib.sha256(diff.stdout).hexdigest(), "files": files, "left": left}
 
 
 def file_sizes(directory):
@@ -746,58 +899,102 @@ def only_scripts(scripts, wanted):
     return [by_id[i] for i in dict.fromkeys(wanted)]
 
 
+def reported_failures(directory):
+    path = directory / "report.md"
+    if not path.is_file():
+        return set()
+    return {cells[0] for _, cells in table_rows(path.read_text()) if len(cells) > 1 and cells[1] == "FAIL"}
+
+
+def fix_attempts(directory):
+    try:
+        return json.loads((directory / FIX_LEDGER).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def run_check(directory, path, args, env):
+    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log."""
+    check_id = script_id(path)
+    command = script_command(path)
+    before = file_sizes(directory)
+    output = ""
+    if not command:
+        verdict, detail = "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}"
+    else:
+        try:
+            r = run_in_group([*command, *args.rest], args.timeout, env=env)
+            output = (r.stdout + r.stderr).strip()
+            verdict = "PASS" if r.returncode == 0 else "FAIL"
+            detail = "" if verdict == "PASS" else f"exit {r.returncode}"
+            if verdict == "FAIL" and output:
+                detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
+        except subprocess.TimeoutExpired:
+            verdict, detail = "FAIL", f"timed out after {args.timeout}s"
+    lost = lost_files(before, file_sizes(directory), check_id)
+    if lost:
+        verdict = "FAIL"
+        detail = f"deleted or emptied files that are not its own: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
+    reason = detail.partition("\n")[0]
+    (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}" + (f" ({reason})" if reason else "") + "\n")
+    return verdict, detail
+
+
 def cmd_rerun(directory, args):
     scripts = check_scripts(directory)
     if args.only:
         scripts = only_scripts(scripts, args.only)
     if not scripts:
         return f"no saved check scripts (<id>.check.<ext>) in {directory}; nothing to rerun"
+    failing, attempts = reported_failures(directory), fix_attempts(directory)
+    left = sorted(i for i in failing if attempts.get(i, 0) >= FIX_ATTEMPTS)
+    if args.only and (spent := [i for i in dict.fromkeys(args.only) if i in left]):
+        raise Failed(f"{', '.join(spent)} failed {FIX_ATTEMPTS} fix attempts since report.md marked them FAIL, the whole fix "
+                     "budget. Stop fixing: take each to the user with its repro, what each fix changed, and the premise the fixes "
+                     "shared, or in an autonomous run put it in the project's backlog with the fix you recommend and leave it FAIL "
+                     f"in report.md. Only the user grants another attempt, by deleting its entry from {FIX_LEDGER}.")
     stamp_path = directory / RERUN_STAMP
-    inputs = None if args.only else rerun_inputs(directory, scripts, args.rest)
+    inputs = None if args.only else rerun_inputs(directory, scripts, args.rest, left)
     if inputs and not args.force and stamp_path.exists():
         try:
             stamp = json.loads(stamp_path.read_text())
         except ValueError:
             stamp = {}
         if {k: stamp.get(k) for k in inputs} == inputs:
-            return (f"rerun: {len(scripts)} checks passed at {stamp.get('at')} on this tree; "
-                    "nothing changed since (pass --force to run again)")
+            known = stamp.get("known") or []
+            return (f"rerun: {len(scripts)} checks passed at {stamp.get('at')} on this tree"
+                    + (f" except {', '.join(known)}, left FAIL after the fix budget" if known else "")
+                    + "; nothing changed since (pass --force to run again)")
     if not args.only:
         stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
-    lines, failed = [], 0
+    lines, failed, known = [], [], []
     for path in scripts:
         check_id = script_id(path)
-        command = script_command(path)
         started = time.time()
-        before = file_sizes(directory)
-        if not command:
-            verdict, detail = "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}"
-        else:
-            try:
-                r = run_in_group([*command, *args.rest], args.timeout, env=env)
-                output = (r.stdout + r.stderr).strip()
-                (directory / f"{check_id}.rerun.log").write_text(output + "\n")
-                verdict = "PASS" if r.returncode == 0 else "FAIL"
-                detail = "" if verdict == "PASS" else f"exit {r.returncode}"
-                if verdict == "FAIL" and output:
-                    detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
-            except subprocess.TimeoutExpired:
-                verdict, detail = "FAIL", f"timed out after {args.timeout}s"
-        lost = lost_files(before, file_sizes(directory), check_id)
-        if lost:
-            verdict = "FAIL"
-            detail = f"deleted or emptied files that are not its own: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
-        failed += verdict == "FAIL"
+        verdict, detail = run_check(directory, path, args, env)
+        if verdict == "FAIL":
+            failed.append(check_id)
+            if check_id in left:
+                known.append(check_id)
+                detail = "left FAIL: its fix budget is spent and report.md marks it FAIL" + (f"; {detail}" if detail else "")
         head, _, rest = detail.partition("\n")
         lines.append(f"{verdict:<5} {check_id}  ({time.time() - started:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
-    summary = f"rerun: {len(scripts)} checks, {len(scripts) - failed} PASS, {failed} FAIL"
+    summary = f"rerun: {len(scripts)} checks, {len(scripts) - len(failed)} PASS, {len(failed)} FAIL"
+    summary += f" ({len(known)} left FAIL after the fix budget)" if known else ""
     lines.append(summary + (" (--only: no stamp; the full rerun decides the gate)" if args.only else ""))
-    if failed:
+    if args.only:
+        for check_id in (i for i in failed if i in failing):
+            attempts[check_id] = attempts.get(check_id, 0) + 1
+            lines.append(f"fix attempt {attempts[check_id]} of {FIX_ATTEMPTS} for {check_id} failed"
+                         + ("; that was the last one, so the next rerun --only refuses it" if attempts[check_id] >= FIX_ATTEMPTS else ""))
+        if any(i in failing for i in failed):
+            (directory / FIX_LEDGER).write_text(json.dumps(attempts, indent=2) + "\n")
+    if len(failed) > len(known):
         raise Failed("\n" + "\n".join(lines))
     if inputs:
         at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-        stamp_path.write_text(json.dumps({**inputs, "at": at}, indent=2) + "\n")
+        stamp_path.write_text(json.dumps({**inputs, "at": at, "known": known}, indent=2) + "\n")
     return "\n".join(lines)
 
 
@@ -868,7 +1065,7 @@ def cmd_phases(directory, args):
             problems.append(f"{path}: missing")
             continue
         text = path.read_text()
-        found, ids, _ = lint_plan(text)
+        found, ids, _, _ = lint_plan(text)
         problems += [f"{path}:{p}" for p in found]
         for check_id in ids:
             if check_id in owner:
@@ -1176,90 +1373,50 @@ def cmd_units(directory, args):
         raise Failed(f"no spec files were added or changed in {base[:12]}..{head[:12]}. A feature ships with specs that fail without it; "
                      "write them, or name spec files with --spec when the project's test files do not follow the usual naming.")
     commands = {s: spec_command(top, s, args.test_cmd) for s in specs}
-    guards = {s for s in specs if GUARD_MARK in git("show", f"{head}:{s}")}
+    texts = {s: git("show", f"{head}:{s}") for s in specs}
+    guards = {s for s in specs if GUARD_MARK in texts[s]}
     with scratch_tree(top, base, specs, head) as tree:
         on_base = {s: run_spec(tree, commands[s], args.timeout) for s in specs}
     with scratch_tree(top, head) as tree:
         at_head = {s: run_spec(tree, commands[s], args.timeout) for s in specs}
-    lines, tally = [], {"ok": 0, "guard": 0, "vacuous": 0, "broken": 0}
+    lines, tally, verdicts = [], {"ok": 0, "guard": 0, "vacuous": 0, "broken": 0}, {}
     for s in specs:
         (base_ok, base_tail), (head_ok, head_tail) = on_base[s], at_head[s]
         if not head_ok:
-            tally["broken"] += 1
+            verdicts[s] = "broken"
             lines.append(f"FAILS AT HEAD  {s}\n" + indent(head_tail))
         elif s in guards:
-            tally["guard"] += 1
+            verdicts[s] = "guard"
             lines.append(f"GUARD          {s}  marked {GUARD_MARK}, exempt from failing on base")
         elif base_ok:
-            tally["vacuous"] += 1
+            verdicts[s] = "vacuous"
             lines.append(f"PASSES ON BASE {s}  passes without the implementation, so it does not show new behavior; "
                          f"make it assert the new behavior, or mark a spec of behavior that already worked with '{GUARD_MARK}'")
         else:
-            tally["ok"] += 1
+            verdicts[s] = "ok"
             lines.append(f"OK             {s}  fails on base, passes at head\n" + indent(base_tail))
+        tally[verdicts[s]] += 1
     lines.append(f"units: {len(specs)} specs, {tally['ok']} fail on base and pass at head, {tally['guard']} regression guards, "
                  f"{tally['vacuous']} pass without the implementation, {tally['broken']} fail at head")
-    if tally["vacuous"] or tally["broken"]:
+    ids = plan_ids(directory)
+    record = {"at": time.time(), "base": base, "head": head, "tree": tree_of(head), "passed": not (tally["vacuous"] or tally["broken"]),
+              "specs": {s: {"verdict": verdicts[s], "checks": named_checks(texts[s], ids)} for s in specs}}
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / UNITS_RECORD).write_text(json.dumps(record, indent=2) + "\n")
+    (directory / UNITS_LOG).write_text("\n".join(lines) + "\n")
+    if not record["passed"]:
         raise Failed("\n" + "\n".join(lines))
     return "\n".join(lines)
 
 
-def default_test_command(top):
-    package = top / "package.json"
-    if package.is_file() and "test" in json.loads(package.read_text()).get("scripts", {}):
-        return next((cmd for lock, cmd in TEST_SCRIPTS.items() if (top / lock).exists()), "npm test")
-    if any(SPEC_FILE.search(n) for n in git("ls-files", "*.py", cwd=top).splitlines()):
-        python = shlex.quote(sys.executable)
-        if importlib.util.find_spec("pytest"):
-            return f"{python} -m pytest"
-        return f"{python} -m unittest discover" + (" -s tests" if (top / "tests").is_dir() else "")
-    raise Failed("cannot detect how to run the project's tests. Pass --cmd '<command>', for example --cmd 'pnpm test'.")
+def plan_ids(directory):
+    path = directory / "plan.md"
+    return [m.group(1) for line in path.read_text().splitlines() if (m := HEADING.match(line))] if path.is_file() else []
 
 
-def spec_only(commit, subject):
-    if subject.lower().startswith("test"):
-        return True
-    names = git("diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit).splitlines()
-    return bool(names) and all(SPEC_FILE.search(n) for n in names)
-
-
-def check_commit(tree, typecheck, command, timeout):
-    if typecheck:
-        ok, tail = run_spec(tree, typecheck, timeout)
-        if not ok:
-            return False, f"typecheck failed: {tail}"
-    return run_spec(tree, command, timeout)
-
-
-def cmd_commits(directory, args):
-    top = pathlib.Path(git("rev-parse", "--show-toplevel"))
-    base, head = resolve_range("commits", args.rest)
-    commits = git("rev-list", "--reverse", "--topo-order", f"{base}..{head}").splitlines()
-    if not commits:
-        raise Failed(f"no commits in {base[:12]}..{head[:12]}")
-    command = args.cmd or default_test_command(top)
-    verdicts = []
-    for commit in commits:
-        subject = git("log", "-1", "--format=%s", commit)
-        pin = spec_only(commit, subject)
-        with scratch_tree(top, commit) as tree:
-            ok, detail = check_commit(tree, args.typecheck, command, args.timeout)
-            strays = reap(str(tree))
-        if strays:
-            detail = "; ".join(filter(None, [detail.partition("\n")[0] if not ok else "",
-                                             "leftover processes killed: " + ", ".join(str(p["pid"]) for p in strays)]))
-        verdict = "PASS" if ok and not strays else "FAIL"
-        counted = verdict == "FAIL" and (strays or not pin)
-        verdicts.append((verdict, counted))
-        head_line, _, rest = detail.partition("\n")
-        note = "  (spec-only commit, not counted)" if verdict == "FAIL" and not counted else ""
-        print(f"{verdict:<5} {commit[:12]} {subject}" + (f"  {head_line}" if head_line else "") + note
-              + (f"\n{indent(rest)}" if rest and verdict == "FAIL" else ""), flush=True)
-    failed = sum(v == "FAIL" for v, _ in verdicts)
-    summary = f"commits: {len(commits)} checked, {len(commits) - failed} PASS, {failed} FAIL"
-    if any(counted for _, counted in verdicts):
-        raise Failed(summary)
-    return summary + (" (all failures were spec-only commits)" if failed else "")
+def named_checks(text, ids):
+    """The plan's check ids a spec names, as in a test titled 'U2: rounds half up'."""
+    return sorted(i for i in ids if re.search(rf"(?<![A-Za-z0-9]){re.escape(i)}(?![A-Za-z0-9])", text))
 
 
 def load_ratio():
@@ -1306,7 +1463,7 @@ def indent(text):
 
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
             "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "carry": cmd_carry,
-            "commits": cmd_commits, "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
+            "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
 
 
 def main():
@@ -1315,8 +1472,6 @@ def main():
     parser.add_argument("--dir")
     parser.add_argument("--revision")
     parser.add_argument("--test-cmd")
-    parser.add_argument("--cmd")
-    parser.add_argument("--typecheck")
     parser.add_argument("--kill", action="store_true")
     parser.add_argument("--native", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -1329,7 +1484,7 @@ def main():
     passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
     args = parser.parse_intermixed_args(argv[:len(argv) - len(passthrough) - 1] if "--" in argv else argv)
     args.rest += passthrough
-    if args.rest and args.command not in ("units", "rerun", "commits", "carry", "phases", "adopt"):
+    if args.rest and args.command not in ("units", "rerun", "carry", "phases", "adopt"):
         parser.error(f"{args.command} takes no arguments")
     args.timeout = args.timeout or (RERUN_TIMEOUT if args.command == "rerun" else SCRIPT_TIMEOUT)
     try:

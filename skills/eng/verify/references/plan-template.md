@@ -9,6 +9,7 @@
 - Evidence: <the artifact that proves it>
 - Pass: <a predicate another agent can check against the evidence>
 - Oracle: n/a: <why the result is not a value computed from data>
+- Tier: <e2e, unit, or walk, per the Terms in plan.md>
 
 ### <id>. <title of a check whose result is computed from data>
 
@@ -19,6 +20,7 @@
 - Oracle: <the spec's definition, precise enough to compute by hand>
 - Seed: <the dataset>
 - Shape: <the JSON both sides write>
+- Tier: <e2e or walk: an oracle value is read from the running app>
 
 ## Perf
 

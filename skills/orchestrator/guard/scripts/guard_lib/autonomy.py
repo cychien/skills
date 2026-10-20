@@ -12,8 +12,8 @@ def autorun_scripts():
     return None
 
 
-def ask_command(agent, session):
-    """The `autorun.py ask` prefix when this session belongs to an active run, else None."""
+def active_run(agent, session):
+    """The active autorun run this session belongs to, else None."""
     scripts = autorun_scripts()
     if not scripts:
         return None
@@ -24,4 +24,13 @@ def ask_command(agent, session):
     explicit = os.environ.get("AUTORUN_RUN")
     if not run and explicit and store.Run(explicit).active:
         run = store.Run(explicit)
-    return f"python3 {os.path.join(scripts, 'autorun.py')} ask --run {run.id}" if run else None
+    return run
+
+
+def ask_command(run):
+    return f"python3 {os.path.join(autorun_scripts(), 'autorun.py')} ask --run {run.id}"
+
+
+def waiting_on_user(run):
+    """Whether the run escalated a question to the user that is not answered yet."""
+    return bool(run.gates("open", "asked"))

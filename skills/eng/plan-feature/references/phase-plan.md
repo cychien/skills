@@ -13,7 +13,7 @@
 
 ## Acceptance
 
-- <check id>: <one line in user terms>, proved in phase <n>
+- <check id> (<e2e, unit, or walk>): <one line in user terms>, proved in phase <n>
 
 ## Phases
 
@@ -29,4 +29,5 @@
 
 - A phase lands and reverts alone. When it cannot ship visible to users, name the flag that hides it.
 - Heavy decides where expensive checks run: a native shell or perf check runs in the phase that changes it, and later phases regrade it by its carried script.
+- Every check has a Tier per `../../verify/references/plan.md`. Only an `e2e` check leaves a script that later phases rerun, so give that tier only to what a unit test cannot see and what costs most when broken.
 - Changes is the only way an earlier phase's check stops holding. The feature skill revises that phase's carried check under `verify.py freeze --revision` and never silently.

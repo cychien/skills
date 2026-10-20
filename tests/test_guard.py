@@ -322,27 +322,26 @@ class Guard(unittest.TestCase):
         out = self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": prompt}})
         return out["hookSpecificOutput"]["permissionDecisionReason"] if out else None
 
-    def test_each_check_gets_a_full_round_and_one_fix_wave_verifier(self):
+    def test_each_check_gets_one_verifier_and_its_check_script_is_not_grading_evidence(self):
         evidence = pathlib.Path(self.tmp.name) / "verification"
         self.assertIsNone(self.verifier(evidence, "C1 C2"))
-        (evidence / "C1.png").write_text("x")
-        (evidence / "C2.txt").write_text("x")
+        (evidence / "C1.check.sh").write_text("x")
         self.assertIsNone(self.verifier(evidence, "C1"))
         time.sleep(0.01)
-        (evidence / "C1-retry.png").write_text("x")
-        self.assertIn("Checks C1 already had", self.verifier(evidence, "C1 C2"))
+        (evidence / "C1.rerun.log").write_text("rerun: PASS\n")
+        reason = self.verifier(evidence, "C1 C2")
+        self.assertIn("Checks C1 already had a verifier that wrote evidence for them, the whole verification budget: one verifier per check.", reason)
+        self.assertIn("Grade a fix with `verify.py rerun --only <ids>` and `verify.py units`", reason)
+        self.assertIn("resume that same verifier instead of spawning a new one", reason)
         self.assertIsNone(self.verifier(evidence, "C2"))
 
     def test_a_verifier_that_left_no_evidence_does_not_spend_the_budget(self):
         evidence = pathlib.Path(self.tmp.name) / "verification"
         self.assertIsNone(self.verifier(evidence, "C1"))
         self.assertIsNone(self.verifier(evidence, "C1"))
-        (evidence / "C1.png").write_text("x")
-        self.assertIsNone(self.verifier(evidence, "C1"))
-        time.sleep(0.01)
         (evidence / "evidence" / "C1").mkdir(parents=True)
         (evidence / "evidence" / "C1" / "shot.png").write_text("x")
-        self.assertIn("already had", self.verifier(evidence, "C1"))
+        self.assertIn("already had a verifier", self.verifier(evidence, "C1"))
 
     def test_a_verifier_prompt_must_name_its_checks(self):
         self.assertIn("no 'Checks:' line", self.verifier(pathlib.Path(self.tmp.name), ""))
@@ -569,6 +568,62 @@ class Guard(unittest.TestCase):
         self.todo("add", "Implement it")
         self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a1", "last_assistant_message": "done \u2014 ok"}))
 
+    def test_todo_wait_is_allowed_once_an_autonomous_run_waits_on_the_user(self):
+        home = pathlib.Path(self.env["AUTORUN_HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.json").write_text(json.dumps({"review": False}))
+        self.hook("UserPromptSubmit", {"prompt": "going to bed, build it"})
+        run = next((home / "active").iterdir()).name
+        self.todo("add", "Pick the export format")
+        self.assertIn(f"autorun.py ask --run {run}", self.todo("wait", "1", "--reason", "format", ok=False))
+        asked = subprocess.run([sys.executable, str(HOOK), "ask", "--run", run, "--kind", "direction", "--question", "Markdown or HTML export?",
+                                "--pick", "markdown", "--why", "both are plausible", "--confidence", "low"], env=self.env, capture_output=True, text=True)
+        self.assertIn("ESCALATED", asked.stdout)
+        self.assertIn("[?] 1. Pick the export format - waiting on the user: the format, escalated as a gate",
+                      self.todo("wait", "1", "--reason", "the format, escalated as a gate"))
+        self.assertIsNone(self.stop("Escalated the format question; waiting for the answer."))
+
+    def test_a_subagent_cannot_spawn_a_background_agent(self):
+        background = {"tool_name": "Agent", "tool_input": {"prompt": "Implement phase 2.", "run_in_background": True}}
+        out = self.hook("PreToolUse", {**background, "agent_id": "owner-1"})["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("when your turn ends, the harness kills your background children", out["permissionDecisionReason"])
+        self.assertIn("Run it in the foreground; for parallel work, put several foreground Agent calls in one message.", out["permissionDecisionReason"])
+        self.assertIsNone(self.hook("PreToolUse", background))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "Implement phase 2."}, "agent_id": "owner-1"}))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "sleep 1", "run_in_background": True}, "agent_id": "owner-1"}))
+
+    def test_a_subagents_todo_list_stays_its_own_and_holds_only_its_own_turn(self):
+        self.todo("add", "Lead: ship phase 3")
+        for command in (f"python3 {GUARD} todo from demo --session claude:s1",
+                        f'g() {{ python3 {GUARD} "$@" --session claude:s1; }}; g todo list',
+                        f"python3 {GUARD} todo add x --session claude:s1 --agent owner-10"):
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}, "agent_id": "owner-1"})["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny", command)
+            self.assertIn("Add `--agent owner-1` to every guard todo command", out["permissionDecisionReason"])
+            self.assertIn("todo from <skill> --session claude:s1 --agent owner-1", out["permissionDecisionReason"])
+        for command in (f"python3 {GUARD} todo add 'Owner: build it' --session claude:s1 --agent owner-1", f"grep -n todo {GUARD}",
+                        "grep -n 'guard.py todo from' notes.md", "python3 - <<'EOF'\nprint('g() { python3 guard.py \"$@\" --session x; }')\nEOF"):
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}, "agent_id": "owner-1"}), command)
+        out = self.todo("add", "Owner: build it", "--agent", "owner-1")
+        self.assertIn("1. Owner: build it", out)
+        self.assertNotIn("Lead", out)
+        lead = self.todo("list")
+        self.assertIn("1. Lead: ship phase 3", lead)
+        self.assertNotIn("Owner", lead)
+        blocked = self.stop("Working.")["reason"]
+        self.assertIn("1. Lead: ship phase 3", blocked)
+        self.assertNotIn("Owner", blocked)
+        held = self.hook("SubagentStop", {"agent_id": "owner-1", "last_assistant_message": "Handing back."})
+        self.assertEqual(held["decision"], "block")
+        self.assertIn("1. Owner: build it", held["reason"])
+        self.assertNotIn("Lead", held["reason"])
+        self.assertIn("todo done <n> --session claude:s1 --agent owner-1", held["reason"])
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "other-2", "last_assistant_message": "Done."}))
+        self.assertIn("Every item is resolved", self.todo("done", "1", "--agent", "owner-1"))
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "owner-1", "last_assistant_message": "Handing back."}))
+        self.assertIn("1. Lead: ship phase 3", self.stop("Working.")["reason"])
+
     def test_autonomous_and_guard_blocks_combine(self):
         self.hook("UserPromptSubmit", {"prompt": "going to bed, build it"})
         out = self.stop("Working \u2014 more to do.")
@@ -589,12 +644,24 @@ class ShippedPlaybooks(unittest.TestCase):
 
     def test_quick_feature_freezes_the_plan_before_code_delegates_and_cannot_skip_verification(self):
         mandatory = self.gated_mandatory_steps("quick-feature")
-        self.assertEqual(mandatory, {1: {"plan", "lock"}, 3: {"driver"}, 4: {"rerun"}, 6: {"report", "rerun", "leftovers"}})
+        self.assertEqual(mandatory, {1: {"plan", "lock"}, 3: {"driver"}, 4: set(), 6: {"oracles"}, 7: set(), 8: {"rerun", "report", "leftovers"}})
 
-    def test_feature_locks_the_plan_before_code_and_keeps_its_driver_build_and_verify_gates(self):
+    def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_final_rerun_and_report(self):
         mandatory = self.gated_mandatory_steps("feature")
-        self.assertEqual(mandatory, {1: {"plan"}, 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units", "rerun"},
-                                     9: {"report", "rerun", "leftovers"}})
+        self.assertEqual(mandatory, {1: {"plan"}, 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units"}, 10: {"oracles"},
+                                     12: set(), 13: set(), 14: {"rerun", "report", "leftovers"}})
+
+    def test_the_step_that_opens_the_pr_is_the_one_the_final_run_gates(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import gates, skills
+        for skill in ("feature", "quick-feature"):
+            steps = skills.steps(ROOT / "skills" / "eng" / skill / "SKILL.md")
+            opening = [n for n, _, text, _ in steps if "../open-pr/SKILL.md" in text]
+            last = steps[-1]
+            self.assertEqual(opening, [last[0]], skill)
+            self.assertTrue(last[3], skill)
+            self.assertLessEqual({"rerun", "report"}, {" ".join(args) for _, _, args in gates.named(last[2])}, skill)
 
     def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
         mandatory = self.gated_mandatory_steps("plan-feature")

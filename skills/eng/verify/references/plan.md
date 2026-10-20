@@ -4,16 +4,28 @@ Write the plan before the design, with the requirements. A pass predicate and a 
 
 Write it as `plan.md` in the verification directory that `python3 ../scripts/verify.py where` prints (a path beside this file's folder), from `plan-template.md` beside this file. `verify.py plan` checks its shape, and the playbook step that writes the plan closes only when that passes, so a check without a predicate or a plan without a perf decision cannot reach a verifier.
 
+## Terms
+
+- **Check.** One acceptance condition, written in the plan before any code and locked. Its fields are Scenario, Surface, Evidence, Pass, Oracle, and Tier.
+- **Verify.** Proving the checks: an agent that did not write the code runs every check and records PASS, FAIL, or INCONCLUSIVE with its evidence in `report.md`.
+- **Tier.** How a check is proved, one of:
+  - `e2e`: isolation, permissions, revocation, wire compatibility, perf budgets, and cross-surface flows, what a unit test cannot see and what costs most when broken. Proved by a zero-argument `<id>.check.<ext>` script the verifier writes and `verify.py rerun` runs on the real app. It is the regression net later phases regrade with `rerun` and `carry`.
+  - `unit`: logic. Proved by a spec the executor writes, graded fail-first by `verify.py units`, with the check id in its test title so `units` records which spec proves it.
+  - `walk`: UI look and interaction. The verifier walks it once on the real app and saves a screenshot or video in `evidence/<id>/`; no script.
+
+Pick `e2e` only where its definition holds, because each script is an instance started on every rerun; logic a spec can reach is `unit`.
+
 ## Checks
 
-Each check has four parts:
+Each check has five parts:
 
 - **Scenario.** One user-visible behavior in user terms, with a concrete input and starting state.
 - **Surface.** Where a user meets the behavior, from the table below.
 - **Evidence.** The artifact that proves it: a screenshot, a video, a terminal transcript, a response body, a value read back.
 - **Pass.** A predicate another agent can check against that evidence with no judgment call. "The export parses as JSON and holds 3 rows" is a predicate. "Export works" is not.
+- **Tier.** `e2e`, `unit`, or `walk`, per the Terms above. `verify.py plan` refuses a check without one and prints the count per tier, and the `report` gate holds a PASS to its tier's evidence.
 
-When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement.
+When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement. Its Tier is `e2e`, a script that diffs the implemented signatures against the skeleton, so later phases regrade it by rerun.
 
 A check can also name a **Seed**: the dataset it starts from. Name one whenever the scenario needs data to exist, because a page with no data proves nothing about how it shows data.
 
@@ -21,7 +33,7 @@ A check can also name a **Seed**: the dataset it starts from. Name one whenever 
 
 When a check's result is computed from data (a total, count, sum, average, rate, ranking, filter, or any analytics number), the author's own reading of the screen is not proof: whoever wrote or watched the code sees what they expect. Split it between two agents that never see each other's work. An oracle reads only the spec and the seed data and writes the expected value. An observer reads the actual value from the running app and never sees the expected one. A script compares the two. A mismatch is a code bug, an oracle misreading, or an ambiguous spec, and an ambiguous spec is a product decision for the user.
 
-Every check states its **Oracle**, and `verify.py plan` refuses a check without one, so the decision is made per check and shows in the plan. An oracle check adds three fields:
+Every check states its **Oracle**, and `verify.py plan` refuses a check without one, so the decision is made per check and shows in the plan. An oracle check's value is read from the running app, so its Tier is `e2e` or `walk`. It adds three fields:
 
 - **Oracle.** The spec's definition of the value, in words precise enough to compute by hand: what is counted, over which rows, in which time zone, how ties and empties behave. For a check whose result is not computed from data, write `n/a: <why>`; a reviewer reads these, so a computed value marked n/a stands out.
 - **Seed.** The dataset the value is computed from. Make it small enough to compute by hand and shaped to catch the likely mistakes: boundary dates, refunds, duplicates, empty groups, ties.
@@ -32,11 +44,11 @@ Cover:
 
 1. **Behavior.** Every behavior the change adds or alters, including the edges settled with the user: empty input, errors, boundaries, permissions.
 2. **Regression.** The load-bearing existing behavior the change could break, run on the base (main, or the previous phase's tip in a stacked feature) and on head. Name what must stay identical, such as byte-identical output or the same screen. When main lacks the feature, say so and gate head on its own predicates.
-3. **Unit.** Tests for logic with a cheap local test path, written to fail before the change and pass after. Assert behavior per the Test Behavior, Not Implementation principle (`../../principles/references/principles/test-behavior-not-implementation.md`). Prefer no new test over a test of mocks, timing, or internals. Tests are one part of the plan, never all of it. Grade fail-first with `python3 ../scripts/verify.py units`: each spec file added or changed in the range, which defaults to the merge-base with the default branch through HEAD, fails on base plus the spec and passes at head, never judged from commit order, so commits group freely and no history is rewritten for evidence. A spec that already passes on base must be a regression guard in its own spec file containing the marker `regression-guard`. Compile-time type tests, import guards, and regression tests that pin behavior main already has cannot fail first: they land in the commit with the code they guard and are exempt from the fail-first predicate, so say so in the check.
+3. **Unit.** Unit-tier checks for logic with a cheap local test path, each a spec written to fail before the change and pass after, with the check id in its test title. Assert behavior per the Test Behavior, Not Implementation principle (`../../principles/references/principles/test-behavior-not-implementation.md`). Prefer no new test over a test of mocks, timing, or internals. Tests are one part of the plan, never all of it. Grade fail-first with `python3 ../scripts/verify.py units`: each spec file added or changed in the range, which defaults to the merge-base with the default branch through HEAD, fails on base plus the spec and passes at head, never judged from commit order, so commits group freely and no history is rewritten for evidence. A spec that already passes on base must be a regression guard in its own spec file containing the marker `regression-guard`. Compile-time type tests, import guards, and regression tests that pin behavior main already has cannot fail first: they land in the commit with the code they guard and are exempt from the fail-first predicate, so say so in the check.
 
 ## Perf
 
-Every plan decides its perf acceptance, because a correct result that is too slow still fails the user, and nobody measures what nobody asked for. For each path a user waits on that the change adds or alters (a page becoming usable, a command returning, a job finishing, a request answering), write one perf check, but only where the change adds work the user waits on or work that scales with data:
+Every plan decides its perf acceptance, because a correct result that is too slow still fails the user, and nobody measures what nobody asked for. For each path a user waits on that the change adds or alters (a page becoming usable, a command returning, a job finishing, a request answering), write one perf check, but only where the change adds work the user waits on or work that scales with data. A perf check is always `e2e`: its script measures main and head and compares against the Rule itself, and runs alone after the other scripts.
 
 - **Path.** The wait as the user experiences it, at a stated, realistic data size.
 - **Metric.** What is measured. Prefer a count (queries, requests, bytes, renders) when it captures the cost, because counts carry no run-to-run noise. Add a timing for the wait itself.
@@ -60,6 +72,10 @@ Propose the budgets from the user's stated expectations, comparable paths in the
 | Performance | A benchmark | Interleave main and head, vetted with the benchmark-checklist skill |
 
 A check that compares against a baseline treats the baseline as the spec. Capture it before the change, and never edit the baseline, the harness, or the component to make a diff pass. If the baseline looks wrong, stop and ask.
+
+## Exploration timebox
+
+A fresh explorer tries to break the change for at most 20 minutes, and the `report` gate refuses the evidence in `evidence/explore/` when it spans longer. A plan that needs a longer box says so with a line above `## Checks`, such as `- Exploration: 30 minutes`; it is a budget like any other, so the user decides it.
 
 ## Revising the plan
 

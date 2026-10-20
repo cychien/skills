@@ -34,6 +34,7 @@ CHECKS = """\
     - Evidence: the terminal transcript
     - Pass: stdout parses as JSON and holds 3 records
     - Oracle: n/a: the output format is checked, no value is computed
+    - Tier: e2e
     """
 PERF_NA = "\n## Perf\n\nn/a: only the help text changes, nothing a user waits on\n"
 PERF_MAIN = """
@@ -63,6 +64,31 @@ REPORT = """\
     ## Exploration
 
     none found
+
+    ## Review
+
+    none found
+    """
+
+UNIT = """
+    ### U1. Multiplying two numbers
+
+    - Scenario: mul(2, 3) in the calc module
+    - Surface: the calc module
+    - Evidence: units.log
+    - Pass: mul(2, 3) returns 6
+    - Oracle: n/a: a fixed product, no data is read
+    - Tier: unit
+    """
+WALK = """
+    ### W1. The export button sits beside Share
+
+    - Scenario: open a project with 3 notes at 390 px width
+    - Surface: a real browser
+    - Evidence: evidence/W1/
+    - Pass: the Export button renders right of Share, on one line
+    - Oracle: n/a: layout only, no value is computed
+    - Tier: walk
     """
 
 
@@ -136,9 +162,15 @@ class Verify(unittest.TestCase):
         self.write("plan.md", plan(CHECKS, CHECKS.split("## Checks\n")[1], PERF_NA))
         self.assertIn("used more than once", self.run_verify("plan", ok=False))
 
+    def passing_scripts(self, *ids):
+        for check_id in ids:
+            self.check_script(f"{check_id}.check.sh", "exit 0\n")
+        self.run_verify("rerun")
+
     def ready_report(self):
         self.write("plan.md", plan(CHECKS, PERF_MAIN))
         self.run_verify("freeze")
+        self.passing_scripts("B1", "P1")
         self.write("B1-terminal.txt", "[{...}]\n")
         self.write("P1-runs.txt", "41 ms\n")
         self.write("report.md", plan(REPORT))
@@ -264,17 +296,19 @@ class Verify(unittest.TestCase):
     - Oracle: revenue is the sum of quantity times unit price over orders placed in the month, refunds excluded
     - Seed: tiers dataset
     - Shape: {"<tier>": <revenue in cents>}
+    - Tier: e2e
     """
 
     def oracle_plan(self, oracle=ORACLE):
         self.write("plan.md", plan(CHECKS, oracle, PERF_NA))
 
     def test_every_check_states_its_oracle(self):
-        self.oracle_plan(self.ORACLE.split("    - Oracle:")[0])
+        bare = self.ORACLE.split("    - Oracle:")[0] + "    - Tier: e2e\n"
+        self.oracle_plan(bare)
         self.assertIn("missing '- Oracle:'", self.run_verify("plan", ok=False))
-        self.oracle_plan(self.ORACLE.split("    - Oracle:")[0] + "    - Oracle: n/a: x\n")
+        self.oracle_plan(bare + "    - Oracle: n/a: x\n")
         self.assertIn("Oracle n/a needs a reason", self.run_verify("plan", ok=False))
-        self.oracle_plan(self.ORACLE.split("    - Oracle:")[0] + "    - Oracle: n/a: the page only echoes a stored total\n")
+        self.oracle_plan(bare + "    - Oracle: n/a: the page only echoes a stored total\n")
         self.run_verify("plan")
         self.oracle_plan(self.ORACLE.replace("    - Seed: tiers dataset\n", ""))
         self.assertIn("missing '- Seed:'", self.run_verify("plan", ok=False))
@@ -299,6 +333,7 @@ class Verify(unittest.TestCase):
     def test_report_compares_observed_with_expected(self):
         self.oracle_plan()
         self.run_verify("freeze")
+        self.passing_scripts("B1", "A1")
         self.write("B1-terminal.txt", "[{...}]\n")
         self.write("A1.expected.json", '{"wholesale": 1200, "retail": 300}')
         self.write("A1.observed.json", '{"wholesale": 1200, "retail": 310}')
@@ -374,6 +409,132 @@ class Verify(unittest.TestCase):
         self.assertRegex(out, r"PASS\s+B2")
         self.assertNotIn("B1-own", out)
         self.assertNotIn("evidence/B1", out)
+
+    def test_every_check_names_its_tier_and_the_plan_counts_them(self):
+        self.write("plan.md", plan(CHECKS, UNIT, WALK, PERF_MAIN))
+        self.assertIn("plan ok, 4 checks, 0 oracle checks; tiers: e2e 2, unit 1, walk 1", self.run_verify("plan"))
+        self.write("plan.md", plan(CHECKS.replace("    - Tier: e2e\n", ""), PERF_NA))
+        out = self.run_verify("plan", ok=False)
+        self.assertIn("missing '- Tier:'; write e2e (isolation, permissions, revocation, wire compatibility, perf, or a cross-surface flow", out)
+        self.assertIn("unit (logic: a spec the executor writes, graded by `verify.py units`)", out)
+        self.write("plan.md", plan(CHECKS.replace("Tier: e2e", "Tier: smoke"), PERF_NA))
+        self.assertIn("Tier must be e2e, unit, or walk, not 'smoke'", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, PERF_MAIN.replace("    - Rule:", "    - Tier: walk\n    - Rule:")))
+        self.assertIn("a perf check is always e2e", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, self.ORACLE.replace("Tier: e2e", "Tier: unit"), PERF_NA))
+        self.assertIn("an oracle check reads its value from the running app, so its Tier is e2e or walk", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, PERF_NA).replace("## Checks", "- Exploration: half an hour\n\n## Checks"))
+        self.assertIn("Exploration must read '<n> minutes'", self.run_verify("plan", ok=False))
+
+    def b1_report(self):
+        self.write("plan.md", plan(CHECKS, PERF_NA))
+        self.run_verify("freeze")
+        self.write("B1-terminal.txt", "[{...}]\n")
+        self.write("report.md", plan(REPORT).replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", ""))
+
+    def test_an_e2e_pass_needs_its_script_and_a_passing_rerun_after_the_freeze(self):
+        self.b1_report()
+        self.assertIn("B1 is an e2e check marked PASS, but no B1.check.<ext> script is saved", self.run_verify("report", ok=False))
+        self.check_script("B1.check.sh", "echo 3 records\nexit 0\n")
+        self.assertIn("B1.rerun.log is missing or predates the frozen plan", self.run_verify("report", ok=False))
+        self.run_verify("rerun")
+        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "3 records\nrerun: PASS\n")
+        os.utime(self.dir / "B1.rerun.log", (1, 1))
+        self.assertIn("B1.rerun.log is missing or predates the frozen plan", self.run_verify("report", ok=False))
+        self.check_script("B1.check.sh", "echo 2 records\nexit 1\n")
+        self.run_verify("rerun", ok=False)
+        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "2 records\nrerun: FAIL (exit 1)\n")
+        self.assertIn("B1.rerun.log records a failing run; a PASS needs a passing `verify.py rerun`", self.run_verify("report", ok=False))
+        self.write("report.md", plan(REPORT).replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
+                   .replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |", "| B1 | FAIL | B1.rerun.log | defect: 2 records |"))
+        self.run_verify("report")
+
+    def test_a_walk_pass_needs_a_screenshot_or_video_in_its_evidence_folder(self):
+        self.write("plan.md", plan("# Verification plan: export button\n\n## Checks\n", WALK, PERF_NA))
+        self.run_verify("freeze")
+        report = plan(REPORT).replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |\n", "").replace(
+            "| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |", "| W1 | PASS | evidence/W1/ | Export right of Share |")
+        self.write("report.md", report)
+        folder = self.dir / "evidence" / "W1"
+        folder.mkdir(parents=True)
+        (folder / "notes.txt").write_text("walked at 390 px\n")
+        self.assertIn("W1 is a walk check marked PASS, but evidence/W1/ holds no screenshot or video written after the freeze",
+                      self.run_verify("report", ok=False))
+        (folder / "walk.mov").write_text("")
+        self.assertIn("holds no screenshot or video", self.run_verify("report", ok=False))
+        (folder / "share-row.PNG").write_text("png")
+        self.assertIn("report ok: 1 checks", self.run_verify("report"))
+
+    def explore(self, *minutes):
+        folder = self.dir / "evidence" / "explore"
+        folder.mkdir(parents=True, exist_ok=True)
+        start = time.time() - 3600
+        for n, at in enumerate(minutes):
+            path = folder / f"finding-{n}.png"
+            path.write_text("png")
+            os.utime(path, (start + at * 60, start + at * 60))
+
+    def test_exploration_evidence_must_fit_its_timebox(self):
+        self.ready_report()
+        self.explore(0, 12, 19)
+        self.run_verify("report")
+        self.explore(0, 12, 19, 25)
+        self.assertIn("exploration ran 25 minutes by its files in evidence/explore/, past its 20-minute timebox",
+                      self.run_verify("report", ok=False))
+        self.write("plan.md", plan(CHECKS, PERF_MAIN).replace("## Checks", "- Exploration: 30 minutes\n\n## Checks"))
+        self.run_verify("freeze", "--revision", "exploration box raised to 30 minutes for the sync flows; agreed by the user")
+        self.run_verify("report")
+
+    def test_the_report_needs_a_triaged_code_review_written_after_the_freeze(self):
+        self.ready_report()
+        without = plan(REPORT).split("## Review")[0]
+        self.write("report.md", without)
+        self.assertIn("missing the code review: a '## Review' section in report.md or review.md", self.run_verify("report", ok=False))
+        self.write("report.md", without + "## Review\n\n- src/auth.ts:42 a revoked token still reads the old account's rows.\n")
+        self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
+        self.write("report.md", without)
+        finding = "- src/auth.ts:42 a revoked token still reads the old account's rows."
+        self.write("review.md", f"# Code review\n\nHead: abc123\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\n{finding}\n")
+        self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
+        self.write("review.md", f"# Code review\n\n## Review\n\n{finding} Triage: new check, R1 proves revocation\n")
+        self.run_verify("report")
+        self.write("report.md", without + "## Review\n\nIn review.md.\n")
+        self.write("review.md", f"# Code review\n\n{finding}\n")
+        self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
+        self.write("review.md", f"# Code review\n\n{finding} Triage: dismissed, the token check runs first on line 30\n")
+        self.run_verify("report")
+        os.utime(self.dir / "review.md", (1, 1))
+        self.assertIn("the review in review.md predates the frozen plan", self.run_verify("report", ok=False))
+
+    FAIL_REPORT = "| Check | Verdict | Evidence | Observed |\n|---|---|---|---|\n| B2 | FAIL | B2.rerun.log | defect: 2 rows, expected 3 |\n"
+
+    def test_a_check_the_report_marks_fail_gets_two_failed_fix_attempts_then_rerun_only_refuses(self):
+        self.check_script("B1.check.sh", "exit 0\n")
+        self.check_script("B2.check.sh", "echo still 2 rows\nexit 1\n")
+        self.assertNotIn("fix attempt", self.run_verify("rerun", "--only", "B2", ok=False))
+        self.assertFalse((self.dir / "fix-attempts.json").exists())
+        self.write("report.md", self.FAIL_REPORT)
+        self.assertIn("fix attempt 1 of 2 for B2 failed\n", self.run_verify("rerun", "--only", "B2", ok=False))
+        self.assertIn("fix attempt 2 of 2 for B2 failed; that was the last one, so the next rerun --only refuses it",
+                      self.run_verify("rerun", "--only", "B2", ok=False))
+        out = self.run_verify("rerun", "--only", "B2", ok=False)
+        self.assertIn("B2 failed 2 fix attempts since report.md marked them FAIL, the whole fix budget", out)
+        self.assertIn("in an autonomous run put it in the project's backlog with the fix you recommend and leave it FAIL", out)
+        self.assertNotIn("still 2 rows", out)
+        self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 2})
+        out = self.run_verify("rerun")
+        self.assertRegex(out, r"FAIL\s+B2 .*left FAIL: its fix budget is spent and report.md marks it FAIL; exit 1")
+        self.assertIn("rerun: 2 checks, 1 PASS, 1 FAIL (1 left FAIL after the fix budget)", out)
+        self.check_script("B1.check.sh", "exit 1\n")
+        self.assertIn("rerun: 2 checks, 0 PASS, 2 FAIL (1 left FAIL after the fix budget)", self.run_verify("rerun", ok=False))
+
+    def test_a_fix_that_passes_spends_nothing(self):
+        self.check_script("B2.check.sh", "exit 1\n")
+        self.write("report.md", self.FAIL_REPORT)
+        self.run_verify("rerun", "--only", "B2", ok=False)
+        self.check_script("B2.check.sh", "exit 0\n")
+        self.assertNotIn("fix attempt", self.run_verify("rerun", "--only", "B2"))
+        self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 1})
 
     def test_decision_log_needs_its_header_and_a_verdict_per_attempt(self):
         header = "id\thypothesis\tchange\tbefore\tafter\tdelta\tgate\tverdict\tnote\n"
@@ -456,6 +617,8 @@ class Driver(unittest.TestCase):
         def run(*a):
             return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
         run("freeze")
+        (d / "B1.check.sh").write_text("exit 0\n")
+        run("rerun")
         (d / "B1-terminal.txt").write_text("[{...}]\n")
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
@@ -475,6 +638,8 @@ class Driver(unittest.TestCase):
         def run(*a):
             return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
         run("freeze")
+        (d / "B1.check.sh").write_text("exit 0\n")
+        run("rerun")
         (d / "B1-terminal.txt").write_text("[{...}]\n")
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
@@ -595,6 +760,15 @@ class RerunStamp(unittest.TestCase):
         self.assertEqual((self.dir / "rerun.stamp.json").read_text(), stamp)
         self.assertIn("nothing changed", self.rerun())
 
+    def test_a_check_left_fail_after_its_fix_budget_passes_the_full_rerun_and_shows_in_the_stamp(self):
+        self.script("B2.check.sh", "exit 1\n")
+        (self.dir / "report.md").write_text("| Check | Verdict | Evidence | Observed |\n|---|---|---|---|\n| B2 | FAIL | B2.rerun.log | defect: x |\n")
+        self.rerun("--only", "B2", ok=False)
+        self.rerun("--only", "B2", ok=False)
+        self.assertIn("rerun: 2 checks, 1 PASS, 1 FAIL (1 left FAIL after the fix budget)", self.rerun())
+        out = self.rerun()
+        self.assertRegex(out, r"^rerun: 2 checks passed at \S+ on this tree except B2, left FAIL after the fix budget; nothing changed since")
+
     def test_only_names_a_check_without_a_script(self):
         out = self.rerun("--only", "B9", ok=False)
         self.assertIn("no saved check script for B9; saved: B1", out)
@@ -610,6 +784,7 @@ class Phases(unittest.TestCase):
     - Evidence: K1-signatures.diff
     - Pass: the diff against skeleton.patch is empty, or each difference is in the design addendum with the user's agreement
     - Oracle: n/a: compares signatures, no value is computed
+    - Tier: e2e
     - Skeleton: src/export.ts: exportJson, ExportOptions
     """
 
@@ -923,6 +1098,56 @@ class Units(RepoFixture):
         self.units()
         self.assertEqual(self.git("worktree", "list").count("\n"), 0)
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+
+class UnitTier(RepoFixture):
+    def report(self, ok=True):
+        head = self.rev()
+        (self.where / "report.md").write_text(textwrap.dedent(f"""\
+            # Verification report: mul
+
+            Head: {head[:12]}
+            Main: {self.base[:12]}
+            Author: claude:claude-sonnet-5-5
+            Verifier: claude:claude-opus-5-5
+
+            | Check | Verdict | Evidence | Observed |
+            |---|---|---|---|
+            | U1 | PASS | units.log | the spec fails on base and passes at head |
+
+            ## Exploration
+
+            none found
+
+            ## Review
+
+            none found
+            """))
+        return self.verify("report", ok=ok)
+
+    def named_spec(self, body):
+        return f"import unittest\n{self.NEW}\n\n\nclass T(unittest.TestCase):\n    def test_U1_mul_multiplies(self):\n        {body}\n"
+
+    def test_a_unit_pass_needs_a_passing_units_run_on_head_whose_spec_names_the_check(self):
+        self.where = pathlib.Path(self.verify("where").strip())
+        (self.where / "plan.md").write_text(plan("# Verification plan: mul\n\n## Checks\n", UNIT, PERF_NA))
+        self.verify("lock")
+        self.feature(test_mul=self.spec(self.NEW, self.NEW_BODY))
+        self.assertIn("U1 is a unit check marked PASS, but no `verify.py units` result is recorded", self.report(ok=False))
+        self.units()
+        self.assertIn("no spec in the last `verify.py units` run names U1; put the check id in the title of the test that proves it",
+                      self.report(ok=False))
+        self.put("tests/test_mul.py", self.named_spec(self.NEW_BODY))
+        self.commit("Name the check the mul spec proves")
+        self.assertIn("the last `verify.py units` ran on another tree than HEAD", self.report(ok=False))
+        self.units()
+        self.assertEqual(json.loads((self.where / "units.json").read_text())["specs"], {"tests/test_mul.py": {"verdict": "ok", "checks": ["U1"]}})
+        self.assertIn("report ok: 1 checks", self.report())
+        self.put("tests/test_mul.py", self.named_spec("self.assertEqual(mul(2, 3), 7)"))
+        self.commit("Break the mul spec")
+        self.units(ok=False)
+        self.assertIn("FAILS AT HEAD  tests/test_mul.py", (self.where / "units.log").read_text())
+        self.assertIn("the last `verify.py units` run failed", self.report(ok=False))
 
 
 def alive(pid):
@@ -1239,79 +1464,6 @@ class RunGroup(unittest.TestCase):
         tree.mkdir()
         ok, tail = verify.run_spec(tree, 'printf "%s" "$pnpm_config_verify_deps_before_run"', 30)
         self.assertEqual((ok, tail.strip()), (True, "false"))
-
-
-class Commits(RepoFixture):
-    TESTS = f"{shlex.quote(sys.executable)} -m unittest discover -s tests"
-
-    def commits(self, *args, ok=True):
-        return self.verify("commits", "--cmd", self.TESTS, *args, ok=ok)
-
-    def test_each_commit_gets_a_verdict_and_a_broken_one_fails_the_run(self):
-        self.feature(test_mul=self.spec(self.NEW, self.NEW_BODY))
-        self.put("calc.py", "def add(a, b):\n    return 0\n\n\ndef mul(a, b):\n    return a * b\n")
-        self.commit("Break add")
-        broken = self.rev()
-        self.put("calc.py", "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n")
-        self.commit("Fix add")
-        out = self.commits(ok=False)
-        lines = [line for line in out.splitlines() if line.startswith(("PASS", "FAIL"))]
-        self.assertEqual([line.split()[0] for line in lines], ["PASS", "FAIL", "PASS"])
-        self.assertIn(broken[:12], lines[1])
-        self.assertIn("Break add", lines[1])
-        self.assertIn("commits: 3 checked, 2 PASS, 1 FAIL", out)
-
-    def test_an_explicit_range_limits_the_commits(self):
-        self.feature(test_mul=self.spec(self.NEW, self.NEW_BODY))
-        self.put("README.md", "docs\n")
-        self.commit("Docs")
-        out = self.commits(f"{self.base}..HEAD~1")
-        self.assertIn("Add mul", out)
-        self.assertNotIn("Docs", out)
-
-    def test_a_spec_only_commit_reports_its_result_without_failing_the_run(self):
-        self.feature()
-        self.put("tests/test_mul.py", self.spec(self.NEW, "self.assertEqual(mul(2, 3), 7)"))
-        self.commit("Pin multiplication")
-        out = self.commits()
-        self.assertRegex(out, r"FAIL .*Pin multiplication.*spec-only")
-        self.assertIn("commits: 2 checked", out)
-        self.put("tests/test_other.py", self.spec(self.NEW, "self.assertEqual(mul(2, 3), 7)"))
-        self.put("README.md", "docs\n")
-        self.commit("test: red spec with docs")
-        self.assertRegex(self.commits(), r"FAIL .*test: red spec with docs.*spec-only")
-
-    def test_a_hung_commit_times_out_and_leaves_no_process(self):
-        self.feature()
-        pidfile = pathlib.Path(self.tmp.name) / "pid"
-        hang = f"sleep 20 & echo $! > {shlex.quote(str(pidfile))}; wait"
-        out = self.verify("commits", "--cmd", hang, "--timeout", "1", ok=False)
-        self.assertRegex(out, r"FAIL .*Add mul.*timed out after 1s")
-        self.assertTrue(gone(int(pidfile.read_text())))
-        self.assertEqual(self.git("worktree", "list").count("\n"), 0)
-
-    def test_a_process_left_running_by_a_commit_fails_it_and_is_killed(self):
-        self.feature()
-        pidfile = pathlib.Path(self.tmp.name) / "pid"
-        spawn = "import subprocess, sys; p = subprocess.Popen(['sleep', '20'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); open(sys.argv[1], 'w').write(str(p.pid))"
-        out = self.verify("commits", "--cmd", f"{shlex.quote(sys.executable)} -c {shlex.quote(spawn)} {shlex.quote(str(pidfile))}", ok=False)
-        self.assertRegex(out, r"FAIL .*Add mul.*leftover")
-        self.assertTrue(gone(wait_for_file(pidfile)))
-
-    def test_the_typecheck_runs_first_and_a_failure_skips_the_tests(self):
-        self.feature()
-        marker = pathlib.Path(self.tmp.name) / "tests-ran"
-        out = self.verify("commits", "--typecheck", "exit 3", "--cmd", f"touch {shlex.quote(str(marker))}", ok=False)
-        self.assertRegex(out, r"FAIL .*Add mul.*typecheck")
-        self.assertFalse(marker.exists())
-
-    def test_an_empty_range_is_an_error(self):
-        self.assertIn("no commits", self.verify("commits", "--cmd", "true", ok=False))
-
-    def test_the_test_command_is_detected_when_not_given(self):
-        self.feature(test_mul=self.spec(self.NEW, self.NEW_BODY))
-        out = self.verify("commits")
-        self.assertIn("commits: 1 checked, 1 PASS, 0 FAIL", out)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,12 @@ SPAWN_TOOLS = {"agent", "task"}
 LEFTOVERS_TIMEOUT = 30
 LEFTOVERS_DENIED = ("Processes from earlier delegates or tasks are still running. Spawning another agent on top of them hides which one "
                     "caused any later problem and burns the machine. Stop them, then spawn again.\n")
+BACKGROUND_DENIED = ("A subagent cannot run an agent in the background: when your turn ends, the harness kills your background children "
+                     "mid-work. Run it in the foreground; for parallel work, put several foreground Agent calls in one message.")
+TODO_CLI = re.compile(r"guard\.py['\"]?\s+(?:todo\b|\"\$@\")")
+OWN_LIST = ("You are a subagent, and guard keeps your todo list apart from your lead's, so your items never land in its list and "
+            "only your own list holds your turn. Add `--agent {agent_id}` to every guard todo command, after `--session`:\n"
+            "   {cmd} todo from <skill> {sess}")
 
 
 def expand(text, variables):
@@ -77,13 +83,10 @@ def headless():
     return False
 
 
-def cli(session_ref):
+def cli(event):
     script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "guard.py")
-    return f"python3 {shlex.quote(script)}", f"--session {shlex.quote(session_ref)}"
-
-
-def session_ref(event):
-    return f"{event.agent}:{event.session}"
+    flags = f"--session {shlex.quote(f'{event.agent}:{event.session}')}"
+    return f"python3 {shlex.quote(script)}", flags + (f" --agent {shlex.quote(event.agent_id)}" if event.agent_id else "")
 
 
 def handle(event):
@@ -97,11 +100,13 @@ def handle(event):
         return on_post_tool(event)
     if event.kind == "stop" and not event.agent_id:
         return on_stop(event)
+    if event.kind in ("stop", "subagent_stop") and event.agent_id:
+        return on_subagent_stop(event)
     return PASS
 
 
 def todo_hint(skill, event):
-    cmd, sess = cli(session_ref(event))
+    cmd, sess = cli(event)
     return f"""Decide the todo list before any other tool call, because the {skill} skill you are about to follow has steps. Copy them in verbatim, then add task-specific items:
    {cmd} todo from {skill} {sess}
    {cmd} todo add "<item>" ["<item>" ...] {sess}
@@ -215,7 +220,9 @@ def on_post_tool(event):
     if not loaded and not read and not state.exists(event.agent, event.session):
         return PASS
     with state.update(event.agent, event.session) as data:
-        data["activity"] = data.get("activity", 0) + 1
+        own = data.get("agents", {}).get(event.agent_id) if event.agent_id else data
+        if own is not None:
+            own["activity"] = own.get("activity", 0) + 1
         for name in loaded:
             if name not in data["skills"]:
                 data["skills"].append(name)
@@ -238,10 +245,16 @@ def on_pre_tool(event):
     if unfilled:
         return "deny", ("This subagent prompt comes from a skill's prompt template but still holds unfilled placeholders: "
                         + ", ".join(unfilled) + ". Fill each one, then send it again.")
+    spawn = (event.tool or "").lower() in SPAWN_TOOLS
+    if spawn and event.agent_id and isinstance(event.tool_input, dict) and event.tool_input.get("run_in_background") is True:
+        return "deny", BACKGROUND_DENIED
+    if event.agent_id and runs_todo(command) and not re.search(rf"--agent[ =]['\"]?{re.escape(event.agent_id)}(?![\w-])", command):
+        cmd, sess = cli(event)
+        return "deny", OWN_LIST.format(agent_id=event.agent_id, cmd=cmd, sess=sess)
     spent = verifiers.over_budget(prompt)
     if spent:
         return "deny", spent
-    if (event.tool or "").lower() in SPAWN_TOOLS:
+    if spawn:
         swept = sweep_leftovers(event)
         if swept and swept[0] == 1:
             return "deny", LEFTOVERS_DENIED + swept[1]
@@ -262,6 +275,12 @@ def on_pre_tool(event):
     if not found:
         return PASS
     return "deny", "The open-pr skill's PR rules reject this command:\n- " + "\n- ".join(found) + "\nFix the command and run it again."
+
+
+def runs_todo(command):
+    """Whether the command runs guard's todo CLI, directly or through a shell function passing "$@"; text in a heredoc or quotes does not."""
+    bare = QUOTED.sub(lambda m: m.group(0) if m.group(0) == '"$@"' else "", HEREDOC.sub("", command))
+    return bool(TODO_CLI.search(bare))
 
 
 def polls_for_subagent(command):
@@ -366,26 +385,43 @@ def on_stop(event):
     needs_reply = [name for name, path in sources.items() if "../reply/SKILL.md" in (skills.read(path) or "")]
     if needs_reply and data["todo"] and not state.unresolved(data) and "reply" not in data["skills"]:
         problems.append(f"The `{needs_reply[0]}` skill asks for its reply per the reply skill. Read `../reply/SKILL.md` beside it and write the reply that way.")
-    items = state.open_items(data)
-    mandatory = [i for i in items if i["mandatory"]]
-    asking = bool(QUESTION_END.search(CODE.sub("", message).strip()))
-    if items and not problems and event.waiting_on_background and headless():
+    problems += open_item_problems(event, message, data, others=bool(problems))
+    return ("block", "\n\n".join(problems)) if problems else PASS
+
+
+def on_subagent_stop(event):
+    """A subagent's turn holds only on its own list; the lead's items are the lead's."""
+    if not state.exists(event.agent, event.session):
+        return PASS
+    problems = open_item_problems(event, event.last_message or "", state.load(event.agent, event.session), others=False)
+    return ("block", "\n\n".join(problems)) if problems else PASS
+
+
+def open_item_problems(event, message, data, others):
+    """Why the turn cannot end while this agent's own list has open items; others says whether other problems block it already."""
+    items = state.open_items(state.own_list(data, event.agent_id))
+    if not items:
+        return []
+    problems = []
+    if not others and event.waiting_on_background and headless():
         problems.append("This session is non-interactive, so ending the turn ends the process and kills the background work "
                         "it is waiting on. Wait for that work in the foreground, finish the open items, then end the turn.")
-    if items and not problems and (asking or event.waiting_on_background):
-        return PASS
-    if items:
-        with state.update(event.agent, event.session) as d:
-            idle = d.get("activity", 0) == d.get("activity_at_block", -1)
-            d["idle_blocks"] = d.get("idle_blocks", 0) + 1 if idle else 0
-            d["activity_at_block"] = d.get("activity", 0)
-            idle_blocks = d["idle_blocks"]
-        if idle_blocks < IDLE_LIMIT or mandatory:
-            cmd, sess = cli(session_ref(event))
-            lines = ["The todo list has open items:"] + [f"   {i['n']}. {i['title']}" for i in items]
-            problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> {sess}`, or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. To end the turn on a question only the user can answer, even one asked in plain text after they declined a question tool, first mark the items that wait on the answer with `{cmd} todo wait <n> {sess} --reason \"<what the user must answer>\"`; they reopen when the user replies.")
-        if idle_blocks >= IDLE_LIMIT and mandatory:
-            problems.append("Item(s) {} are mandatory, so stopping repeatedly does not release them. If something outside your control "
-                            "keeps one from closing, ask the user a question that names the item and what blocks it.".format(
-                                ", ".join(str(i["n"]) for i in mandatory)))
-    return ("block", "\n\n".join(problems)) if problems else PASS
+    asking = bool(QUESTION_END.search(CODE.sub("", message).strip()))
+    if not others and not problems and (asking or event.waiting_on_background):
+        return []
+    with state.update(event.agent, event.session) as d:
+        own = state.own_list(d, event.agent_id)
+        idle = own.get("activity", 0) == own.get("activity_at_block", -1)
+        own["idle_blocks"] = own.get("idle_blocks", 0) + 1 if idle else 0
+        own["activity_at_block"] = own.get("activity", 0)
+        idle_blocks = own["idle_blocks"]
+    mandatory = [i for i in items if i["mandatory"]]
+    if idle_blocks < IDLE_LIMIT or mandatory:
+        cmd, sess = cli(event)
+        lines = ["The todo list has open items:"] + [f"   {i['n']}. {i['title']}" for i in items]
+        problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> {sess}`, or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. To end the turn on a question only the user can answer, even one asked in plain text after they declined a question tool, first mark the items that wait on the answer with `{cmd} todo wait <n> {sess} --reason \"<what the user must answer>\"`; they reopen when the user replies.")
+    if idle_blocks >= IDLE_LIMIT and mandatory:
+        problems.append("Item(s) {} are mandatory, so stopping repeatedly does not release them. If something outside your control "
+                        "keeps one from closing, ask the user a question that names the item and what blocks it.".format(
+                            ", ".join(str(i["n"]) for i in mandatory)))
+    return problems

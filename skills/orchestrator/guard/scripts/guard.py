@@ -10,6 +10,8 @@ usage:
   guard.py todo none --reason TEXT [--session AGENT:ID]  this task needs no list
   guard.py todo list [--session AGENT:ID]
   guard.py todo clear --reason TEXT [--session AGENT:ID] the user stopped the work
+
+A subagent adds --agent ID (its agent id, which guard names when it asks) to every command, so its list stays its own.
 """
 import argparse
 import os
@@ -42,8 +44,8 @@ def show(data):
     return "\n".join(lines)
 
 
-def resolve(data, n, status, note, not_run=()):
-    item = next((i for i in data["todo"] if i["n"] == n), None)
+def resolve(data, own, n, status, note, not_run=()):
+    item = next((i for i in own["todo"] if i["n"] == n), None)
     if not item:
         sys.exit(f"guard: the todo list has no item {n}.")
     if status == "skipped" and item["mandatory"]:
@@ -68,7 +70,7 @@ def resolve(data, n, status, note, not_run=()):
     message = f"Item {n} {status}."
     if status == "skipped":
         children = set(skills.SKILL_REF.findall(item["text"]))
-        dropped = [i for i in state.unresolved(data) if i["source"] in children]
+        dropped = [i for i in state.unresolved(own) if i["source"] in children]
         for child in dropped:
             child["status"], child["note"] = "skipped", f"item {n} that runs {child['source']} was skipped"
         if dropped:
@@ -100,18 +102,20 @@ def main():
     todo.add_parser("list")
     for p in todo.choices.values():
         p.add_argument("--session")
+        p.add_argument("--agent")
     args = parser.parse_args()
     agent, sid = session(args.session)
 
     if args.action == "list":
-        print(show(state.load(agent, sid)))
+        print(show(state.own_list(state.load(agent, sid), args.agent)))
         return
     if args.action == "wait":
-        ask = autonomy.ask_command(agent, sid)
-        if ask:
-            sys.exit(f"guard: this session is in an autonomous run, where the user is not available. Route the question with `{ask} --kind <kind> --question \"...\" --pick \"...\" --why \"...\" --confidence <level>` and keep working.")
+        run = autonomy.active_run(agent, sid)
+        if run and not autonomy.waiting_on_user(run):
+            sys.exit(f"guard: this session is in an autonomous run, where the user is not available. Route the question with `{autonomy.ask_command(run)} --kind <kind> --question \"...\" --pick \"...\" --why \"...\" --confidence <level>` and keep working. Once `ask` escalates it to the user, `todo wait` is allowed.")
     with state.update(agent, sid) as data:
-        decided = data.get("todo_undecided")
+        own = state.own_list(data, args.agent)
+        decided = own.get("todo_undecided")
         if decided and args.action in ("from", "add", "none"):
             data.setdefault("todo_decided", []).append(decided)
         if args.action == "from":
@@ -119,7 +123,7 @@ def main():
             steps = skills.steps(path) if path else []
             if not steps:
                 sys.exit(f"guard: found no steps in the {args.skill} skill. Add its steps with `todo add`, or run `todo none` if it has none.")
-            state.add_items(data, [t for _, _, t, _ in steps], source=args.skill, source_path=path,
+            state.add_items(own, [t for _, _, t, _ in steps], source=args.skill, source_path=path,
                             titles=[t for _, t, _, _ in steps], mandatory=[m for _, _, _, m in steps])
             if args.skill not in data["skills"]:
                 data["skills"].append(args.skill)
@@ -128,14 +132,14 @@ def main():
             flags = [t for t in args.text if t.startswith("-")]
             if flags:
                 sys.exit(f"guard: {flags[0]!r} looks like a flag, not an item. Put flags after the items, outside their quotes.")
-            state.add_items(data, args.text)
+            state.add_items(own, args.text)
             message = f"Added {len(args.text)} item(s)."
         elif args.action == "none":
-            data["todo_undecided"] = None
+            own["todo_undecided"] = None
             message = f"No todo list for this task: {args.reason}"
         elif args.action == "clear":
-            data["archived"].append({"cleared": args.reason, "items": data["todo"]})
-            data["todo"], data["todo_undecided"] = [], None
+            own["archived"].append({"cleared": args.reason, "items": own["todo"]})
+            own["todo"], own["todo_undecided"] = [], None
             message = f"Todo list cleared: {args.reason}. Say so in your final reply."
         else:
             status = {"done": "done", "skip": "skipped", "wait": "waiting"}[args.action]
@@ -144,20 +148,20 @@ def main():
             if args.action == "done" and not_run:
                 if not args.reason:
                     sys.exit("guard: --not-run needs --reason, the user reads why the skill did not run.")
-                named = {s for i in data["todo"] if i["n"] in args.n for s in skills.SKILL_REF.findall(i["text"])}
+                named = {s for i in own["todo"] if i["n"] in args.n for s in skills.SKILL_REF.findall(i["text"])}
                 stray = sorted(set(not_run) - named)
                 if stray:
                     sys.exit("guard: {} not named by the item(s) being closed.".format(", ".join(f"../{s}/SKILL.md" for s in stray)))
                 note = " - ".join(filter(None, [f"not run: {', '.join(not_run)}", args.reason, args.note]))
             elif args.action == "done" and args.reason:
                 sys.exit("guard: --reason on done only goes with --not-run. Use --note to annotate.")
-            message = "\n".join(resolve(data, n, status, note, not_run) for n in args.n)
-            if data["todo"] and not state.unresolved(data):
+            message = "\n".join(resolve(data, own, n, status, note, not_run) for n in args.n)
+            if own["todo"] and not state.unresolved(own):
                 message += "\nEvery item is resolved; list them with their marks in your final reply."
-            elif status == "waiting" and not state.open_items(data):
+            elif status == "waiting" and not state.open_items(own):
                 message += "\nEnd the turn now with your question in plain text. Waiting items reopen when the user replies."
-        data["activity"] = data.get("activity", 0) + 1
-        report = show(data)
+        own["activity"] = own.get("activity", 0) + 1
+        report = show(own)
     print(message)
     print(report)
 
