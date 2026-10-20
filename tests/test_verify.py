@@ -831,22 +831,37 @@ class Driver(unittest.TestCase):
         (d / "review.md").write_text(review + "\n## Fix review\n\n- app.py:3 paging skips the last row. Triage: dismissed, row 200 is the sentinel\n")
         out = report()
         self.assertEqual(out.returncode, 0, out.stdout)
-        os.utime(d / "review.md", (1, 1))
-        self.assertIn("the fix review in review.md predates the last fix commit", report().stdout)
+        (self.repo / "app.py").write_text("".join(f"print({n})\n" for n in range(201)))
+        self.git("add", "-A")
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "Fix the fix review's finding"], cwd=self.repo,
+                       check=True, capture_output=True, env={**os.environ, "GIT_COMMITTER_DATE": "2099-01-01T00:00:00Z"})
+        out = report()
+        self.assertEqual(out.returncode, 0, out.stdout)
 
-    def test_a_fix_on_a_sensitive_path_needs_a_fix_review_at_any_size(self):
-        d, report = self.reviewed_report("\n## Sensitive paths\n\n- `auth/`: sessions and tokens\n- `*.sql`: migrations\n")
-        (self.repo / "search.py").write_text("print('fixed')\n")
-        self.commit("Fix search")
-        self.assertEqual(report().returncode, 0)
+    def test_a_small_fix_on_a_sensitive_path_needs_no_fix_review(self):
+        d, report = self.reviewed_report("\n## Sensitive paths\n\n- `auth/`: sessions and tokens\n")
         (self.repo / "auth").mkdir()
         (self.repo / "auth" / "token.py").write_text("print('revoke')\n")
-        (self.repo / "db").mkdir()
-        (self.repo / "db" / "001.sql").write_text("select 1;\n")
         self.commit("Revoke the token on sign-out")
         out = report()
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+    def test_an_e2e_pass_needs_a_run_that_no_later_change_to_its_touches_made_stale(self):
+        d, report = self.reviewed_report()
+        self.assertEqual(report().returncode, 0)
+        ledger = json.loads((d / "rerun.ledger.json").read_text())["B1"]
+        (self.repo / "src" / "export").mkdir(parents=True)
+        (self.repo / "src" / "export" / "json.py").write_text("print('json')\n")
+        self.commit("Export JSON")
+        out = report()
         self.assertEqual(out.returncode, 1)
-        self.assertIn("touch the plan's Sensitive paths (auth/token.py, db/001.sql), so they need a fix review", out.stdout)
+        self.assertIn(f"B1 is an e2e check marked PASS, but it is stale: src/export/json.py changed since its latest rerun at "
+                      f"{ledger['at']} on {ledger['head'][:12]}, matching its Touches; run `verify.py rerun --only $(verify.py affected)`",
+                      out.stdout)
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--only", "B1", "--dir", str(d)], cwd=self.repo, check=True, capture_output=True, env=env)
+        out = report()
+        self.assertEqual(out.returncode, 0, out.stdout)
 
     def test_the_review_must_name_the_head_it_read(self):
         d, report = self.reviewed_report()

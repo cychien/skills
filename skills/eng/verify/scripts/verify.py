@@ -19,8 +19,8 @@ usage: verify.py <command> [--dir DIR]
               section: every name those checks drive (test ids, accessible names, routes, HTTP paths, CLI commands and
               flags, wire and event names, file paths), settled before code. At most 10 e2e checks per plan, with no
               override: keep the riskiest, move the rest to unit or drop them, or split the phase. An optional
-              '## Sensitive paths' section lists paths or globs (auth, permissions, crypto) whose fixes need a fix
-              review. Prints the count per tier.
+              '## Sensitive paths' section lists paths or globs (auth, permissions, crypto) where the reviewer looks
+              hardest. Prints the count per tier.
   driver      a project verification skill is on main, or was committed before any product change
   freeze      record the plan's hash, the Drive contract and Sensitive paths included, before a verifier runs;
               --revision "<why; agreed by>" records a deliberate change to an already frozen plan
@@ -35,13 +35,13 @@ usage: verify.py <command> [--dir DIR]
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match
               the comparison; the report's Head is HEAD or a commit with HEAD's tree (a regrouped history). A PASS
               is backed by its tier's evidence: e2e by its <id>.check.<ext> script and an <id>.rerun.log from a passing
-              rerun after the freeze; unit by the last `units` result, after the freeze, passing, on HEAD's tree, with
+              rerun after the freeze, and not listed by `affected`; unit by the last `units` result, after the freeze, passing, on HEAD's tree, with
               a spec that names the check id; walk by a screenshot or video in evidence/<id>/ written after the freeze.
               A '## Review' section in report.md, or review.md, written after the freeze, holds the code review's
               findings, each triaged, or 'none found'. In a git repository, review.md's 'Head:' line names the commit the
-              reviewer read; when the diff from it to HEAD changes more than 200 lines or touches a path the plan's
-              '## Sensitive paths' lists, review.md needs a '## Fix review' section, written after HEAD's commit, every
-              finding triaged. A passing report lists each plan revision, each full rerun after the prove, and each
+              reviewer read; when the diff from it to HEAD changes more than 200 lines, review.md needs a '## Fix review'
+              section with every finding triaged. Fixes made for the fix review's findings are proved by their unit specs,
+              with no further review. A passing report lists each plan revision, each full rerun after the prove, and each
               script fix, with its reason.
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
@@ -127,7 +127,6 @@ import argparse
 import collections
 import contextlib
 import datetime
-import fnmatch
 import glob
 import hashlib
 import importlib.util
@@ -438,16 +437,6 @@ def e2e_cap_problems(tiers):
         return []
     return [f"1: {len(e2e)} e2e checks ({', '.join(e2e)}), more than {MAX_E2E}. Keep the {MAX_E2E} most important, the "
             "riskiest and costliest-to-break behavior, and move the rest to the unit tier or drop them, or split the phase"]
-
-
-def sensitive_paths(text):
-    found = sections(text.splitlines()).get(SENSITIVE, [])
-    words = [line[2:].split(None, 1) for _, line in found if line.startswith(("- ", "* "))]
-    return [w[0].strip("`,:") for w in words if w and not PLACEHOLDER.search(w[0])]
-
-
-def is_sensitive(path, patterns):
-    return any(fnmatch.fnmatchcase(path, p) if GLOB_MAGIC.search(p) else under(path, p.rstrip("/")) for p in patterns)
 
 
 def load_plan(directory):
@@ -773,8 +762,8 @@ def review_problems(directory, report, frozen_ts):
     return problems
 
 
-def fix_review_problems(directory, plan_text):
-    """The fixes made after the review: past FIX_REVIEW_LINES changed lines or on a sensitive path, they need a triaged fix review."""
+def fix_review_problems(directory):
+    """The fixes made after the review: past FIX_REVIEW_LINES changed lines, they need a triaged fix review."""
     path = directory / REVIEW
     text = path.read_text() if path.is_file() else ""
     m = re.search(r"^Head:\s*(\S+)", text, re.M)
@@ -786,25 +775,15 @@ def fix_review_problems(directory, plan_text):
         numstat = git("diff", "--numstat", "--no-renames", reviewed, "HEAD")
     except Failed:
         return [f"{REVIEW} reviewed Head {reviewed}, which is not a commit in this repository"]
-    changed, count = [], 0
-    for row in numstat.splitlines():
-        added, deleted, name = row.split("\t", 2)
-        count += sum(int(n) for n in (added, deleted) if n.isdigit())
-        changed.append(name)
-    touched = [n for n in changed if is_sensitive(n, sensitive_paths(plan_text))]
-    reasons = ([f"change {count} lines, over {FIX_REVIEW_LINES}"] if count > FIX_REVIEW_LINES else []) + \
-              ([f"touch the plan's {SENSITIVE} ({', '.join(touched[:5])})"] if touched else [])
-    if not reasons:
+    count = sum(int(n) for row in numstat.splitlines() for n in row.split("\t", 2)[:2] if n.isdigit())
+    if count <= FIX_REVIEW_LINES:
         return []
-    why = f"the fixes since the reviewed Head {reviewed[:12]} " + " and ".join(reasons)
     body = section(text, FIX_REVIEW)
     if not body:
-        return [f"{why}, so they need a fix review: the reviewer reviews that diff once into a '## {FIX_REVIEW}' section of "
-                f"{REVIEW}, and every finding is triaged"]
-    problems = [f"fix review finding {p}" for p in untriaged(body)]
-    if path.stat().st_mtime < int(git("log", "-1", "--format=%ct", "HEAD")):
-        problems.append(f"the fix review in {REVIEW} predates the last fix commit; review the fix diff that ships")
-    return problems
+        return [f"the fixes since the reviewed Head {reviewed[:12]} change {count} lines, over {FIX_REVIEW_LINES}, so they need "
+                f"a fix review: the reviewer reviews that diff once into a '## {FIX_REVIEW}' section of {REVIEW}, and every "
+                "finding is triaged"]
+    return [f"fix review finding {p}" for p in untriaged(body)]
 
 
 def load_units(directory):
@@ -834,7 +813,7 @@ def units_gap(check_id, frozen_ts, units):
     return None
 
 
-def tier_gap(directory, check_id, tier, frozen_ts, scripts, units):
+def tier_gap(directory, check_id, tier, frozen_ts, scripts, units, stale):
     """Why a PASS lacks the evidence its tier needs, or None."""
     if tier == "unit":
         return units_gap(check_id, frozen_ts, units)
@@ -847,6 +826,8 @@ def tier_gap(directory, check_id, tier, frozen_ts, scripts, units):
             return f"{log.name} is missing or predates the frozen plan; run `verify.py rerun` after the freeze"
         if last_line(log) != RERUN_PASS:
             return f"{log.name} records a failing run; a PASS needs a passing `verify.py rerun`"
+        if check_id in stale:
+            return f"it is stale: {stale[check_id]}; run `verify.py rerun --only $(verify.py affected)`"
         return None
     folder = directory / EVIDENCE_DIR / check_id
     media = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
@@ -886,8 +867,9 @@ def cmd_report(directory, args):
         problems.append("the Verifier is the Author; a fresh agent must produce the verdicts")
     problems += review_problems(directory, report, lock["frozen_ts"])
     if current_head:
-        problems += fix_review_problems(directory, text)
+        problems += fix_review_problems(directory)
     units = load_units(directory)
+    stale = stale_checks(directory, text, ids, tiers, in_repo=current_head is not None)
     scripts = {script_id(p) for p in check_scripts(directory)}
     rows = {}
     for number, cells in table_rows(report):
@@ -914,7 +896,7 @@ def cmd_report(directory, args):
                 problems.append(f"{number}: {check_id} is PASS, but its observed value differs from the oracle's: {diffs[0]}")
         if verdict == "PASS" and check_id in tiers:
             tier = tiers[check_id]
-            gap = tier_gap(directory, check_id, tier, lock["frozen_ts"], scripts, units)
+            gap = tier_gap(directory, check_id, tier, lock["frozen_ts"], scripts, units, stale)
             if gap:
                 problems.append(f"{number}: {check_id} is {'an' if tier == 'e2e' else 'a'} {tier} check marked PASS, but {gap}")
         if verdict == "FAIL" and not observed.lower().startswith(("defect:", "blocker:")):
