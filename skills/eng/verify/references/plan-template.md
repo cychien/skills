@@ -10,6 +10,7 @@
 - Pass: <a predicate another agent can check against the evidence>
 - Oracle: n/a: <why the result is not a value computed from data>
 - Tier: <e2e, unit, or walk, per the Terms in plan.md>
+- Touches: <e2e only: `<path glob>`, `<path glob>`, every package the scenario runs through>
 
 ### <id>. <title of a check whose result is computed from data>
 
@@ -21,6 +22,7 @@
 - Seed: <the dataset>
 - Shape: <the JSON both sides write>
 - Tier: <e2e or walk: an oracle value is read from the running app>
+- Touches: <e2e only: `<path glob>`, every package the scenario runs through>
 
 ## Perf
 
@@ -31,6 +33,7 @@
 - Probe: <the command or procedure, run on main and head, interleaved>
 - Baseline: <main, or none: why main lacks the path>
 - Rule: <the number that fails: a limit against main, or absolute budgets for the added work and the end state>
+- Touches: `<path glob>`, <every package on the measured path>
 
 ## Drive contract
 
@@ -38,4 +41,4 @@
 
 ## Sensitive paths
 
-- `<path or glob>`: <why a fix there needs a second review: auth, permissions, crypto, or similar>
+- `<path or glob>`: <why a defect there costs most: auth, permissions, crypto, or similar>

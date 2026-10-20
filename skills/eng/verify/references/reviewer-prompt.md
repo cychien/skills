@@ -1,6 +1,6 @@
 # Reviewer prompt
 
-Fill every `<...>` that contains a space and send the block as the reviewer's whole task. The guard skill denies a subagent prompt that still holds a fill. Send it in Mode `change` once the code has landed, in the same message as the verifier's prove stage, and in Mode `fix` at most once more, after the fix loop, when the fix diff changes more than 200 lines or touches a path the plan's Sensitive paths lists. Start the reviewer through the salvo skill from the change's worktree, on a planner-role model from a different family than the author's when the orchestrator config has one, else on a different entry, because a reviewer of the author's family shares its blind spots.
+Fill every `<...>` that contains a space and send the block as the reviewer's whole task. The guard skill denies a subagent prompt that still holds a fill. Send it in Mode `change` once the code has landed, in the same message as the verifier's prove stage, and in Mode `fix` at most once more, after the fix loop, when the fix diff changes more than 200 lines. Start the reviewer through the salvo skill from the change's worktree, on a planner-role model from a different family than the author's when the orchestrator config has one, else on a different entry, because a reviewer of the author's family shares its blind spots.
 
 ```
 You are reviewing a change you did not write. Find the defects its checks miss. Do not fix them.

@@ -6,11 +6,11 @@ Write it as `plan.md` in the verification directory that `python3 ../scripts/ver
 
 ## Terms
 
-- **Check.** One acceptance condition, written in the plan before any code and locked. Its fields are Scenario, Surface, Evidence, Pass, Oracle, and Tier.
+- **Check.** One acceptance condition, written in the plan before any code and locked. Its fields are Scenario, Surface, Evidence, Pass, Oracle, and Tier, plus Touches on an e2e check.
 - **Drive contract.** Every name an e2e or walk check drives, settled before any code: DOM test ids and accessible names, routes and HTTP paths, CLI commands and flags, wire and event names, and the file paths the checks read. The executor builds those names exactly, and the verifier writes its scripts against them alone.
 - **Verify.** Proving the checks: an agent that did not write the code runs every check and records PASS, FAIL, or INCONCLUSIVE with its evidence in `report.md`.
 - **Tier.** How a check is proved, one of:
-  - `e2e`: isolation, permissions, revocation, wire compatibility, perf budgets, and cross-surface flows, what a unit test cannot see and what costs most when broken. Proved by a zero-argument `<id>.check.<ext>` script the verifier writes and `verify.py rerun` runs on the real app, so it regrades the check without an agent whenever the code changes.
+  - `e2e`: isolation, permissions, revocation, wire compatibility, perf budgets, and cross-surface flows, what a unit test cannot see and what costs most when broken. Proved by a zero-argument `<id>.check.<ext>` script the verifier writes and `verify.py rerun` runs on the real app: once in full at prove, then only when `verify.py affected` lists it because a later commit changed a path its Touches names.
   - `unit`: logic. Proved by a spec the executor writes, graded fail-first by `verify.py units`, with the check id in its test title so `units` records which spec proves it.
   - `walk`: UI look and interaction. The verifier walks it once on the real app and saves a screenshot or video in `evidence/<id>/`; no script.
 
@@ -25,8 +25,9 @@ Each check has five parts:
 - **Evidence.** The artifact that proves it: a screenshot, a video, a terminal transcript, a response body, a value read back.
 - **Pass.** A predicate another agent can check against that evidence with no judgment call. "The export parses as JSON and holds 3 rows" is a predicate. "Export works" is not.
 - **Tier.** `e2e`, `unit`, or `walk`, per the Terms above. `verify.py plan` refuses a check without one and prints the count per tier, and the `report` gate holds a PASS to its tier's evidence.
+- **Touches** (e2e only). The repository paths the scenario runs through, as globs in backticks, comma separated: `` `packages/agent-host/**`, `packages/server/src/**` ``. Write it wide, every package on the path and not only the one the check is named after, because `verify.py affected` reruns the check whenever a commit after its last passing run changes a matching path, and a path left out is a change the check never sees. `verify.py plan` refuses an e2e check without it.
 
-When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement. Its Tier is `unit`: a static spec the unit suite runs (type tests plus a diff of the implemented signatures against the skeleton, with the check id in its test title), so it never spends the e2e budget, which exists for the cost of driving an app.
+When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the skeleton's type tests pass unchanged against the implementation and its import guards hold; a difference from the skeleton goes in the design addendum with the user's agreement. Its Tier is `unit`: static specs the unit suite runs, with the check id in a test title, so it never spends the e2e budget, which exists for the cost of driving an app.
 
 A check can also name a **Seed**: the dataset it starts from. Name one whenever the scenario needs data to exist, because a page with no data proves nothing about how it shows data.
 
@@ -53,7 +54,7 @@ Every plan with an `e2e` or `walk` check lists, under `## Drive contract`, each 
 
 ## Sensitive paths
 
-Name, under `## Sensitive paths`, the paths or globs where a defect costs most: authentication, permissions, crypto, and similar. After the fix loop, a fix diff that touches one, or that changes more than 200 lines, gets one more review of that diff, and the `report` gate refuses a report without it. Write `n/a: <reason>` when the change touches none.
+Name, under `## Sensitive paths`, the paths or globs where a defect costs most: authentication, permissions, crypto, and similar. The reviewer looks hardest there. Write `n/a: <reason>` when the change touches none. A second review of the fixes depends only on their size: a fix diff of more than 200 lines gets one, and the `report` gate refuses a report without it.
 
 ## Perf
 

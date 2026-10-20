@@ -692,12 +692,19 @@ class ShippedPlaybooks(unittest.TestCase):
 
     def test_quick_feature_freezes_the_plan_before_code_delegates_and_cannot_skip_verification(self):
         mandatory = self.gated_mandatory_steps("quick-feature")
-        self.assertEqual(mandatory, {1: set(), 3: {"driver"}, 4: {"plan", "lock"}, 5: set(), 7: {"oracles"}, 9: {"rerun", "report", "leftovers"}})
+        self.assertEqual(mandatory, {1: set(), 3: {"plan", "lock"}, 4: {"driver"}, 6: {"oracles"}, 8: {"report", "leftovers"}})
 
-    def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_final_rerun_and_report(self):
+    def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_report(self):
         mandatory = self.gated_mandatory_steps("feature")
-        self.assertEqual(mandatory, {1: set(), 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units"}, 10: {"oracles"},
-                                     11: set(), 13: {"rerun", "report", "leftovers"}})
+        self.assertEqual(mandatory, {1: set(), 5: {"lock"}, 7: {"units"}, 9: {"oracles"}, 10: set(), 12: {"report", "leftovers"}})
+
+    def test_feature_gets_the_driver_in_the_verifier_step(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import gates, skills
+        steps = skills.steps(ROOT / "skills" / "eng" / "feature" / "SKILL.md")
+        driver = [n for n, _, text, _ in steps if {"driver"} <= {" ".join(args) for _, _, args in gates.named(text)}]
+        self.assertEqual(driver, [8])
 
     def test_the_step_that_opens_the_pr_is_the_one_the_final_run_gates(self):
         sys.path.insert(0, str(GUARD.parent))
@@ -709,7 +716,7 @@ class ShippedPlaybooks(unittest.TestCase):
             last = steps[-1]
             self.assertEqual(opening, [last[0]], skill)
             self.assertTrue(last[3], skill)
-            self.assertLessEqual({"rerun", "report"}, {" ".join(args) for _, _, args in gates.named(last[2])}, skill)
+            self.assertLessEqual({"report", "leftovers"}, {" ".join(args) for _, _, args in gates.named(last[2])}, skill)
 
     def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
         mandatory = self.gated_mandatory_steps("plan-feature")

@@ -5,7 +5,7 @@ The plan-feature skill leaves a plan folder: `plan.md` with the decisions and th
 ## Once for the whole feature
 
 - Step 3 starts from `grounding.md` and explores only what it does not cover.
-- Step 7 extends the driver once for every phase's checks, in phase 1's session before its code, because a harness extended per phase pays its setup and review again each time.
+- Step 8's verifier extends the driver once for every phase's checks, in phase 1's session on the base, because a harness extended per phase pays its setup and review again each time.
 
 ## Each phase, in its own session, in the order of `plan.md`
 
@@ -14,11 +14,11 @@ The plan-feature skill leaves a plan folder: `plan.md` with the decisions and th
 3. Step 4 is case A: an addendum only where this phase's code contradicts the plan folder, with the Drive contract changed only where the addendum changes it.
 4. Step 5 locks the phase's plan before its code.
 5. Step 6 writes the checkpoint for this phase.
-6. Steps 8 to 13 build and verify the phase. The executor's brief carries only the skeleton files and symbols the phase entry names. The verifier writes scripts for and walks only this phase's checks; a native shell or perf check runs only in the phase whose Heavy line names it. The reviewer covers this phase's diff. Step 13's final run is this phase's `rerun`, its `units`, and the project's whole unit test suite. Open the PR against the previous phase's branch, tell the user the phase is done and which phase comes next, and stop: the user starts the next phase in a new session, without waiting for review.
+6. Steps 7 to 12 build and verify the phase. The executor's brief carries only the skeleton files and symbols the phase entry names. The verifier writes scripts for and walks only this phase's checks; a native shell or perf check runs only in the phase whose Heavy line names it. The reviewer covers this phase's diff. Step 12's closing run is this phase's `units`, the project's whole unit test suite, and `rerun --only $(verify.py affected)` when it lists any check. Open the PR against the previous phase's branch, tell the user the phase is done and which phase comes next, and stop: the user starts the next phase in a new session, without waiting for review.
 7. A check still failing after its 2 failed fix attempts stays FAIL in the phase's report. In an autonomous run it goes to the backlog, and the next phase to start is one whose Depends on line does not reach the failing phase.
 
 ## Landing
 
-The user lands the stack bottom up, and may land a verified bottom phase before the rest is built. After a merge, the PR above retargets to main. When `git patch-id` of its change is the same as at its verdict, the verdict stands; otherwise the phase's own `verify.py rerun`, `verify.py units`, and the project's whole unit test suite regrade it, never an earlier phase's scripts, and the phase's verifier, resumed, walks again each walk check the difference touches, because guard allows one verifier per check.
+The user lands the stack bottom up, and may land a verified bottom phase before the rest is built. After a merge, the PR above retargets to main. When `git patch-id` of its change is the same as at its verdict, the verdict stands; otherwise the phase's own `verify.py rerun --only $(verify.py affected)`, `verify.py units`, and the project's whole unit test suite regrade it, never an earlier phase's scripts, and the phase's verifier, resumed, walks again each walk check the difference touches, because guard allows one verifier per check.
 
 A new session resumes at the first phase without a passing report.
