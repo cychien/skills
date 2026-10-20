@@ -111,7 +111,12 @@ usage: verify.py <command> [--dir DIR]
               (deleted ones included) or its command line is under one of them. The caller and its ancestors never
               count. --running-since EPOCH says a delegate that is still running began then (guard passes it before a
               spawn): a process started since may be that delegate's, so it is listed as in use by a running agent and
-              neither counted nor killed. Exits 1 while any remain and 2 when the scan itself cannot run. --kill sends
+              neither counted nor killed. A process whose environment holds VERIFY_LEAD=1, and every descendant of one,
+              is the lead's own (a watcher or Monitor loop that names the verification directory): it is listed as
+              spared, started by the lead, and neither counted nor killed. Linux exposes another process's environment
+              and macOS does not, so the marker also counts anywhere in a command line: start a watcher as
+              sh -c 'VERIFY_LEAD=1 ...'. Set it on the watcher's own command, never in the session's environment,
+              or every process the session starts is spared. Exits 1 while any remain and 2 when the scan itself cannot run. --kill sends
               SIGTERM to each process group, then SIGKILL to survivors, and rescans. When nothing remains but the
               1-minute load exceeds the core count, it also lists the busiest processes and flags those whose parent is init as
               likely leftovers (the exit code is unaffected).
@@ -217,6 +222,8 @@ ELAPSED_SLACK_S = 1.0
 ELAPSED = re.compile(r"^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$")
 TOP_CPU = 5
 SALVO_GLOBS = ("/tmp/salvo-*", "/private/tmp/salvo-*")
+LEAD_MARK = "VERIFY_LEAD=1"
+LEAD_IN_COMMAND = re.compile(rf"(?<![\w=]){re.escape(LEAD_MARK)}(?!\w)")
 # A scratch tree borrows the checkout's installed dependencies through symlinks, which pnpm 11's pre-run deps check rejects.
 SCRATCH_ENV = {"pnpm_config_verify_deps_before_run": "false"}
 
@@ -1597,6 +1604,35 @@ def process_cwds(proc=pathlib.Path("/proc")):
     return cwds
 
 
+def environ_holds(pid, mark, proc=pathlib.Path("/proc")):
+    """Whether a process's environment holds mark, where /proc exposes it (Linux); macOS's ps shows no other process's environment."""
+    with contextlib.suppress(OSError):
+        return mark.encode() in (proc / str(pid) / "environ").read_bytes().split(b"\0")
+    return False
+
+
+def lead_test(table, proc=pathlib.Path("/proc")):
+    """A test of whether the lead started a pid: it or an ancestor holds LEAD_MARK in its environment or command line."""
+    parents = {row["pid"]: row["ppid"] for row in table}
+    commands = {row["pid"]: row["command"] for row in table}
+    marked = {}
+
+    def is_marked(pid):
+        if pid not in marked:
+            marked[pid] = bool(LEAD_IN_COMMAND.search(commands.get(pid, ""))) or environ_holds(pid, LEAD_MARK, proc)
+        return marked[pid]
+
+    def from_lead(pid):
+        seen = set()
+        while pid and pid > 1 and pid not in seen:
+            if is_marked(pid):
+                return True
+            seen.add(pid)
+            pid = parents.get(pid)
+        return False
+    return from_lead
+
+
 def lineage(table):
     """This process and its ancestors, which must never count as leftovers."""
     parents = {row["pid"]: row["ppid"] for row in table}
@@ -1631,25 +1667,37 @@ def root_patterns(roots):
     return lambda cwd, command: bool((cwd and in_cwd.search(cwd)) or in_command.search(command))
 
 
-def find_leftovers(roots, orphan_roots=()):
-    """Processes under any root, plus orphans (parent init) under orphan roots, where the user's own shells and editors live."""
+def scan_processes(roots, orphan_roots=()):
+    """(leftovers, lead's): processes under any root, plus orphans (parent init) under orphan roots, where the user's own
+    shells and editors live, split by whether the lead started them."""
     under, orphaned_under = root_patterns(roots), root_patterns(orphan_roots)
     table = process_table()
     skip = lineage(table)
     cwds = process_cwds()
-    return [{**row, "cwd": cwds.get(row["pid"])} for row in table
-            if row["pid"] not in skip and not row["stat"].startswith("Z")
-            and (under(cwds.get(row["pid"]), row["command"]) or (row["ppid"] == 1 and orphaned_under(cwds.get(row["pid"]), row["command"])))]
+    found = [{**row, "cwd": cwds.get(row["pid"])} for row in table
+             if row["pid"] not in skip and not row["stat"].startswith("Z")
+             and (under(cwds.get(row["pid"]), row["command"]) or (row["ppid"] == 1 and orphaned_under(cwds.get(row["pid"]), row["command"])))]
+    from_lead = lead_test(table)
+    lead = [p for p in found if from_lead(p["pid"])]
+    return [p for p in found if p not in lead], lead
+
+
+def find_leftovers(roots, orphan_roots=()):
+    return scan_processes(roots, orphan_roots)[0]
 
 
 def signal_processes(found, sig):
     table = process_table()
     skip = lineage(table)
     protected = {row["pgid"] for row in table if row["pid"] in skip}
+    from_lead = lead_test(table)
+    members = collections.defaultdict(list)
+    for row in table:
+        members[row["pgid"]].append(row["pid"])
     for proc in found:
         group = proc["pgid"]
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            if group in protected or group <= 1:
+            if group in protected or group <= 1 or any(from_lead(pid) for pid in members[group]):
                 os.kill(proc["pid"], sig)
             else:
                 os.killpg(group, sig)
@@ -1703,18 +1751,21 @@ def split_in_use(found, running_since):
 
 
 def scan_leftovers(roots, orphan_roots, running_since):
-    return split_in_use(find_leftovers(roots, orphan_roots), running_since)
+    found, lead = scan_processes(roots, orphan_roots)
+    return (*split_in_use(found, running_since), lead)
 
 
 def cmd_leftovers(directory, args):
     roots, orphan_roots = [*default_roots(directory), *(args.root or [])], worktree_paths()
-    found, busy = scan_leftovers(roots, orphan_roots, args.running_since)
+    found, busy, lead = scan_leftovers(roots, orphan_roots, args.running_since)
     killed = len(found) if args.kill else 0
     if found and args.kill:
         stop_processes(found)
-        found, busy = scan_leftovers(roots, orphan_roots, args.running_since)
+        found, busy, lead = scan_leftovers(roots, orphan_roots, args.running_since)
     spared = ([f"{len(busy)} in use by a running agent, started after it began, so neither counted nor killed:"]
               + [describe(p) for p in busy]) if busy else []
+    spared += ([f"{len(lead)} spared, started by the lead ({LEAD_MARK}), so neither counted nor killed:"]
+               + [describe(p) for p in lead]) if lead else []
     if found:
         script = shlex.quote(str(pathlib.Path(__file__).resolve()))
         raise Failed("\n" + "\n".join([*(describe(p) for p in found),

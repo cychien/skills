@@ -1532,6 +1532,27 @@ class Leftovers(unittest.TestCase):
         self.assertTrue(alive(busy.pid))
         self.assertRegex(self.leftovers("--root", str(self.root), ok=False), rf"\bpid {busy.pid}\b")
 
+    def test_the_leads_own_processes_and_their_descendants_are_spared_and_never_killed(self):
+        leftover = self.spawn(self.root)
+        child = self.base / "child.pid"
+        lead = self.spawn(self.root, "sh", "-c", f": VERIFY_LEAD=1; sleep 300 & echo $! > {shlex.quote(str(child))}; wait")
+        sleeper = wait_for_file(child)
+        self.addCleanup(lambda: os.kill(sleeper, signal.SIGKILL) if alive(sleeper) else None)
+        out = self.leftovers("--kill", "--root", str(self.root))
+        self.assertRegex(out, rf"^leftovers: killed 1, none remain\n2 spared, started by the lead \(VERIFY_LEAD=1\), so neither counted "
+                              rf"nor killed:\npid {lead.pid} .*\npid {sleeper} .*\n")
+        self.assertTrue(gone(leftover.pid))
+        self.assertTrue(alive(lead.pid) and alive(sleeper))
+        self.assertIn("2 spared, started by the lead", self.leftovers("--root", str(self.root)))
+
+    @unittest.skipUnless(pathlib.Path("/proc/self/environ").is_file(), "only Linux exposes another process's environment")
+    def test_a_process_whose_environment_holds_the_lead_marker_is_spared(self):
+        p = subprocess.Popen(["sleep", "300"], cwd=self.root, start_new_session=True, env={**os.environ, "VERIFY_LEAD": "1"})
+        self.sleepers.append(p)
+        time.sleep(0.2)
+        self.assertRegex(self.leftovers("--kill", "--root", str(self.root)), rf"1 spared, started by the lead .*\npid {p.pid} ")
+        self.assertTrue(alive(p.pid))
+
     def test_a_process_ignoring_sigterm_is_killed(self):
         script = "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(300)\n"
         p = subprocess.Popen([sys.executable, "-c", script], cwd=self.root, start_new_session=True, stdout=subprocess.PIPE, text=True)
@@ -1652,6 +1673,23 @@ class ProcCwds(unittest.TestCase):
             (proc / "thread-self").mkdir()
             (proc / "sys").mkdir()
             self.assertEqual(verify.process_cwds(proc), {41: "/srv/app", 42: "/srv/gone"})
+
+
+class LeadProcesses(unittest.TestCase):
+    def row(self, pid, ppid, command):
+        return {"pid": pid, "ppid": ppid, "pgid": pid, "stat": "S", "elapsed": "00:10", "cpu": 0.0, "command": command}
+
+    def test_a_marked_environment_or_command_line_marks_the_process_and_every_descendant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = pathlib.Path(tmp)
+            for pid, environ in ((10, b"HOME=/h\0VERIFY_LEAD=1\0"), (20, b"VERIFY_LEAD=10\0"), (40, b"PATH=/bin\0")):
+                (proc / str(pid)).mkdir()
+                (proc / str(pid) / "environ").write_bytes(environ)
+            table = [self.row(10, 1, "node watch.js"), self.row(11, 10, "sh -c tail"), self.row(12, 11, "tail -f log"),
+                     self.row(20, 1, "sleep 9"), self.row(30, 1, "sh -c 'VERIFY_LEAD=1 tail -f log'"), self.row(31, 30, "tail -f log"),
+                     self.row(40, 1, "echo XVERIFY_LEAD=1 VERIFY_LEAD=12"), self.row(50, 40, "sleep 1")]
+            from_lead = verify.lead_test(table, proc)
+            self.assertEqual({row["pid"] for row in table if from_lead(row["pid"])}, {10, 11, 12, 30, 31})
 
 
 class Capacity(unittest.TestCase):
