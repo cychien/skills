@@ -1391,6 +1391,15 @@ class Affected(RepoFixture):
         self.verify("rerun", "--only", "B2")
         self.assertEqual(self.affected(), ("", ""))
 
+    def test_a_check_left_fail_after_its_fix_budget_is_not_affected(self):
+        self.verify("rerun")
+        (self.where / "B2.broken").write_text("x\n")
+        (self.where / "report.md").write_text(Verify.FAIL_REPORT)
+        self.verify("rerun", "--only", "B2", ok=False)
+        self.assertEqual(self.affected()[0], "B2\n")
+        self.verify("rerun", "--only", "B2", ok=False)
+        self.assertEqual(self.affected(), ("", ""))
+
     def test_rerun_only_takes_every_id_affected_prints_and_none(self):
         self.assertEqual(self.verify("rerun", "--only"), "rerun --only: no check ids given, so nothing to rerun\n")
         self.assertFalse((self.where / "rerun.ledger.json").exists())

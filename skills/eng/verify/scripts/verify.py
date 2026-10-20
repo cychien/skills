@@ -93,8 +93,10 @@ usage: verify.py <command> [--dir DIR]
   affected    print, space separated on one line, the e2e checks with a saved script that need a rerun: no run of it in
               rerun.ledger.json, a failing latest run, or a path matching its Touches changed between the commit its
               latest run saw and the working tree (git diff from that commit, plus untracked files). Prints nothing when
-              none is stale. --explain prints each one's reason and first matching paths on stderr. The verification
-              directory is outside the repository, so a script edit never counts here; `script-fix` governs those.
+              none is stale. A check report.md marks FAIL after its 2 failed fix attempts is left out, because it goes to
+              the user or the backlog and `rerun --only` refuses it. --explain prints each one's reason and first
+              matching paths on stderr. The verification directory is outside the repository, so a script edit never
+              counts here; `script-fix` governs those.
   script-fix  record why a check script or helper that scripts.lock.json locked changed after the prove: <file> in the
               verification directory and --reason "<why it crashed before its predicate>". It appends the time, the file,
               its old and new sha256, and the reason to the lock's script fixes and locks the new hash, so a rerun may
@@ -1177,7 +1179,9 @@ def cmd_affected(directory, args):
     _, text, ids, _, tiers = load_plan(directory)
     if tree_of("HEAD") is None:
         raise Failed("affected compares the working tree with the commit each check last ran on, so run it inside the repository")
-    stale = stale_checks(directory, text, ids, tiers)
+    failing, attempts = reported_failures(directory), fix_attempts(directory)
+    left = {i for i in failing if attempts.get(i, 0) >= FIX_ATTEMPTS}
+    stale = {i: why for i, why in stale_checks(directory, text, ids, tiers).items() if i not in left}
     if args.explain:
         for check_id, why in stale.items():
             print(f"{check_id}: {why}", file=sys.stderr)
