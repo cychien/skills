@@ -1018,7 +1018,8 @@ class RerunStamp(unittest.TestCase):
         self.rerun()
         stamp = (self.dir / "rerun.stamp.json").read_text()
         out = self.rerun("--only", "B2", "--only", "B2")
-        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the full rerun decides the gate)", out)
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the ledger records it, and `verify.py affected` lists what is "
+                      "still stale)", out)
         self.assertNotIn("B1", out)
         self.assertEqual(self.runs(), 1)
         self.assertEqual(len((self.dir / "runs2.txt").read_text().split()), 2)
@@ -1295,6 +1296,67 @@ class Units(RepoFixture):
         self.units()
         self.assertEqual(self.git("worktree", "list").count("\n"), 0)
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+
+class Affected(RepoFixture):
+    def setUp(self):
+        super().setUp()
+        self.where = pathlib.Path(self.verify("where").strip())
+        body = CHECKS.split("## Checks\n")[1]
+        b2 = body.replace("B1", "B2").replace("`src/export/**`, `bin/export`", "`*.py`")
+        b3 = body.replace("B1", "B3")
+        (self.where / "plan.md").write_text(plan(CHECKS, b2, b3, UNIT, PERF_NA))
+        for check_id in ("B1", "B2"):
+            (self.where / f"{check_id}.check.sh").write_text(f'test ! -e "$(dirname "$0")/{check_id}.broken"\n')
+        (self.where / "U1.check.sh").write_text("exit 0\n")
+
+    def affected(self):
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        r = subprocess.run([sys.executable, "-I", str(VERIFY), "affected", "--explain"], cwd=self.repo, capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout, r.stderr
+
+    def ledger(self):
+        return json.loads((self.where / "rerun.ledger.json").read_text())
+
+    def test_lists_the_e2e_checks_whose_latest_run_no_longer_grades_the_working_tree(self):
+        self.assertEqual(self.affected(), ("B1 B2\n", "B1: no rerun of it is recorded\nB2: no rerun of it is recorded\n"))
+        self.verify("rerun")
+        head = self.rev()
+        self.assertEqual({i: (e["head"], e["dirty"], e["verdict"]) for i, e in self.ledger().items()},
+                         {"B1": (head, None, "PASS"), "B2": (head, None, "PASS"), "U1": (head, None, "PASS")})
+        self.assertEqual(self.affected(), ("", ""))
+        self.put("src/export/json.py", "print('json')\n")
+        at = self.ledger()["B1"]["at"]
+        self.assertEqual(self.affected(), ("B1\n", f"B1: src/export/json.py changed since its latest rerun at {at} on {head[:12]}, "
+                                                    "matching its Touches\n"))
+        self.commit("Export JSON")
+        self.assertEqual(self.affected()[0], "B1\n")
+        self.put("calc.py", "def add(a, b):\n    return b + a\n")
+        self.assertEqual(self.affected()[0], "B1 B2\n")
+        out = self.verify("rerun", "--only", *self.affected()[0].split())
+        self.assertIn("rerun: 2 checks, 2 PASS, 0 FAIL", out)
+        entry = self.ledger()["B2"]
+        self.assertEqual((entry["head"], len(entry["dirty"])), (self.rev(), 64))
+        self.assertEqual(self.affected()[0], "B2\n")
+        self.commit("Swap the operands")
+        self.verify("rerun", "--only", "B2")
+        self.assertEqual(self.affected(), ("", ""))
+
+    def test_a_failing_latest_run_stays_affected_until_it_passes(self):
+        self.verify("rerun")
+        (self.where / "B2.broken").write_text("x\n")
+        self.verify("rerun", "--only", "B2", ok=False)
+        at = self.ledger()["B2"]["at"]
+        self.assertEqual(self.affected(), ("B2\n", f"B2: its latest rerun, at {at}, failed\n"))
+        (self.where / "B2.broken").unlink()
+        self.verify("rerun", "--only", "B2")
+        self.assertEqual(self.affected(), ("", ""))
+
+    def test_rerun_only_takes_every_id_affected_prints_and_none(self):
+        self.assertEqual(self.verify("rerun", "--only"), "rerun --only: no check ids given, so nothing to rerun\n")
+        self.assertFalse((self.where / "rerun.ledger.json").exists())
+        self.assertRegex(self.verify("rerun", "--only", "B1", "B2"), r"PASS\s+B1 .*\nPASS\s+B2 ")
 
 
 class UnitTier(RepoFixture):

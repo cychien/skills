@@ -4,6 +4,7 @@
 usage: verify.py <command> [--dir DIR]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
        verify.py rerun [--only ID ...] [--jobs N] [--timeout SECONDS] [--force] [--full-reason "<why; agreed by whom>"] [-- ARGS ...]
+       verify.py affected [--explain]
        verify.py script-fix <file> --reason "<why it crashed before its predicate>"
        verify.py phases [<plan folder>]
        verify.py adopt <phase folder>
@@ -77,12 +78,20 @@ usage: verify.py <command> [--dir DIR]
               changes are graded with `rerun --only $(verify.py affected)`; --full-reason "<why; agreed by whom>" allows
               one, records it in the lock, and relocks the hashes. Any rerun, --only included, refuses while a locked file
               differs from its hash, until `script-fix` records why it changed; a script or helper added later is locked
-              on its first run. --only ID (repeatable) runs just those checks, for grading a fix; it neither
-              reads nor writes the stamp, so the full rerun still decides the gate. Once report.md marks a check FAIL,
+              on its first run. --only ID ... runs just those checks, for grading a later change with
+              `rerun --only $(verify.py affected)`; it neither reads nor writes the stamp, and given no ids it runs
+              nothing. Every rerun, --only included, records per check it ran the HEAD, a hash of the tracked working-tree
+              diff (null when clean), the verdict, and the time in rerun.ledger.json, keeping each check's latest run, for
+              `affected` and `report`. Once report.md marks a check FAIL,
               each --only run in which it still fails is one failed fix attempt, counted in fix-attempts.json; after 2,
               --only refuses it, and the full rerun reports it as left FAIL without failing, because it goes to the
               user or the backlog. A check script finds the repository from its working directory, never a hard-coded
               worktree path.
+  affected    print, space separated on one line, the e2e checks with a saved script that need a rerun: no run of it in
+              rerun.ledger.json, a failing latest run, or a path matching its Touches changed between the commit its
+              latest run saw and the working tree (git diff from that commit, plus untracked files). Prints nothing when
+              none is stale. --explain prints each one's reason and first matching paths on stderr. The verification
+              directory is outside the repository, so a script edit never counts here; `script-fix` governs those.
   script-fix  record why a check script or helper that scripts.lock.json locked changed after the prove: <file> in the
               verification directory and --reason "<why it crashed before its predicate>". It appends the time, the file,
               its old and new sha256, and the reason to the lock's script fixes and locks the new hash, so a rerun may
@@ -111,7 +120,7 @@ usage: verify.py <command> [--dir DIR]
 
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
 the root, --dir overrides the whole path). It holds plan.md, plan.lock, report.md, review.md,
-decision.tsv, units.json, fix-attempts.json, scripts.lock.json, and the evidence files. An oracle check <id> also has <id>.expected.json, written by an
+decision.tsv, units.json, fix-attempts.json, scripts.lock.json, rerun.ledger.json, and the evidence files. An oracle check <id> also has <id>.expected.json, written by an
 agent that read only the spec and the seed data, and <id>.observed.json, read from the running app.
 """
 import argparse
@@ -175,6 +184,7 @@ SCRIPT_TIMEOUT = 900
 RERUN_TIMEOUT = 300
 RERUN_STAMP = "rerun.stamp.json"
 SCRIPTS_LOCK = "scripts.lock.json"
+RERUN_LEDGER = "rerun.ledger.json"
 RERUN_PASS = "rerun: PASS"
 FIX_ATTEMPTS = 2
 FIX_LEDGER = "fix-attempts.json"
@@ -545,6 +555,10 @@ def cmd_adopt(directory, args):
     return f"adopted {folder.name}: {len(ids)} checks, base {head[:12]}"
 
 
+def listed(names):
+    return ", ".join(names[:LISTED_LOSSES]) + (f" and {len(names) - LISTED_LOSSES} more" if len(names) > LISTED_LOSSES else "")
+
+
 def product_changes(base, skip):
     top = pathlib.Path(git("rev-parse", "--show-toplevel"))
     names = set(git("diff", "--name-only", base).splitlines()) | set(git("ls-files", "--others", "--exclude-standard").splitlines())
@@ -565,8 +579,7 @@ def cmd_lock(directory, args):
     base = record.get("base") or git("merge-base", default_branch(), "HEAD")
     changed = product_changes(base, [record["plan"]] if record.get("plan") else [])
     if changed:
-        shown = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
-        raise Failed(f"product files already changed since {base[:12]}: {shown}. Lock the plan before any code: "
+        raise Failed(f"product files already changed since {base[:12]}: {listed(changed)}. Lock the plan before any code: "
                      "stash or move the change aside, lock, then bring it back.")
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     lock_path.write_text(json.dumps({"sha": sha(text), "frozen_at": now, "frozen_ts": time.time(), "revisions": [],
@@ -1040,6 +1053,108 @@ def cmd_script_fix(directory, args):
     return f"script fix recorded for {name}: {args.reason.strip()}"
 
 
+def working_state():
+    """(HEAD, a hash of the tracked working-tree diff or None when it is clean), or (None, None) outside a git repository."""
+    head = head_sha()
+    if head is None:
+        return None, None
+    diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True)
+    return head, hashlib.sha256(diff.stdout).hexdigest() if diff.returncode == 0 and diff.stdout else None
+
+
+def load_ledger(directory):
+    path = directory / RERUN_LEDGER
+    return load_json(path) if path.is_file() else {}
+
+
+def record_runs(directory, results, head, dirty):
+    ledger = load_ledger(directory)
+    for check_id, (verdict, _, _) in results.items():
+        ledger[check_id] = {"head": head, "dirty": dirty, "verdict": verdict, "at": now_iso()}
+    (directory / RERUN_LEDGER).write_text(json.dumps(dict(sorted(ledger.items())), indent=2) + "\n")
+
+
+def plan_touches(text):
+    found = sections(text.splitlines())
+    touches = {}
+    for name in ("Checks", "Perf"):
+        for entry in entries(found.get(name, []))[1]:
+            field = entry["fields"].get("Touches")
+            if (check_id := entry_id(entry)) and field:
+                touches[check_id] = TOUCHES_GLOB.findall(field[1])
+    return touches
+
+
+def glob_regex(pattern):
+    """A path glob as a regex: * within one path segment, ** across segments; a plain path also matches what is under it."""
+    pattern = pattern.strip().removeprefix("./")
+    parts, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            parts.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            parts.append(".*")
+            i += 2
+        else:
+            parts.append({"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i])))
+            i += 1
+    whole_tree = pattern.endswith("/") or not any(c in pattern for c in "*?")
+    body = "".join(parts).removesuffix("/")
+    return re.compile(body + "(?:/.*)?" if whole_tree else body)
+
+
+def changed_paths(head):
+    """Paths that differ between head and the working tree, untracked files included, or None when head is not a commit here."""
+    try:
+        names = git("diff", "--name-only", "--no-renames", head, "--").splitlines()
+    except Failed:
+        return None
+    return sorted({*names, *git("ls-files", "--others", "--exclude-standard").splitlines()} - {""})
+
+
+def stale_checks(directory, text, ids, tiers, in_repo=True):
+    """{e2e check id with a saved script: why its latest rerun no longer grades the working tree}, in plan order."""
+    scripts = {script_id(p) for p in check_scripts(directory)}
+    ledger, touches, changed, stale = load_ledger(directory), plan_touches(text), {}, {}
+    for check_id in ids:
+        if tiers.get(check_id) != "e2e" or check_id not in scripts:
+            continue
+        entry = ledger.get(check_id)
+        if not entry:
+            stale[check_id] = "no rerun of it is recorded"
+            continue
+        at, head = entry.get("at"), entry.get("head")
+        if entry.get("verdict") != "PASS":
+            stale[check_id] = f"its latest rerun, at {at}, failed"
+        elif not in_repo:
+            continue
+        elif not head:
+            stale[check_id] = f"its latest rerun, at {at}, ran outside a git repository"
+        else:
+            if head not in changed:
+                changed[head] = changed_paths(head)
+            if changed[head] is None:
+                stale[check_id] = f"its latest rerun, at {at}, ran on {head[:12]}, which is not a commit in this repository"
+                continue
+            patterns = [glob_regex(g) for g in touches.get(check_id, [])]
+            hits = [path for path in changed[head] if any(r.fullmatch(path) for r in patterns)]
+            if hits:
+                stale[check_id] = f"{listed(hits)} changed since its latest rerun at {at} on {head[:12]}, matching its Touches"
+    return stale
+
+
+def cmd_affected(directory, args):
+    _, text, ids, _, tiers = load_plan(directory)
+    if tree_of("HEAD") is None:
+        raise Failed("affected compares the working tree with the commit each check last ran on, so run it inside the repository")
+    stale = stale_checks(directory, text, ids, tiers)
+    if args.explain:
+        for check_id, why in stale.items():
+            print(f"{check_id}: {why}", file=sys.stderr)
+    return " ".join(stale)
+
+
 def rerun_inputs(directory, scripts, rest, left):
     """What a passing rerun depends on, or None outside a git repository."""
     tree = tree_of("HEAD")
@@ -1223,6 +1338,8 @@ def evict(directory, run, others):
 
 
 def cmd_rerun(directory, args):
+    if args.only == []:
+        return "rerun --only: no check ids given, so nothing to rerun"
     scripts = check_scripts(directory)
     if args.only:
         scripts = only_scripts(scripts, args.only)
@@ -1253,7 +1370,9 @@ def cmd_rerun(directory, args):
         claim_full_rerun(directory, lock, check_scripts(directory), args)
         stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
+    head, dirty = working_state()
     results, requeued = run_checks(directory, scripts, args, env)
+    record_runs(directory, results, head, dirty)
     lines, failed, known = list(requeued), [], []
     for path in scripts:
         check_id = script_id(path)
@@ -1268,7 +1387,7 @@ def cmd_rerun(directory, args):
     summary = f"rerun: {len(scripts)} checks, {len(scripts) - len(failed)} PASS, {len(failed)} FAIL"
     summary += f" ({len(known)} left FAIL after the fix budget)" if known else ""
     summary += f", {len(requeued)} requeued under load" if requeued else ""
-    lines.append(summary + (" (--only: no stamp; the full rerun decides the gate)" if args.only else ""))
+    lines.append(summary + (" (--only: no stamp; the ledger records it, and `verify.py affected` lists what is still stale)" if args.only else ""))
     if args.only:
         for check_id in (i for i in failed if i in failing):
             attempts[check_id] = attempts.get(check_id, 0) + 1
@@ -1728,8 +1847,9 @@ def indent(text):
 
 
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
-            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "script-fix": cmd_script_fix,
-            "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
+            "affected": cmd_affected, "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun,
+            "script-fix": cmd_script_fix, "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers,
+            "capacity": cmd_capacity}
 
 
 def main():
@@ -1745,7 +1865,8 @@ def main():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--root", action="append")
     parser.add_argument("--spec", action="append")
-    parser.add_argument("--only", action="append")
+    parser.add_argument("--only", action="extend", nargs="*")
+    parser.add_argument("--explain", action="store_true")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--running-since", type=float)
@@ -1770,7 +1891,8 @@ def main():
             directory.mkdir(parents=True, exist_ok=True)
             print(directory)
             return
-        print(COMMANDS[args.command](directory, args))
+        if out := COMMANDS[args.command](directory, args):
+            print(out)
     except Failed as e:
         print(f"verify {args.command}: {e}")
         sys.exit(e.code)
