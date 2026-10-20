@@ -26,7 +26,7 @@ Each check has five parts:
 - **Pass.** A predicate another agent can check against that evidence with no judgment call. "The export parses as JSON and holds 3 rows" is a predicate. "Export works" is not.
 - **Tier.** `e2e`, `unit`, or `walk`, per the Terms above. `verify.py plan` refuses a check without one and prints the count per tier, and the `report` gate holds a PASS to its tier's evidence.
 
-When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement. Its Tier is `e2e`, a script that diffs the implemented signatures against the skeleton, so rerun regrades it.
+When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement. Its Tier is `unit`: a static spec the unit suite runs (type tests plus a diff of the implemented signatures against the skeleton, with the check id in its test title), so it never spends the e2e budget, which exists for the cost of driving an app.
 
 A check can also name a **Seed**: the dataset it starts from. Name one whenever the scenario needs data to exist, because a page with no data proves nothing about how it shows data.
 
