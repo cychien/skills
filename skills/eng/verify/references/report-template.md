@@ -13,12 +13,6 @@ Verifier: <agent:model that produced the verdicts>
 
 <each perf check: the number with its unit, run count, range, limiter, and data source>
 
-## Exploration
-
-- <finding, its repro and its evidence in evidence/explore/>. Triage: <new check | follow-up | pre-existing | dismissed> <why>
-
-<or "none found" with no list>
-
 ## Review
 
 <the reviewer's findings, copied from review.md or left there; each ends in a triage:>

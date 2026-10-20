@@ -28,6 +28,7 @@
 ```
 
 - A phase lands and reverts alone. When it cannot ship visible to users, name the flag that hides it.
-- Heavy decides where expensive checks run: a native shell or perf check runs in the phase that changes it, and later phases regrade it by its carried script.
-- Every check has a Tier per `../../verify/references/plan.md`. Only an `e2e` check leaves a script that later phases rerun, so give that tier only to what a unit test cannot see and what costs most when broken.
-- Changes is the only way an earlier phase's check stops holding. The feature skill revises that phase's carried check under `verify.py freeze --revision` and never silently.
+- Heavy decides where expensive checks run: a native shell or perf check runs only in the phase that changes it.
+- Every check has a Tier per `../../verify/references/plan.md`. An `e2e` check is a script that starts an instance on every rerun of its phase, so give that tier only to what a unit test cannot see and what costs most when broken.
+- No phase reruns another phase's scripts, so each phase's plan holds Regression checks for the earlier behavior it could break.
+- Changes is the only way an earlier phase's check stops holding. The phase that changes it holds a check with the new predicate in its own plan, so the change is never silent.

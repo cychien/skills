@@ -3,17 +3,15 @@
 
 usage: verify.py <command> [--dir DIR]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
-       verify.py rerun [--only ID ...] [--timeout SECONDS] [--force] [-- ARGS ...]
-       verify.py carry <branch or directory>
+       verify.py rerun [--only ID ...] [--jobs N] [--timeout SECONDS] [--force] [-- ARGS ...]
        verify.py phases [<plan folder>]
        verify.py adopt <phase folder>
-       verify.py leftovers [--kill] [--root DIR ...]
+       verify.py leftovers [--kill] [--root DIR ...] [--running-since EPOCH]
        verify.py capacity [--native]
 
   where       print this branch's verification directory
   plan        the plan is complete: checks with every field, a Tier of e2e, unit, or walk on each (a perf check is
-              always e2e), and a perf decision. Prints the count per tier. An optional '- Exploration: <n> minutes'
-              line above '## Checks' replaces the 20-minute exploration timebox.
+              always e2e), and a perf decision. Prints the count per tier.
   driver      a project verification skill is on main, or was committed before any product change
   freeze      record the plan's hash before a verifier runs; --revision "<why; agreed by>"
               records a deliberate change to an already frozen plan
@@ -30,9 +28,8 @@ usage: verify.py <command> [--dir DIR]
               is backed by its tier's evidence: e2e by its <id>.check.<ext> script and an <id>.rerun.log from a passing
               rerun after the freeze; unit by the last `units` result, after the freeze, passing, on HEAD's tree, with
               a spec that names the check id; walk by a screenshot or video in evidence/<id>/ written after the freeze.
-              The files in evidence/explore/ span at most the plan's exploration timebox (20 minutes by default), and
-              every Exploration finding is triaged. A '## Review' section in report.md, or review.md, written after
-              the freeze, holds the code review's findings, each triaged, or 'none found'.
+              A '## Review' section in report.md, or review.md, written after the freeze, holds the code review's
+              findings, each triaged, or 'none found'.
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
               base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
@@ -42,9 +39,14 @@ usage: verify.py <command> [--dir DIR]
               Each run records units.json (per spec its verdict and the plan check ids its text names, so a test
               titled "U2: ..." proves unit check U2) and units.log in the verification directory, for `report`.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
-              instance id) to each; one PASS or FAIL line per check from its exit code, and a summary. Each script
-              gets 300 seconds unless --timeout raises it. Exits 0 with a "no saved check scripts" line when there
-              are none. A check script runs with zero arguments and provisions and tears down its own instance through
+              instance id) to each; one PASS or FAIL line per check from its exit code, in id order, and a summary. Each
+              script gets 300 seconds unless --timeout raises it. --jobs N runs up to N scripts at once, admitting the
+              next one only while `capacity` would pass (one always runs, so a busy machine slows the run instead of
+              stalling it); the plan's perf checks always run alone after the rest, because concurrent instances skew
+              every timing. Under --jobs, a file owned by a check that ran at the same time is not held against the
+              other, because that check may be rewriting its own evidence, and a loss seen while checks ran side by
+              side FAILs each of them with the names of the others, so `--only` finds the culprit. Exits 0 with a "no saved check scripts"
+              line when there are none. A check script runs with zero arguments and provisions and tears down its own instance through
               the project driver (optional ARGS may reuse a running instance); it cleans only its own evidence
               (evidence/<id>/ or files starting with <id>), never a shared folder, and a script that deletes or empties
               another check's file FAILs; the report cites <id>.rerun.log, not the script, and the log's last line is
@@ -57,26 +59,22 @@ usage: verify.py <command> [--dir DIR]
               each --only run in which it still fails is one failed fix attempt, counted in fix-attempts.json; after 2,
               --only refuses it, and the full rerun reports it as left FAIL without failing, because it goes to the
               user or the backlog. A check script finds the repository from its working directory, never a hard-coded
-              worktree path, so a later phase can carry it.
-  carry       copy the saved check scripts and their helpers from an earlier phase's verification directory (a branch
-              name, resolved beside this one, or a path) into this one, so rerun regrades that phase's checks without an
-              agent. Evidence, plans, reports, and logs stay behind, and so do the scripts of the source plan's perf checks,
-              because perf is measured where its path changes. A file that already exists here is kept, and named when it
-              differs. Refuses, copying nothing, when a script names another worktree of this repo, because it would
-              drive that worktree's code instead of this one's.
+              worktree path.
   phases      every phase of a feature plan has a sound verification plan: <plan folder>/phases/<phase>/plan.md for
-              each phase, each passing the plan rules, check ids unique across the whole feature (carried scripts keep
-              their ids), and, when <plan folder>/skeleton.patch exists, every phase holding a conformance check with a
-              Skeleton field naming the skeleton files and symbols it implements. Given a plan folder, it records it in
+              each phase, each passing the plan rules, check ids unique across the whole feature (the feature
+              plan's Acceptance list names each check by id), and, when <plan folder>/skeleton.patch exists, every
+              phase holding a conformance check with a Skeleton field naming the skeleton files and symbols it implements. Given a plan folder, it records it in
               this branch's verification directory, so the bare command (a gate) checks the same folder later.
   leftovers   list processes still running from this run's places: the verification directory,
               ~/.cache/parlor-verify-hello, $PARLOR_VERIFY_HOME, $VERIFY_SCRATCHPAD (the agent scratchpad),
               /tmp/salvo-*, each --root, and, when their parent is init, anything under a worktree of this repo
               (the user's own shells and editors live there). A process counts when its working directory
               (deleted ones included) or its command line is under one of them. The caller and its ancestors never
-              count. Exits 1 while any remain and 2 when the scan itself cannot run. --kill sends SIGTERM to each
-              process group, then SIGKILL to survivors, and rescans. When nothing remains but the 1-minute load
-              exceeds the core count, it also lists the busiest processes and flags those whose parent is init as
+              count. --running-since EPOCH says a delegate that is still running began then (guard passes it before a
+              spawn): a process started since may be that delegate's, so it is listed as in use by a running agent and
+              neither counted nor killed. Exits 1 while any remain and 2 when the scan itself cannot run. --kill sends
+              SIGTERM to each process group, then SIGKILL to survivors, and rescans. When nothing remains but the
+              1-minute load exceeds the core count, it also lists the busiest processes and flags those whose parent is init as
               likely leftovers (the exit code is unaffected).
   capacity    the machine has room for another heavy run: exits 0 when the 1-minute load is below ratio x cores
               (ratio 0.7, $VERIFY_MAX_LOAD_RATIO overrides) and no native app build is running, else exits 1. Native
@@ -105,6 +103,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 CHECK_FIELDS = ("Scenario", "Surface", "Evidence", "Pass")
@@ -126,8 +125,6 @@ TIERS = ("e2e", "unit", "walk")
 TIER_HELP = ("write e2e (isolation, permissions, revocation, wire compatibility, perf, or a cross-surface flow: a script the "
              "verifier writes, run on the real app), unit (logic: a spec the executor writes, graded by `verify.py units`), or "
              "walk (UI look and interaction: walked once on the real app, saved as a screenshot or video)")
-EXPLORE_MINUTES = 20
-EXPLORE_BOX = re.compile(r"^(\d+) minutes?$")
 MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"}
 
 
@@ -148,7 +145,6 @@ UNITS_LOG = "units.log"
 REVIEW = "review.md"
 HELPER_SUFFIXES = {".mjs", ".cjs", ".js", ".ts", ".py", ".sh"}
 EVIDENCE_DIR = "evidence"
-EXPLORE_DIR = "explore"
 LISTED_LOSSES = 5
 LOAD_RATIO = 0.7
 NATIVE_BUILDS = {
@@ -161,9 +157,12 @@ NATIVE_BUILDS = {
 SHELLS = {"sh", "bash", "zsh", "dash", "fish"}
 GLOB_MAGIC = re.compile(r"[*?\[]")
 KILL_WAIT_S = 3.0
+ADMIT_POLL_S = 1.0
+# ps rounds elapsed time to the second, so a start can read up to a second early.
+ELAPSED_SLACK_S = 1.0
+ELAPSED = re.compile(r"^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$")
 TOP_CPU = 5
 SALVO_GLOBS = ("/tmp/salvo-*", "/private/tmp/salvo-*")
-ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/[^\s'\"`;,()<>|&]+")
 # A scratch tree borrows the checkout's installed dependencies through symlinks, which pnpm 11's pre-run deps check rejects.
 SCRATCH_ENV = {"pnpm_config_verify_deps_before_run": "false"}
 
@@ -303,23 +302,9 @@ def check_tier(entry, problems, tiers, oracles):
         tiers[check_id] = value
 
 
-def explore_minutes(text, problems=None):
-    """The exploration timebox: a '- Exploration: <n> minutes' line above the plan's first section, else the default."""
-    for number, line in enumerate(text.splitlines(), 1):
-        if line.startswith("## "):
-            break
-        if (m := FIELD.match(line)) and m.group(1) == "Exploration":
-            if box := EXPLORE_BOX.match(m.group(2).strip()):
-                return int(box.group(1))
-            if problems is not None:
-                problems.append(f"{number}: Exploration must read '<n> minutes'")
-    return EXPLORE_MINUTES
-
-
 def lint_plan(text):
     """Return (problems, check ids, {oracle check id: tolerance}, {check id: tier}) for a plan's text."""
     problems, ids, oracles, tiers = [], [], {}, {}
-    explore_minutes(text, problems)
     found = sections(text.splitlines())
     if "Checks" not in found:
         problems.append("1: missing '## Checks' section")
@@ -662,18 +647,6 @@ def untriaged(body):
     return [f"has no 'Triage: fixed | new check | follow-up | pre-existing | dismissed': {f[:80]}" for f in findings if not TRIAGE.search(f)]
 
 
-def explore_problems(directory, minutes):
-    folder = directory / EVIDENCE_DIR / EXPLORE_DIR
-    times = [p.stat().st_mtime for p in folder.rglob("*") if p.is_file()] if folder.is_dir() else []
-    span = (max(times) - min(times)) / 60 if times else 0
-    if span <= minutes:
-        return []
-    return [f"exploration ran {span:.0f} minutes by its files in {EVIDENCE_DIR}/{EXPLORE_DIR}/, past its {minutes}-minute timebox. "
-            "End exploration at the box: move what was found after it out of that folder and triage it follow-up, or, when the "
-            "user agreed to a longer box, write '- Exploration: <n> minutes' above the plan's '## Checks' and record it with "
-            "`verify.py freeze --revision`"]
-
-
 def review_problems(directory, report, frozen_ts):
     """The code review: report.md's '## Review' section and review.md, written after the freeze, every finding triaged."""
     sources = [(directory / "report.md", section(report, "Review"))]
@@ -769,11 +742,6 @@ def cmd_report(directory, args):
                             "then set Head")
     if header.get("Author", "").strip() and header.get("Author", "").strip() == header.get("Verifier", "").strip():
         problems.append("the Verifier is the Author; a fresh agent must produce the verdicts")
-    exploration = section(report, "Exploration")
-    if not exploration:
-        problems.append("missing '## Exploration' section with the explorer's findings, or 'none found'")
-    problems += [f"exploration finding {p}" for p in untriaged(exploration)]
-    problems += explore_problems(directory, explore_minutes(text))
     problems += review_problems(directory, report, lock["frozen_ts"])
     units = load_units(directory)
     scripts = {script_id(p) for p in check_scripts(directory)}
@@ -880,8 +848,8 @@ def owned_by(path, check_id):
     return parts[0].startswith(check_id)
 
 
-def lost_files(before, after, check_id):
-    lost = sorted(str(p) for p, size in before.items() if size and not after.get(p) and not owned_by(p, check_id))
+def lost_files(before, after, owners):
+    lost = sorted(str(p) for p, size in before.items() if size and not after.get(p) and not any(owned_by(p, o) for o in owners))
     if len(lost) > LISTED_LOSSES:
         lost = [*lost[:LISTED_LOSSES], f"and {len(lost) - LISTED_LOSSES} more"]
     return lost
@@ -913,8 +881,8 @@ def fix_attempts(directory):
         return {}
 
 
-def run_check(directory, path, args, env):
-    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log."""
+def run_check(directory, path, args, env, concurrent=set):
+    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log. concurrent() names the checks that ran beside it."""
     check_id = script_id(path)
     command = script_command(path)
     before = file_sizes(directory)
@@ -931,13 +899,56 @@ def run_check(directory, path, args, env):
                 detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
         except subprocess.TimeoutExpired:
             verdict, detail = "FAIL", f"timed out after {args.timeout}s"
-    lost = lost_files(before, file_sizes(directory), check_id)
+    beside = sorted(concurrent())
+    lost = lost_files(before, file_sizes(directory), {check_id, *beside})
     if lost:
         verdict = "FAIL"
-        detail = f"deleted or emptied files that are not its own: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
+        culprit = f"files that are not its own were deleted or emptied while it ran beside {', '.join(beside)}" if beside else \
+            "deleted or emptied files that are not its own"
+        detail = f"{culprit}: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
     reason = detail.partition("\n")[0]
     (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}" + (f" ({reason})" if reason else "") + "\n")
     return verdict, detail
+
+
+def run_checks(directory, scripts, args, env):
+    """{check id: (verdict, detail, seconds)}: up to --jobs scripts at once while the machine has capacity, then perf checks alone."""
+    perf = perf_ids(directory)
+    batches = (([p for p in scripts if script_id(p) not in perf], args.jobs), ([p for p in scripts if script_id(p) in perf], 1))
+    results, beside, running = {}, {}, set()
+    turn = threading.Condition()
+    if args.jobs > 1:
+        load_ratio()
+
+    def beside_of(check_id):
+        with turn:
+            return set(beside[check_id])
+
+    def work(path, check_id):
+        started = time.time()
+        try:
+            verdict, detail = run_check(directory, path, args, env, lambda: beside_of(check_id))
+        except Exception as e:
+            verdict, detail = "FAIL", f"rerun could not run it: {type(e).__name__}: {e}"
+        with turn:
+            results[check_id] = (verdict, detail, time.time() - started)
+            running.discard(check_id)
+            turn.notify_all()
+
+    with turn:
+        for batch, width in batches:
+            for path in batch:
+                while running and (len(running) >= width or not has_capacity()):
+                    turn.wait(ADMIT_POLL_S)
+                check_id = script_id(path)
+                beside[check_id] = set(running)
+                for other in running:
+                    beside[other].add(check_id)
+                running.add(check_id)
+                threading.Thread(target=work, args=(path, check_id), daemon=True).start()
+            while running:
+                turn.wait()
+    return results
 
 
 def cmd_rerun(directory, args):
@@ -968,18 +979,18 @@ def cmd_rerun(directory, args):
     if not args.only:
         stamp_path.unlink(missing_ok=True)
     env = {**os.environ, "VERIFY_DIR": str(directory)}
+    results = run_checks(directory, scripts, args, env)
     lines, failed, known = [], [], []
     for path in scripts:
         check_id = script_id(path)
-        started = time.time()
-        verdict, detail = run_check(directory, path, args, env)
+        verdict, detail, seconds = results[check_id]
         if verdict == "FAIL":
             failed.append(check_id)
             if check_id in left:
                 known.append(check_id)
                 detail = "left FAIL: its fix budget is spent and report.md marks it FAIL" + (f"; {detail}" if detail else "")
         head, _, rest = detail.partition("\n")
-        lines.append(f"{verdict:<5} {check_id}  ({time.time() - started:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
+        lines.append(f"{verdict:<5} {check_id}  ({seconds:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
     summary = f"rerun: {len(scripts)} checks, {len(scripts) - len(failed)} PASS, {len(failed)} FAIL"
     summary += f" ({len(known)} left FAIL after the fix budget)" if known else ""
     lines.append(summary + (" (--only: no stamp; the full rerun decides the gate)" if args.only else ""))
@@ -998,16 +1009,6 @@ def cmd_rerun(directory, args):
     return "\n".join(lines)
 
 
-def source_directory(directory, ref):
-    path = pathlib.Path(ref).expanduser()
-    source = path if path.is_dir() else directory.parent / ref.replace("/", "-")
-    if not source.is_dir():
-        raise Failed(f"no verification directory for {ref!r}: not a directory, and {source} does not exist")
-    if source.resolve() == directory.resolve():
-        raise Failed(f"{ref!r} is this branch's own verification directory; carry from the phase before it")
-    return source
-
-
 def perf_ids(directory):
     path = directory / "plan.md"
     if not path.is_file():
@@ -1016,23 +1017,8 @@ def perf_ids(directory):
     return {check_id for entry in perf if (check_id := entry_id(entry))}
 
 
-def named_paths(text):
-    """Every absolute path a script names, resolved, so /tmp and /private/tmp spell one place."""
-    return {os.path.realpath(token) for token in ABSOLUTE_PATH.findall(text)}
-
-
 def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
-
-
-def foreign_worktrees(paths, worktrees, current):
-    """Other worktrees among these paths; a path belongs to the deepest worktree it sits under."""
-    found = set()
-    for path in paths:
-        owners = [w for w in worktrees if under(path, w)]
-        if owners and (owner := max(owners, key=len)) != current:
-            found.add(owner)
-    return sorted(found)
 
 
 PHASES_POINTER = "phases.json"
@@ -1086,50 +1072,6 @@ def conformance_checks(text):
     return [c for c in checks if (field := c["fields"].get("Skeleton")) and field[1] and not PLACEHOLDER.search(field[1])]
 
 
-def cmd_carry(directory, args):
-    if len(args.rest) != 1:
-        raise Failed("carry takes one <branch or directory>: the earlier phase's")
-    source = source_directory(directory, args.rest[0])
-    perf = perf_ids(source)
-    scripts = [p for p in check_scripts(source) if script_id(p) not in perf]
-    left = sorted(script_id(p) for p in check_scripts(source) if script_id(p) in perf)
-    helpers = [p for p in helper_files(source) if not (p.parent == source and CHECK_SCRIPT.match(p.name))]
-    files = sorted({*scripts, *helpers})
-    if not files:
-        raise Failed(f"no saved check scripts or helpers in {source}")
-    try:
-        current = os.path.realpath(git("rev-parse", "--show-toplevel"))
-    except Failed:
-        current = None
-    worktrees = {os.path.realpath(w) for w in worktree_paths()} if current else set()
-    problems = []
-    for path in files:
-        paths, name = named_paths(path.read_text(errors="replace")), path.relative_to(source)
-        problems += [f"{name} names {w}, another worktree; make it find the repository from its working directory "
-                     "(git rev-parse --show-toplevel)" for w in foreign_worktrees(paths, worktrees, current)]
-        if any(under(n, os.path.realpath(source)) for n in paths):
-            problems.append(f"{name} names {source}, the earlier phase's verification directory; make it write to $VERIFY_DIR "
-                            "or its own folder")
-    if problems:
-        raise Failed("carried nothing:\n" + "\n".join(problems))
-    copied, kept = [], []
-    for path in files:
-        target = directory / path.relative_to(source)
-        if target.exists():
-            if target.read_bytes() != path.read_bytes():
-                kept.append(str(path.relative_to(source)))
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-        copied.append(path)
-    ids = sorted(script_id(p) for p in copied if p in scripts)
-    lines = [f"carry: {len(ids)} check scripts and {len(copied) - len(ids)} helpers from {source}" + (f": {' '.join(ids)}" if ids else "")]
-    if left:
-        lines.append(f"left behind perf checks {' '.join(left)}: perf is measured where its path changes")
-    lines += [f"kept this directory's {name}, which differs from the source's" for name in kept]
-    return "\n".join(lines)
-
-
 def changed_specs(base, head):
     names = git("diff", "--name-only", "--diff-filter=ACMR", base, head).splitlines()
     return [n for n in names if SPEC_FILE.search(n)]
@@ -1171,17 +1113,26 @@ def run_in_group(command, timeout, **kwargs):
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
+def started_at(elapsed, now):
+    """When a process started, from ps's elapsed time ([[dd-]hh:]mm:ss), or None when it does not parse."""
+    m = ELAPSED.match(elapsed)
+    if not m:
+        return None
+    days, hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    return now - (((days * 24 + hours) * 60 + minutes) * 60 + seconds)
+
+
 def process_table():
     try:
         out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,pcpu=,command="], capture_output=True, text=True, timeout=15).stdout
     except (OSError, subprocess.TimeoutExpired) as e:
         raise CannotScan(f"cannot list processes with ps: {e}")
-    rows = []
+    now, rows = time.time(), []
     for line in out.splitlines():
         parts = line.split(None, 6)
         if len(parts) == 7 and parts[0].isdigit():
             rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "pgid": int(parts[2]), "stat": parts[3],
-                         "elapsed": parts[4], "cpu": float(parts[5]), "command": parts[6]})
+                         "elapsed": parts[4], "started": started_at(parts[4], now), "cpu": float(parts[5]), "command": parts[6]})
     return rows
 
 
@@ -1305,18 +1256,32 @@ def load_report():
     return "\n".join([f"load {load:.1f} exceeds {cores} cores and no leftovers matched; busiest processes:", *busiest_lines()])
 
 
+def split_in_use(found, running_since):
+    """(leftovers, in use): a process started since a delegate that is still running began may be that delegate's."""
+    if running_since is None:
+        return found, []
+    busy = [p for p in found if p.get("started") is not None and p["started"] >= running_since - ELAPSED_SLACK_S]
+    return [p for p in found if p not in busy], busy
+
+
+def scan_leftovers(roots, orphan_roots, running_since):
+    return split_in_use(find_leftovers(roots, orphan_roots), running_since)
+
+
 def cmd_leftovers(directory, args):
     roots, orphan_roots = [*default_roots(directory), *(args.root or [])], worktree_paths()
-    found = find_leftovers(roots, orphan_roots)
+    found, busy = scan_leftovers(roots, orphan_roots, args.running_since)
     killed = len(found) if args.kill else 0
     if found and args.kill:
         stop_processes(found)
-        found = find_leftovers(roots, orphan_roots)
+        found, busy = scan_leftovers(roots, orphan_roots, args.running_since)
+    spared = ([f"{len(busy)} in use by a running agent, started after it began, so neither counted nor killed:"]
+              + [describe(p) for p in busy]) if busy else []
     if found:
         script = shlex.quote(str(pathlib.Path(__file__).resolve()))
-        raise Failed("\n" + "\n".join(describe(p) for p in found)
-                     + f"\n{len(found)} still running. Stop them with: python3 {script} leftovers --kill")
-    lines = ["leftovers: " + (f"killed {killed}, " if killed else "") + "none remain"]
+        raise Failed("\n" + "\n".join([*(describe(p) for p in found),
+                                        f"{len(found)} still running. Stop them with: python3 {script} leftovers --kill", *spared]))
+    lines = ["leftovers: " + (f"killed {killed}, " if killed else "") + "none remain", *spared]
     return "\n".join([*lines, load_report()]).strip()
 
 
@@ -1444,6 +1409,10 @@ def native_builds(table):
     return found
 
 
+def has_capacity():
+    return os.getloadavg()[0] < load_ratio() * (os.cpu_count() or 1)
+
+
 def cmd_capacity(directory, args):
     load, cores = os.getloadavg()[0], os.cpu_count() or 1
     threshold = load_ratio() * cores
@@ -1462,7 +1431,7 @@ def indent(text):
 
 
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
-            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "carry": cmd_carry,
+            "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun,
             "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
 
 
@@ -1479,13 +1448,17 @@ def main():
     parser.add_argument("--spec", action="append")
     parser.add_argument("--only", action="append")
     parser.add_argument("--timeout", type=int)
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--running-since", type=float)
     parser.add_argument("rest", nargs="*")
     argv = sys.argv[1:]
     passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
     args = parser.parse_intermixed_args(argv[:len(argv) - len(passthrough) - 1] if "--" in argv else argv)
     args.rest += passthrough
-    if args.rest and args.command not in ("units", "rerun", "carry", "phases", "adopt"):
+    if args.rest and args.command not in ("units", "rerun", "phases", "adopt"):
         parser.error(f"{args.command} takes no arguments")
+    if args.jobs < 1:
+        parser.error("--jobs needs at least 1")
     args.timeout = args.timeout or (RERUN_TIMEOUT if args.command == "rerun" else SCRIPT_TIMEOUT)
     try:
         try:

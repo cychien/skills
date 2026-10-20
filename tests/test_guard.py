@@ -519,6 +519,15 @@ class Guard(unittest.TestCase):
                 print("pid 42 ppid 1 pgid 42 elapsed 03:00 cwd /work/app  node server.js")
                 print("1 still running. Stop them with: python3 verify.py leftovers --kill")
                 sys.exit(1)
+            if mode == "in use":
+                if "--running-since" in sys.argv:
+                    print("leftovers: none remain")
+                    print("1 in use by a running agent, started after it began, so neither counted nor killed:")
+                    print("pid 43 ppid 1 pgid 43 elapsed 01:00 cwd /work/app-v7  node bridge.js")
+                    sys.exit(0)
+                print("pid 43 ppid 1 pgid 43 elapsed 01:00 cwd /work/app-v7  node bridge.js")
+                print("1 still running. Stop them with: python3 verify.py leftovers --kill")
+                sys.exit(1)
             if mode == "broken":
                 print("verify leftovers: cannot read process working directories")
                 sys.exit(2)
@@ -554,6 +563,45 @@ class Guard(unittest.TestCase):
         self.assertFalse(calls.exists())
         self.fake_verify("clean")
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "verify it"}}))
+
+    def spawn(self, agent_id=None):
+        payload = {"tool_name": "Agent", "tool_input": {"prompt": "verify it"}}
+        out = self.hook("PreToolUse", {**payload, "agent_id": agent_id} if agent_id else payload)
+        return out["hookSpecificOutput"]["permissionDecision"] if out else "allow"
+
+    def last_sweep(self, calls):
+        return calls.read_text().splitlines()[-1].split()
+
+    def test_a_running_delegates_processes_are_in_use_not_leftovers_until_it_ends(self):
+        calls = self.fake_verify("in use")
+        self.assertEqual(self.spawn(), "deny")
+        before = time.time()
+        self.hook("PreToolUse", {"agent_id": "bg1", "tool_name": "Bash", "tool_input": {"command": "node hello.mjs up --id v7"}})
+        self.hook("PreToolUse", {"agent_id": "bg1", "tool_name": "Bash", "tool_input": {"command": "node hello.mjs browser v7 open /"}})
+        self.assertEqual(self.spawn(), "allow")
+        sweep = self.last_sweep(calls)
+        self.assertEqual(sweep[:2], ["leftovers", "--running-since"])
+        self.assertAlmostEqual(float(sweep[2]), before, delta=5)
+        self.assertEqual(self.spawn("bg1"), "deny")
+        self.assertEqual(self.last_sweep(calls), ["leftovers"])
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "bg1", "last_assistant_message": "done"}), None)
+        self.assertEqual(self.spawn(), "deny")
+        self.hook("PreToolUse", {"agent_id": "bg1", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertEqual(self.spawn(), "allow")
+        self.assertEqual(float(self.last_sweep(calls)[2]), float(sweep[2]))
+
+    def test_a_delegate_stops_running_when_its_task_is_stopped_or_the_lead_ends_with_no_background_work(self):
+        calls = self.fake_verify("in use")
+        for agent_id in ("bg1", "bg2"):
+            self.hook("PreToolUse", {"agent_id": agent_id, "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.hook("PostToolUse", {"tool_name": "TaskStop", "tool_input": {"task_id": "bg1"}})
+        self.assertEqual(self.last_sweep(calls)[:3], ["leftovers", "--kill", "--running-since"])
+        self.stop("Waiting for the verifier.", background_tasks=[{"id": "bg2"}])
+        self.assertEqual(self.spawn(), "allow")
+        self.stop("Done.")
+        self.assertEqual(self.spawn(), "deny")
+        self.hook("PostToolUse", {"tool_name": "TaskStop", "tool_input": {"task_id": "bg2"}})
+        self.assertEqual(self.last_sweep(calls), ["leftovers", "--kill"])
 
     def test_the_leftovers_sweep_fails_open_and_says_why(self):
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "x"}}))
@@ -649,7 +697,7 @@ class ShippedPlaybooks(unittest.TestCase):
     def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_final_rerun_and_report(self):
         mandatory = self.gated_mandatory_steps("feature")
         self.assertEqual(mandatory, {1: {"plan"}, 2: set(), 5: {"lock"}, 7: {"driver"}, 8: {"units"}, 10: {"oracles"},
-                                     12: set(), 13: set(), 14: {"rerun", "report", "leftovers"}})
+                                     12: set(), 13: {"rerun", "report", "leftovers"}})
 
     def test_the_step_that_opens_the_pr_is_the_one_the_final_run_gates(self):
         sys.path.insert(0, str(GUARD.parent))

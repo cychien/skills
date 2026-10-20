@@ -95,14 +95,49 @@ def handle(event):
     if event.kind == "prompt":
         return on_prompt(event)
     if event.kind == "pre_tool":
+        if event.agent_id:
+            delegate_acts(event)
         return on_pre_tool(event)
     if event.kind == "post_tool":
         return on_post_tool(event)
     if event.kind == "stop" and not event.agent_id:
+        if not event.waiting_on_background:
+            delegates_end(event)
         return on_stop(event)
     if event.kind in ("stop", "subagent_stop") and event.agent_id:
-        return on_subagent_stop(event)
+        decision = on_subagent_stop(event)
+        if decision == PASS:
+            delegates_end(event, {event.agent_id})
+        return decision
     return PASS
+
+
+def delegate_acts(event):
+    """Mark a subagent running from its first tool call; one whose stop went through but that acts again keeps its start."""
+    if state.exists(event.agent, event.session) and state.load(event.agent, event.session).get("delegates", {}).get(event.agent_id, {}).get("running"):
+        return
+    with state.update(event.agent, event.session) as data:
+        data.setdefault("delegates", {}).setdefault(event.agent_id, {"since": time.time()})["running"] = True
+
+
+def delegates_end(event, ids=None):
+    """Mark these subagents, or all of them, no longer running: a lead stop with no background work outlives every delegate."""
+    if not state.exists(event.agent, event.session):
+        return
+    ending = [i for i, d in state.load(event.agent, event.session).get("delegates", {}).items() if d.get("running") and (ids is None or i in ids)]
+    if not ending:
+        return
+    with state.update(event.agent, event.session) as data:
+        for agent_id in ending:
+            data["delegates"][agent_id]["running"] = False
+
+
+def running_since(event):
+    """When the earliest subagent still running, other than the caller, began; its processes may be any started since."""
+    if not state.exists(event.agent, event.session):
+        return None
+    starts = [d["since"] for i, d in state.load(event.agent, event.session).get("delegates", {}).items() if d.get("running") and i != event.agent_id]
+    return min(starts) if starts else None
 
 
 def todo_hint(skill, event):
@@ -179,11 +214,14 @@ def files_read(event):
 
 
 def sweep_leftovers(event, *flags):
-    """Run the verify skill's leftovers sweep. Returns (exit code, output), or None when it cannot run, which is logged and never blocks the agent."""
+    """Run the verify skill's leftovers sweep, sparing what a running delegate may own. Returns (exit code, output), or None when it cannot run, which is logged and never blocks the agent."""
     found = skills.find("verify", event.cwd)
     script = found.parent / "scripts" / "verify.py" if found else None
     if not script or not script.is_file():
         return skipped("the verify skill is not installed")
+    since = running_since(event)
+    if since is not None:
+        flags = (*flags, "--running-since", f"{since:.3f}")
     try:
         r = subprocess.run([sys.executable, str(script), "leftovers", *flags], cwd=event.cwd, capture_output=True, text=True, timeout=LEFTOVERS_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as e:
@@ -206,6 +244,9 @@ def skipped(why):
 
 def on_post_tool(event):
     if (event.tool or "").lower() == "taskstop":
+        stopped = event.tool_input.get("task_id") if isinstance(event.tool_input, dict) else None
+        if stopped:
+            delegates_end(event, {stopped})
         swept = sweep_leftovers(event, "--kill")
         return ("context", swept[1]) if swept and swept[1] and event.can_inject else PASS
     loaded, read, invoked = [], [], set()

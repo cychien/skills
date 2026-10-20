@@ -32,4 +32,4 @@ Open a todolist whose first items are the steps below, copied in verbatim, befor
 9. Rebase into small, ordered commits: any probe or harness first, then each kept fix.
 10. Run the **open-pr** skill (`../open-pr/SKILL.md`), with the primary number in the Verification section.
 
-**Reply:** baseline number, post-fix number, delta, limiter, data source, artifact path, and every exploration finding with its triage. Write it per the **reply** skill (`../reply/SKILL.md`).
+**Reply:** baseline number, post-fix number, delta, limiter, data source, artifact path, and every review finding with its triage. Write it per the **reply** skill (`../reply/SKILL.md`).

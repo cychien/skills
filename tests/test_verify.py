@@ -61,10 +61,6 @@ REPORT = """\
     | B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |
     | P1 | PASS | P1-runs.txt | p50 41 ms on both sides |
 
-    ## Exploration
-
-    none found
-
     ## Review
 
     none found
@@ -106,11 +102,11 @@ class Verify(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_verify(self, command, *extra, ok=True, cwd=None):
+    def run_verify(self, command, *extra, ok=True, cwd=None, env=None):
         args = [sys.executable, "-I", str(VERIFY), command, *extra]
         if cwd is None:
             args += ["--dir", str(self.dir)]
-        env = {**os.environ, "VERIFY_HOME": str(self.base / "home")}
+        env = {**os.environ, "VERIFY_HOME": str(self.base / "home"), **(env or {})}
         r = subprocess.run(args, capture_output=True, text=True, cwd=cwd or self.base, env=env)
         self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
         return r.stdout
@@ -247,21 +243,6 @@ class Verify(unittest.TestCase):
         self.ready_report()
         self.write("report.md", plan(REPORT).replace("Verifier: codex:gpt-5.6-sol", "Verifier: claude:claude-opus-5-5"))
         self.assertIn("Verifier is the Author", self.run_verify("report", ok=False))
-
-    def test_the_report_needs_an_exploration_section(self):
-        self.ready_report()
-        self.write("report.md", plan(REPORT).split("## Exploration")[0])
-        self.assertIn("Exploration", self.run_verify("report", ok=False))
-
-    def test_every_exploration_finding_needs_a_triage(self):
-        self.ready_report()
-        found = plan(REPORT).replace("none found", "- A 20-digit customer id drops the connection instead of a 404.")
-        self.write("report.md", found)
-        self.assertIn("has no 'Triage:", self.run_verify("report", ok=False))
-        self.write("report.md", found.replace("instead of a 404.", "instead of a 404. Triage: follow-up, the error wording only; user agreed"))
-        self.run_verify("report")
-        self.write("report.md", found.replace("instead of a 404.", "instead of a 404. Triage: pre-existing, main crashes the same way"))
-        self.run_verify("report")
 
     def test_a_plan_edited_after_freezing_needs_a_recorded_revision(self):
         self.ready_report()
@@ -410,6 +391,51 @@ class Verify(unittest.TestCase):
         self.assertNotIn("B1-own", out)
         self.assertNotIn("evidence/B1", out)
 
+    MEET = ('d="$(dirname "$0")"; touch "$d/{me}.started"\n'
+            'for i in $(seq 30); do [ -e "$d/{other}.started" ] && exit 0; sleep 0.1; done\necho "{other} never ran beside it"; exit 1\n')
+
+    def meeting_checks(self):
+        for name in self.dir.glob("*.started"):
+            name.unlink()
+        self.check_script("B1.check.sh", self.MEET.format(me="B1", other="B2"))
+        self.check_script("B2.check.sh", self.MEET.format(me="B2", other="B1"))
+
+    def test_rerun_jobs_runs_scripts_side_by_side_and_reports_them_in_id_order(self):
+        self.meeting_checks()
+        self.assertRegex(self.run_verify("rerun", ok=False), r"FAIL\s+B1.*\n\s+B2 never ran beside it")
+        self.meeting_checks()
+        out = self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
+        self.assertRegex(out, r"^PASS\s+B1 .*\nPASS\s+B2 .*\nrerun: 2 checks, 2 PASS, 0 FAIL\n$")
+        self.assertEqual((self.dir / "B2.rerun.log").read_text(), "rerun: PASS\n")
+
+    def test_rerun_jobs_admits_another_script_only_while_the_machine_has_capacity(self):
+        self.meeting_checks()
+        out = self.run_verify("rerun", "--jobs", "2", ok=False, env={"VERIFY_MAX_LOAD_RATIO": "0.000001"})
+        self.assertRegex(out, r"FAIL\s+B1.*\n\s+B2 never ran beside it")
+        self.assertRegex(out, r"PASS\s+B2")
+        self.assertIn("--jobs needs at least 1", subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--jobs", "0", "--dir", str(self.dir)],
+                                                                capture_output=True, text=True).stderr)
+
+    def test_rerun_jobs_runs_perf_checks_alone_after_the_rest(self):
+        self.write("plan.md", plan(CHECKS, PERF_MAIN.replace("P1", "A0")))
+        self.meeting_checks()
+        self.check_script("A0.check.sh", 'd="$(dirname "$0")"; ls "$d"/*.started >/dev/null 2>&1 || exit 1\n'
+                                         'for c in B1 B2; do [ -e "$d/$c.rerun.log" ] || { echo "$c still running"; exit 1; }; done\n')
+        out = self.run_verify("rerun", "--jobs", "3", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
+        self.assertRegex(out, r"^PASS\s+A0 .*\nPASS\s+B1 .*\nPASS\s+B2 ")
+
+    def test_rerun_jobs_never_blames_a_check_for_the_evidence_a_concurrent_check_is_rewriting(self):
+        for name in ("evidence/B1/shot.png", "evidence/W1/walk.png"):
+            (self.dir / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.dir / name).write_text("png")
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; rm "$d/evidence/B1/shot.png"; sleep 1.5; echo png > "$d/evidence/B1/shot.png"\n')
+        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; sleep 1.2; rm "$d/evidence/W1/walk.png"\n')
+        out = self.run_verify("rerun", "--jobs", "2", ok=False, env={"VERIFY_MAX_LOAD_RATIO": "1000"})
+        self.assertRegex(out, r"FAIL\s+B1 .*files that are not its own were deleted or emptied while it ran beside B2: evidence/W1/walk.png\n")
+        self.assertRegex(out, r"FAIL\s+B2 .*while it ran beside B1: evidence/W1/walk.png\n")
+        self.check_script("B2.check.sh", "sleep 1.2\n")
+        self.assertRegex(self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"PASS\s+B1 .*\nPASS\s+B2 ")
+
     def test_every_check_names_its_tier_and_the_plan_counts_them(self):
         self.write("plan.md", plan(CHECKS, UNIT, WALK, PERF_MAIN))
         self.assertIn("plan ok, 4 checks, 0 oracle checks; tiers: e2e 2, unit 1, walk 1", self.run_verify("plan"))
@@ -423,8 +449,6 @@ class Verify(unittest.TestCase):
         self.assertIn("a perf check is always e2e", self.run_verify("plan", ok=False))
         self.write("plan.md", plan(CHECKS, self.ORACLE.replace("Tier: e2e", "Tier: unit"), PERF_NA))
         self.assertIn("an oracle check reads its value from the running app, so its Tier is e2e or walk", self.run_verify("plan", ok=False))
-        self.write("plan.md", plan(CHECKS, PERF_NA).replace("## Checks", "- Exploration: half an hour\n\n## Checks"))
-        self.assertIn("Exploration must read '<n> minutes'", self.run_verify("plan", ok=False))
 
     def b1_report(self):
         self.write("plan.md", plan(CHECKS, PERF_NA))
@@ -464,26 +488,6 @@ class Verify(unittest.TestCase):
         self.assertIn("holds no screenshot or video", self.run_verify("report", ok=False))
         (folder / "share-row.PNG").write_text("png")
         self.assertIn("report ok: 1 checks", self.run_verify("report"))
-
-    def explore(self, *minutes):
-        folder = self.dir / "evidence" / "explore"
-        folder.mkdir(parents=True, exist_ok=True)
-        start = time.time() - 3600
-        for n, at in enumerate(minutes):
-            path = folder / f"finding-{n}.png"
-            path.write_text("png")
-            os.utime(path, (start + at * 60, start + at * 60))
-
-    def test_exploration_evidence_must_fit_its_timebox(self):
-        self.ready_report()
-        self.explore(0, 12, 19)
-        self.run_verify("report")
-        self.explore(0, 12, 19, 25)
-        self.assertIn("exploration ran 25 minutes by its files in evidence/explore/, past its 20-minute timebox",
-                      self.run_verify("report", ok=False))
-        self.write("plan.md", plan(CHECKS, PERF_MAIN).replace("## Checks", "- Exploration: 30 minutes\n\n## Checks"))
-        self.run_verify("freeze", "--revision", "exploration box raised to 30 minutes for the sync flows; agreed by the user")
-        self.run_verify("report")
 
     def test_the_report_needs_a_triaged_code_review_written_after_the_freeze(self):
         self.ready_report()
@@ -848,92 +852,6 @@ class Phases(unittest.TestCase):
         self.assertIn("no conformance check", self.phases(str(self.root), ok=False))
 
 
-class Carry(unittest.TestCase):
-    """Phase 1 lives on feat-1 in the main checkout; phase 2 is a worktree nested inside it, on feat-2."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.base = pathlib.Path(self.tmp.name)
-        self.repo = self.base / "app"
-        self.repo.mkdir()
-        self.git(self.repo, "init", "-q", "-b", "main")
-        (self.repo / ".gitignore").write_text(".worktrees/\n")
-        (self.repo / "server.py").write_text("print('app')\n")
-        self.git(self.repo, "add", ".")
-        self.git(self.repo, "commit", "-qm", "Start the app")
-        self.git(self.repo, "checkout", "-qb", "feat-1")
-        self.phase2 = self.repo / ".worktrees" / "two"
-        self.git(self.repo, "worktree", "add", "-q", "-b", "feat-2", str(self.phase2))
-        self.env = {**os.environ, "VERIFY_HOME": str(self.base / "home")}
-        self.one = pathlib.Path(self.verify(self.repo, "where").strip())
-        self.two = pathlib.Path(self.verify(self.phase2, "where").strip())
-        (self.one / "plan.md").write_text(plan(CHECKS, PERF_MAIN))
-        self.put(self.one, "B1.check.sh", 'node "$(dirname "$0")/lib/drive.mjs" >/dev/null 2>&1; echo ok > "$VERIFY_DIR/B1-own.txt"\n')
-        self.put(self.one, "P1.check.sh", "exit 0\n")
-        self.put(self.one, "lib/drive.mjs", "export const drive = () => 1\n")
-        for name in ("B1-terminal.txt", "B1.rerun.log", "B1.observed.json", "report.md", "plan.lock", "rerun.stamp.json",
-                     "evidence/B1/shot.png", "evidence/B1/trace.js"):
-            self.put(self.one, name, "x\n")
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def git(self, cwd, *args):
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True, capture_output=True)
-
-    def put(self, directory, name, text):
-        path = directory / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
-
-    def verify(self, cwd, command, *args, ok=True):
-        r = subprocess.run([sys.executable, "-I", str(VERIFY), command, *args], cwd=cwd, capture_output=True, text=True, env=self.env)
-        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
-        return r.stdout
-
-    def carried(self):
-        return sorted(str(p.relative_to(self.two)) for p in self.two.rglob("*") if p.is_file())
-
-    def test_carries_check_scripts_and_helpers_but_never_evidence_or_perf_checks(self):
-        out = self.verify(self.phase2, "carry", "feat-1")
-        self.assertIn(f"carry: 1 check scripts and 1 helpers from {self.one}: B1", out)
-        self.assertIn("left behind perf checks P1", out)
-        self.assertEqual(self.carried(), ["B1.check.sh", "lib/drive.mjs"])
-        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL", self.verify(self.phase2, "rerun"))
-        self.assertTrue((self.two / "B1-own.txt").exists())
-        self.assertFalse((self.one / "B1-own.txt").exists())
-
-    def test_a_path_source_and_a_second_carry_copy_nothing_new_and_keep_a_changed_script(self):
-        self.verify(self.phase2, "carry", str(self.one))
-        self.put(self.two, "B1.check.sh", "exit 0\n")
-        out = self.verify(self.phase2, "carry", "feat-1")
-        self.assertIn("carry: 0 check scripts and 0 helpers", out)
-        self.assertIn("kept this directory's B1.check.sh, which differs from the source's", out)
-        self.assertEqual((self.two / "B1.check.sh").read_text(), "exit 0\n")
-
-    def test_refuses_a_script_that_drives_another_worktree_and_copies_nothing(self):
-        self.put(self.one, "B2.check.sh", f"cd {self.phase2}/sub && python3 {self.repo}/server.py\n")
-        out = self.verify(self.phase2, "carry", "feat-1", ok=False)
-        self.assertIn(f"B2.check.sh names {os.path.realpath(self.repo)}, another worktree", out)
-        self.assertEqual(out.count("another worktree"), 1)
-        self.assertEqual(self.carried(), [])
-
-    def test_a_path_inside_this_worktree_is_not_foreign(self):
-        self.put(self.one, "B2.check.sh", f"cd {self.phase2} && python3 {self.phase2}/server.py\n")
-        self.assertIn("2 check scripts", self.verify(self.phase2, "carry", "feat-1"))
-
-    def test_refuses_a_script_that_writes_into_the_earlier_phase_directory(self):
-        self.put(self.one, "B2.check.sh", f"echo ok > {self.one}/B2-out.txt\n")
-        out = self.verify(self.phase2, "carry", "feat-1", ok=False)
-        self.assertIn("B2.check.sh names", out)
-        self.assertIn("the earlier phase's verification directory", out)
-
-    def test_a_missing_source_or_this_branch_is_an_error(self):
-        self.assertIn("does not exist", self.verify(self.phase2, "carry", "feat-0", ok=False))
-        self.assertIn("this branch's own verification directory", self.verify(self.phase2, "carry", "feat-2", ok=False))
-        self.assertIn("carry takes one", self.verify(self.phase2, "carry", ok=False))
-
-
 class RepoFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1115,10 +1033,6 @@ class UnitTier(RepoFixture):
             |---|---|---|---|
             | U1 | PASS | units.log | the spec fails on base and passes at head |
 
-            ## Exploration
-
-            none found
-
             ## Review
 
             none found
@@ -1221,6 +1135,23 @@ class Leftovers(unittest.TestCase):
         self.assertTrue(gone(p.pid))
         self.assertIn("none", self.leftovers("--root", str(self.root)))
 
+    def test_a_process_started_since_a_running_delegate_began_is_in_use_and_never_killed(self):
+        orphan = self.spawn(self.root)
+        time.sleep(2)
+        since = time.time()
+        busy = self.spawn(self.root, sys.executable, "-c", "import time; time.sleep(300)", str(self.root / "bridge.js"))
+        out = self.leftovers("--root", str(self.root), "--running-since", str(since), ok=False)
+        listed, _, spared = out.partition("in use by a running agent")
+        self.assertRegex(listed, rf"\bpid {orphan.pid}\b")
+        self.assertNotRegex(listed, rf"\bpid {busy.pid}\b")
+        self.assertIn("1 still running", listed)
+        self.assertRegex(spared, rf"\bpid {busy.pid}\b")
+        out = self.leftovers("--kill", "--root", str(self.root), "--running-since", str(since))
+        self.assertRegex(out, rf"^leftovers: killed 1, none remain\n1 in use by a running agent, started after it began, so neither counted nor killed:\npid {busy.pid}\b")
+        self.assertTrue(gone(orphan.pid))
+        self.assertTrue(alive(busy.pid))
+        self.assertRegex(self.leftovers("--root", str(self.root), ok=False), rf"\bpid {busy.pid}\b")
+
     def test_a_process_ignoring_sigterm_is_killed(self):
         script = "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('ready', flush=True)\ntime.sleep(300)\n"
         p = subprocess.Popen([sys.executable, "-c", script], cwd=self.root, start_new_session=True, stdout=subprocess.PIPE, text=True)
@@ -1295,7 +1226,7 @@ class Leftovers(unittest.TestCase):
         with mock.patch.object(verify, "signal_processes"), mock.patch.object(verify, "KILL_WAIT_S", 0.2), \
                 mock.patch.object(verify, "default_roots", return_value=[]), mock.patch.object(verify, "worktree_paths", return_value=[]):
             with self.assertRaises(verify.Failed) as raised:
-                verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=True))
+                verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=True, running_since=None))
         self.assertIn(str(p.pid), str(raised.exception))
 
     def test_high_load_with_nothing_left_names_the_top_cpu_processes(self):
@@ -1308,7 +1239,7 @@ class Leftovers(unittest.TestCase):
         with mock.patch.object(verify, "process_table", return_value=table), mock.patch.object(verify, "process_cwds", return_value=cwds), \
                 mock.patch.object(verify.os, "getloadavg", return_value=(50.0, 40.0, 30.0)), mock.patch.object(verify.os, "cpu_count", return_value=8), \
                 mock.patch.object(verify, "default_roots", return_value=[]), mock.patch.object(verify, "worktree_paths", return_value=[]):
-            out = verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=False))
+            out = verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=False, running_since=None))
         self.assertIn("load 50.0 exceeds 8 cores", out)
         first, second = [line for line in out.splitlines() if "drizzle-kit" in line or "vitest" in line]
         self.assertIn("900", first)
@@ -1326,7 +1257,7 @@ class Leftovers(unittest.TestCase):
     def test_normal_load_prints_no_cpu_report(self):
         with mock.patch.object(verify.os, "getloadavg", return_value=(0.5, 0.5, 0.5)), \
                 mock.patch.object(verify, "default_roots", return_value=[]), mock.patch.object(verify, "worktree_paths", return_value=[]):
-            out = verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=False))
+            out = verify.cmd_leftovers(None, mock.Mock(root=[str(self.root)], kill=False, running_since=None))
         self.assertNotIn("exceeds", out)
 
 

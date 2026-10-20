@@ -9,7 +9,7 @@ Write it as `plan.md` in the verification directory that `python3 ../scripts/ver
 - **Check.** One acceptance condition, written in the plan before any code and locked. Its fields are Scenario, Surface, Evidence, Pass, Oracle, and Tier.
 - **Verify.** Proving the checks: an agent that did not write the code runs every check and records PASS, FAIL, or INCONCLUSIVE with its evidence in `report.md`.
 - **Tier.** How a check is proved, one of:
-  - `e2e`: isolation, permissions, revocation, wire compatibility, perf budgets, and cross-surface flows, what a unit test cannot see and what costs most when broken. Proved by a zero-argument `<id>.check.<ext>` script the verifier writes and `verify.py rerun` runs on the real app. It is the regression net later phases regrade with `rerun` and `carry`.
+  - `e2e`: isolation, permissions, revocation, wire compatibility, perf budgets, and cross-surface flows, what a unit test cannot see and what costs most when broken. Proved by a zero-argument `<id>.check.<ext>` script the verifier writes and `verify.py rerun` runs on the real app, so it regrades the check without an agent whenever the code changes.
   - `unit`: logic. Proved by a spec the executor writes, graded fail-first by `verify.py units`, with the check id in its test title so `units` records which spec proves it.
   - `walk`: UI look and interaction. The verifier walks it once on the real app and saves a screenshot or video in `evidence/<id>/`; no script.
 
@@ -25,7 +25,7 @@ Each check has five parts:
 - **Pass.** A predicate another agent can check against that evidence with no judgment call. "The export parses as JSON and holds 3 rows" is a predicate. "Export works" is not.
 - **Tier.** `e2e`, `unit`, or `walk`, per the Terms above. `verify.py plan` refuses a check without one and prints the count per tier, and the `report` gate holds a PASS to its tier's evidence.
 
-When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement. Its Tier is `e2e`, a script that diffs the implemented signatures against the skeleton, so later phases regrade it by rerun.
+When the change implements a skeleton from the architect skill, one **conformance** check adds a **Skeleton** field naming the skeleton files and symbols it covers, and passes when the implemented signatures match the skeleton or each difference is in the design addendum with the user's agreement. Its Tier is `e2e`, a script that diffs the implemented signatures against the skeleton, so rerun regrades it.
 
 A check can also name a **Seed**: the dataset it starts from. Name one whenever the scenario needs data to exist, because a page with no data proves nothing about how it shows data.
 
@@ -43,7 +43,7 @@ Every check states its **Oracle**, and `verify.py plan` refuses a check without 
 Cover:
 
 1. **Behavior.** Every behavior the change adds or alters, including the edges settled with the user: empty input, errors, boundaries, permissions.
-2. **Regression.** The load-bearing existing behavior the change could break, run on the base (main, or the previous phase's tip in a stacked feature) and on head. Name what must stay identical, such as byte-identical output or the same screen. When main lacks the feature, say so and gate head on its own predicates.
+2. **Regression.** The load-bearing existing behavior the change could break, run on the base (main, or the previous phase's tip in a stacked feature) and on head. Name what must stay identical, such as byte-identical output or the same screen. When main lacks the feature, say so and gate head on its own predicates. In a stacked feature these checks are the only regrade an earlier phase's behavior gets, because no phase reruns another phase's scripts, so name each earlier behavior this phase could break.
 3. **Unit.** Unit-tier checks for logic with a cheap local test path, each a spec written to fail before the change and pass after, with the check id in its test title. Assert behavior per the Test Behavior, Not Implementation principle (`../../principles/references/principles/test-behavior-not-implementation.md`). Prefer no new test over a test of mocks, timing, or internals. Tests are one part of the plan, never all of it. Grade fail-first with `python3 ../scripts/verify.py units`: each spec file added or changed in the range, which defaults to the merge-base with the default branch through HEAD, fails on base plus the spec and passes at head, never judged from commit order, so commits group freely and no history is rewritten for evidence. A spec that already passes on base must be a regression guard in its own spec file containing the marker `regression-guard`. Compile-time type tests, import guards, and regression tests that pin behavior main already has cannot fail first: they land in the commit with the code they guard and are exempt from the fail-first predicate, so say so in the check.
 
 ## Perf
@@ -72,10 +72,6 @@ Propose the budgets from the user's stated expectations, comparable paths in the
 | Performance | A benchmark | Interleave main and head, vetted with the benchmark-checklist skill |
 
 A check that compares against a baseline treats the baseline as the spec. Capture it before the change, and never edit the baseline, the harness, or the component to make a diff pass. If the baseline looks wrong, stop and ask.
-
-## Exploration timebox
-
-A fresh explorer tries to break the change for at most 20 minutes, and the `report` gate refuses the evidence in `evidence/explore/` when it spans longer. A plan that needs a longer box says so with a line above `## Checks`, such as `- Exploration: 30 minutes`; it is a budget like any other, so the user decides it.
 
 ## Revising the plan
 
