@@ -69,3 +69,12 @@ Rewrite to the flow above, matching the house style (short declarative sentences
 
 1. A machine-wide lock file (for example `~/.cache/parlor-verify-hello/dialog.lock`, flock) taken by every helper that waits for or clicks a local dialog, held for the shortest span, so concurrent scripts never answer each other's dialogs.
 2. An attacker helper in the phase 5 kit: `attackerSend(info, {deviceId, privateKey, publicJwk, threadId, agent, text})` that builds and posts a prompt signed with a key the caller holds, from the code now inline in `T5-04.check.mjs`; the script then calls the helper. Document both in the driver SKILL.md.
+
+## Amendments (after workstream C's gap report)
+
+- Dependencies: "Starts after step N" / "Starts after steps N and M" in a step's text are explicit dependencies; feature step 7 starts after step 5, step 8 after steps 6 and 7. Lint errors on a missing step number.
+- Gates may carry flags (`plan --checks`, `premises --resolved`); the GATE regex accepts them.
+- `pr.py` allows an optional `## Not ready to merge` section first.
+- `- Agent: real` matches as a prefix.
+- Stacking stays: step 1 accepts "previous phase merged, base is main" or "previous phase's PR open, stack on its branch".
+- `report --write --author --verifier --note`; walk verdicts from the observation line; per-section Head lines in review.md; `--dir` on every command; a failing run counts toward the fix budget only after a product or script change; a check past its budget is skipped with a note in a rerun.
