@@ -60,6 +60,8 @@ CONTRACT = """
     - calc.py: the only module the change touches
     """
 PREMISES = """\
+    Base: {base}
+
     | Check | Premise | Holds | Evidence | Resolution |
     |---|---|---|---|---|
     | E1 | calc.py already has a command line | no | calc.py:1 defines only add | {resolution} |
@@ -226,7 +228,9 @@ class FlowV2(unittest.TestCase):
 
         self.assertIn("the gate `../verify/scripts/verify.py premises` failed", self.close(2, ok=False))
         (self.phase / "grounding.md").write_text("# How calc works\n\ncalc.py holds add; tests import it.\n")
-        (self.phase / "premises.md").write_text(dedent(PREMISES).format(resolution=""))
+        (self.phase / "premises.md").write_text(dedent(PREMISES).format(base=base, resolution=""))
+        self.assertIn("grounding.md names no 'Base: <sha>' line", self.close(2, ok=False))
+        (self.phase / "grounding.md").write_text(f"Base: {base}\n\n# How calc works\n\ncalc.py holds add; tests import it.\n")
         self.close(2)
 
         shown = self.todo("show", 3)
@@ -234,7 +238,7 @@ class FlowV2(unittest.TestCase):
         self.assertIn("no '## Drive contract'", self.close(3, ok=False))
         self.put(f"docs/mul/phases/{PHASE}/plan.md", dedent(PLAN) + dedent(CONTRACT))
         self.assertIn("the premise does not hold and has no Resolution", self.close(3, ok=False))
-        (self.phase / "premises.md").write_text(dedent(PREMISES).format(resolution="the design adds a command line to calc.py"))
+        (self.phase / "premises.md").write_text(dedent(PREMISES).format(base=base, resolution="the design adds a command line to calc.py"))
         spec = self.plan_root / "spec.md"
         spec.write_text(spec.read_text() + f"- {PHASE}: calc.py gains a mul command line, because premise E1 does not hold\n")
         self.commit("Design mul")
@@ -273,9 +277,15 @@ class FlowV2(unittest.TestCase):
         self.close(5)
 
         self.assertIn("item 8 waits on item 7", self.todo("done", 8, "--token", self.token(8), ok=False))
-        (where / "review.md").write_text(f"# Code review\n\n## Review\n\nHead: {head}\n\n"
-                                         "- calc.py: a non-integer argument raises ValueError. Triage: follow-up: no user flow passes one; in the backlog\n\n"
-                                         f"## Fix review\n\nHead: {head}\n\nnone found\n")
+        review = (f"# Code review\n\nReviewer: codex:gpt-5.6\n\n## Review\n\nHead: {head}\n\n"
+                  "- calc.py: a non-integer argument raises ValueError. Triage: follow-up: no user flow passes one; in the backlog\n\n"
+                  f"## Fix review\n\nHead: {head}\nReviewer: claude:sonnet\n\nnone found\n")
+        (where / "review.md").write_text(review)
+        refused = self.close(7, ok=False)
+        self.assertIn("the fix review's Reviewer claude:sonnet is not the review's codex:gpt-5.6", refused)
+        self.assertIn("names no 'Fixed at:' line", refused)
+        review = review.replace("Reviewer: claude:sonnet\n", f"Reviewer: codex:gpt-5.6\nFixed at: {head}\n")
+        (where / "review.md").write_text(review)
         self.close(7)
 
         self.hook("PreToolUse", {"agent_id": "fix-1", **self.bash("ls")})

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -71,11 +72,16 @@ REPORT = """\
     | B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |
     | P1 | PASS | P1-runs.txt | p50 41 ms on both sides |
     """
-REVIEW_MD = "# Code review\n\n## Review\n\nHead: {head}\n\n{findings}\n\n## Fix review\n\nHead: {fixed}\n\n{fix_findings}\n"
+REVIEW_MD = ("# Code review\n\nReviewer: {reviewer}\n\n## Review\n\nHead: {head}\n\n{findings}\n\n"
+             "## Fix review\n\nHead: {fixed}\nReviewer: {fix_reviewer}\nFixed at: {fixed_at}\n{relaxed}\n{fix_findings}\n")
+REVIEWER = "codex:gpt-5.6-sol"
 
 
-def review_md(head="abc123", fixed=None, findings="none found", fix_findings="none found"):
-    return REVIEW_MD.format(head=head, fixed=fixed or head, findings=findings, fix_findings=fix_findings)
+def review_md(head="abc123", fixed=None, findings="none found", fix_findings="none found", fixed_at=None, fix_reviewer=REVIEWER,
+              relaxed=None):
+    fixed = fixed or head
+    return REVIEW_MD.format(reviewer=REVIEWER, head=head, fixed=fixed, findings=findings, fix_reviewer=fix_reviewer,
+                            fixed_at=fixed_at or fixed, relaxed=f"Relaxed: {relaxed}\n" if relaxed else "", fix_findings=fix_findings)
 
 UNIT = """
     ### U1. Multiplying two numbers
@@ -452,6 +458,50 @@ class Verify(unittest.TestCase):
         self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
         self.assertIn("rerun: 2 checks, 2 PASS, 0 FAIL, 1 requeued", out)
 
+    def concurrent_reruns(self, *onlys, slow):
+        """Run cmd_rerun once per --only list at the same time, with slow() widening each bookkeeping read; return each outcome."""
+        outcomes = {}
+
+        def rerun(key, only):
+            args = mock.Mock(only=only, rest=[], jobs=None, timeout=30, force=False, full_reason=None)
+            try:
+                outcomes[key] = verify.cmd_rerun(self.dir, args)
+            except verify.Failed as e:
+                outcomes[key] = f"Failed: {e}"
+
+        with mock.patch.object(verify, slow.__name__, slow):
+            threads = [threading.Thread(target=rerun, args=(i, only)) for i, only in enumerate(onlys)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        return [outcomes[i] for i in range(len(onlys))]
+
+    def test_concurrent_reruns_serialize_their_bookkeeping(self):
+        self.check_script("B1.check.sh", "exit 0\n")
+        self.check_script("B2.check.sh", "exit 0\n")
+        load_scripts_lock = verify.load_scripts_lock
+
+        def slow_lock(directory):
+            time.sleep(0.3)
+            return load_scripts_lock(directory)
+
+        slow_lock.__name__ = "load_scripts_lock"
+        outcomes = self.concurrent_reruns(None, None, slow=slow_lock)
+        self.assertEqual(sum("the prove's full rerun already ran" in o for o in outcomes), 1, outcomes)
+        self.assertEqual(sum(o.endswith("rerun: 2 checks, 2 PASS, 0 FAIL") for o in outcomes), 1, outcomes)
+        load_ledger = verify.load_ledger
+
+        def slow_ledger(directory):
+            time.sleep(0.3)
+            return load_ledger(directory)
+
+        slow_ledger.__name__ = "load_ledger"
+        (self.dir / "rerun.ledger.json").unlink()
+        self.concurrent_reruns(["B1"], ["B2"], slow=slow_ledger)
+        self.assertEqual(sorted(verify.load_ledger(self.dir)), ["B1", "B2"])
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(verify.TMP_SUFFIX)], [])
+
     def test_a_script_that_waits_twice_for_capacity_is_not_run_and_fails_the_rerun(self):
         self.check_script("B1.check.sh", "exit 0\n")
         out = self.capacity_rerun(lambda: 9.0, wait=0.2)
@@ -459,7 +509,7 @@ class Verify(unittest.TestCase):
         self.assertRegex(out, r"NOT RUN B1  \(0\.0s\)  waited .* twice; run it with --only B1 once the machine has room")
         self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 not run for lack of capacity, 1 requeued", out)
         self.assertFalse((self.dir / "B1.rerun.log").exists())
-        self.assertNotIn("B1", json.loads((self.dir / "rerun.ledger.json").read_text()))
+        self.assertNotIn("B1", verify.load_ledger(self.dir))
         self.assertIn("--jobs needs at least 1", subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--jobs", "0", "--dir", str(self.dir)],
                                                                 capture_output=True, text=True).stderr)
 
@@ -690,7 +740,7 @@ class Verify(unittest.TestCase):
     def test_the_report_needs_a_triaged_review_and_fix_review_written_after_the_freeze(self):
         self.ready_report()
         (self.dir / "review.md").unlink()
-        self.assertIn("no review.md. The reviewer writes a '## Review' section", self.run_verify("report", ok=False))
+        self.assertIn("no review.md. The reviewer writes a 'Reviewer:' line, then a '## Review' section", self.run_verify("report", ok=False))
         finding = "- src/auth.ts:42 a revoked token still reads the old account's rows."
         self.write("review.md", review_md(findings=finding))
         self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
@@ -699,6 +749,29 @@ class Verify(unittest.TestCase):
         self.write("review.md", review_md(findings=f"{finding} Triage: fixed in abc124",
                                           fix_findings=f"{finding} Triage: dismissed, the token check runs first on line 30"))
         self.run_verify("report")
+        self.write("review.md", review_md(findings=f"{finding}\n  Triage: fixed in abc124, the continuation of its bullet"))
+        self.run_verify("report")
+        for prose in ("Potential auth bypass in app.py:1", "Base: abc122", "Fixed at: abc124"):
+            self.write("review.md", review_md(findings=prose))
+            self.assertIn(f"the '## Review' section of review.md holds a line that is not a finding bullet: {prose}; write each finding "
+                          "as a bullet with its triage", self.run_verify("report", ok=False), prose)
+        self.write("review.md", review_md(fix_findings="none found\nThe fix looks right, but app.py:9 still swallows the error"))
+        self.assertIn("the '## Fix review' section of review.md holds a line that is not a finding bullet: The fix looks right",
+                      self.run_verify("report", ok=False))
+        self.write("review.md", review_md(fix_reviewer="claude:claude-opus-5-5"))
+        self.assertIn(f"the fix review's Reviewer claude:claude-opus-5-5 is not the review's {REVIEWER}; the same reviewer reviews "
+                      "the fixes", self.run_verify("report", ok=False))
+        self.write("review.md", review_md(fix_reviewer="claude:claude-opus-5-5", relaxed="short"))
+        self.assertIn("'Relaxed:' line needs the reason", self.run_verify("report", ok=False))
+        self.write("review.md", review_md(fix_reviewer="claude:claude-opus-5-5", relaxed="codex was limited until 14:00; quota pick --relax"))
+        self.assertIn("fix review relaxed: claude:claude-opus-5-5 took it: codex was limited until 14:00; quota pick --relax",
+                      self.run_verify("report"))
+        self.write("review.md", review_md().replace(f"Reviewer: {REVIEWER}\n", ""))
+        out = self.run_verify("report", ok=False)
+        self.assertIn("review.md names no 'Reviewer:' line; the reviewer writes its agent:model under the title", out)
+        self.assertIn("the '## Fix review' section of review.md names no 'Reviewer:' line", out)
+        self.write("review.md", review_md().replace("Fixed at: abc123\n", ""))
+        self.assertIn("the '## Fix review' section of review.md names no 'Fixed at:' line", self.run_verify("report", ok=False))
         self.write("review.md", review_md().split("## Fix review")[0])
         self.assertIn("review.md has no '## Fix review' section", self.run_verify("report", ok=False))
         self.write("review.md", "# Code review\n\nHead: abc123\n\n## Review\n\nnone found\n\n## Fix review\n\n\n")
@@ -913,7 +986,7 @@ class Driver(unittest.TestCase):
     def head(self):
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
 
-    def test_the_review_gate_needs_a_fix_review_of_heads_product_tree(self):
+    def test_the_review_gate_needs_heads_product_tree_to_be_the_fix_reviews_fixed_at(self):
         d, report, run = self.reviewed_report()
         reviewed = self.head()
         self.assertEqual(run("review").stdout, "review ok: the review and the fix review name the Head they read and triage every finding\n")
@@ -921,22 +994,35 @@ class Driver(unittest.TestCase):
         self.commit("Fix the review's finding")
         out = run("review")
         self.assertEqual(out.returncode, 1)
-        self.assertIn(f"the fix review read {reviewed[:12]}, but product files changed since: app.py. The fix review covers every "
-                      "review fix, so its Head is HEAD or a commit with HEAD's product tree", out.stdout)
+        self.assertIn(f"product files changed after the fix review's fixes (Fixed at {reviewed[:12]}): app.py. No reviewer read them",
+                      out.stdout)
         fixed = self.head()
         (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings="- app.py:1 prints the wrong word."))
         self.assertIn("fix review finding has no 'Triage:", run("review").stdout)
-        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings="- app.py:1 prints the wrong word. Triage: fixed in the next commit"))
+        triaged = "- app.py:1 prints the wrong word. Triage: fixed in the next commit"
+        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings=triaged))
         self.assertEqual(run("review").returncode, 0)
         (self.repo / "app.py").write_text("print('right')\n")
         self.commit("Fix the fix review's finding")
-        self.assertEqual(run("review").returncode, 0, "fixes for the fix review's own findings follow it")
-        (d / "review.md").write_text(review_md(reviewed, fixed))
-        self.assertEqual(run("review").returncode, 1)
+        self.assertIn(f"product files changed after the fix review's fixes (Fixed at {fixed[:12]}): app.py", run("review").stdout)
+        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings=triaged, fixed_at=self.head()))
+        self.assertEqual(run("review").returncode, 0, "Fixed at names the commit that holds the fix review's fixes")
+        fixed_at = self.head()
+        (self.repo / "auth.py").write_text("ALLOW_ALL = True\n")
+        self.commit("An unrelated auth change")
+        self.assertIn(f"product files changed after the fix review's fixes (Fixed at {fixed_at[:12]}): auth.py", run("review").stdout)
+        (d / "review.md").write_text(review_md(reviewed, fixed, fixed_at=self.head()))
+        self.assertIn(f"no fix review finding is triaged fixed, yet product files changed from its Head {fixed[:12]} to Fixed at "
+                      f"{self.head()[:12]}: app.py, auth.py. Fixed at is the section's Head when nothing was fixed", run("review").stdout)
+        (d / "review.md").write_text(review_md(reviewed, self.head(), fixed_at=reviewed))
+        self.assertIn(f"the fix review's Fixed at {reviewed[:12]} does not descend from its Head {self.head()[:12]}", run("review").stdout)
+        (d / "review.md").write_text(review_md(reviewed, self.head(), fixed_at="0123456789ab"))
+        self.assertIn("the fix review's Fixed at 0123456789ab is not a commit in this repository", run("review").stdout)
+        (d / "review.md").write_text(review_md(reviewed, self.head()))
+        self.assertEqual(run("review").returncode, 0)
         self.add_driver()
         self.commit("Extend the driver")
-        (d / "review.md").write_text(review_md(reviewed, self.head(), fix_findings="none found"))
-        self.assertEqual(run("review").returncode, 0)
+        self.assertEqual(run("review").returncode, 0, "a driver commit after Fixed at is not a product change")
         (d / "review.md").write_text(review_md("0123456789ab"))
         self.assertIn("review.md reviewed Head 0123456789ab, which is not a commit in this repository", run("review").stdout)
 
@@ -1409,9 +1495,24 @@ class Lock(RepoFixture):
         self.assertEqual(self.verify("freeze"), "revision recorded automatically: additions: B2 (Export writes CSV); "
                                                 "Drive contract: `export --csv`\n")
         self.verify("lock")
-        path.write_text(plan(CHECKS.replace(CONTRACT, CONTRACT + self.CSV).replace("a real terminal", "a terminal"), self.B2, PERF_NA))
-        self.assertIn("other edits: B1 Surface changed", self.verify("freeze"))
+        sensitive = "\n## Sensitive paths\n\n- `src/auth/**`: token checks\n"
+        path.write_text(plan(CHECKS.replace(CONTRACT, CONTRACT + self.CSV), self.B2, PERF_NA) + sensitive)
+        self.assertEqual(self.verify("freeze"), "revision recorded automatically: Sensitive paths: `src/auth/**`\n")
         self.assertEqual([r.get("auto") for r in self.revisions()], [True, True])
+        current = path.read_text()
+        for changed, why in ((current.replace("- Surface: a real terminal", "- Surface: a terminal", 1), "B1 Surface changed"),
+                             (current.replace("Export writes JSON", "Export prints JSON"), "B1 title changed"),
+                             (current.replace("- Tier: e2e\n", "- Tier: e2e\n- Agent: real, the CLI under test\n", 1), "B1 Agent added"),
+                             (current.replace("- Tier: e2e\n", "- Tier: e2e\n\nRun it twice.\n", 1), "B1 text changed"),
+                             (current.replace("only the help text changes", "only the help changes"),
+                              "Perf line removed or changed: n/a: only the help text changes"),
+                             (current.replace("- `src/auth/**`: token checks\n", ""), "Sensitive paths line removed or changed: - `src/auth/**`"),
+                             (current.replace("# Verification plan: json export", "# Verification plan: json export\n\nAlso CSV."),
+                              "the plan's preamble line added: Also CSV.")):
+            path.write_text(changed)
+            self.assertIn(why, self.verify("freeze", ok=False), why)
+        path.write_text(current)
+        self.assertEqual(self.verify("freeze"), "plan unchanged since it was frozen\n")
 
     def test_a_changed_predicate_or_a_removed_check_or_contract_line_needs_a_revision(self):
         path = self.locked()
@@ -1422,7 +1523,7 @@ class Lock(RepoFixture):
                              (plan("# Verification plan: none\n\n## Checks\n", UNIT, PERF_NA), "B1 was removed")):
             path.write_text(changed)
             out = self.verify("freeze", ok=False)
-            self.assertIn(f"the plan changed after it was frozen, beyond adding checks or Drive contract lines: {why}", out)
+            self.assertIn(f"the plan changed after it was frozen, beyond adding checks, Drive contract lines, or Sensitive paths: {why}", out)
             self.assertIn("--revision \"<what changed and why>\", plus --gate <id> of the autorun gate the user answered", out)
         path.write_text(plan(CHECKS.replace("3 records", "4 records"), PERF_NA))
         self.assertEqual(self.verify("freeze", "--revision", "export holds 4 records now; agreed by the user"),
@@ -1472,39 +1573,51 @@ class Premises(RepoFixture):
     def premises(self, *flags, ok=True):
         return self.verify("premises", *flags, ok=ok)
 
+    def based(self, text, base=None):
+        return f"Base: {base or self.rev()}\n\n{text}"
+
     def test_premises_and_grounding_sit_beside_the_plan_and_cover_every_check(self):
         out = self.premises(ok=False)
         self.assertIn(f"no premises.md beside the plan, in {self.folder}", out)
         self.assertIn("no grounding.md beside the plan", out)
-        (self.folder / "grounding.md").write_text("# How export works\n")
-        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="").replace("| B1, P1 |", "| B1 |"))
+        self.assertIn(f"with the line 'Base: {self.rev()}'", out)
+        (self.folder / "grounding.md").write_text(self.based("# How export works\n"))
+        (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="").replace("| B1, P1 |", "| B1 |")))
         self.assertIn("no premise row for P1; every check of the plan gets at least one row", self.premises(ok=False))
-        (self.folder / "premises.md").write_text(self.TABLE.format(resolution=""))
+        (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="")))
         self.assertEqual(self.premises(), "premises ok: 2 premises cover 2 checks, 1 do not hold; resolve them in the design, "
                                           "then pass `verify.py premises --resolved`\n")
-        self.assertIn(":4: the premise does not hold and has no Resolution", self.premises("--resolved", ok=False))
-        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="the design adds a --json flag to bin/export"))
+        self.assertIn(":6: the premise does not hold and has no Resolution", self.premises("--resolved", ok=False))
+        (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="the design adds a --json flag to bin/export")))
         self.assertEqual(self.premises("--resolved"), "premises ok: 2 premises cover 2 checks, 1 do not hold, each with its resolution\n")
 
-    def test_each_row_says_whether_it_holds_with_evidence_and_both_files_postdate_the_base(self):
-        (self.folder / "grounding.md").write_text("# How export works\n")
-        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="x").replace("| yes | calc.py:1 |", "| maybe |  |"))
+    def test_each_row_says_whether_it_holds_with_evidence_and_both_files_name_the_base(self):
+        (self.folder / "grounding.md").write_text(self.based("# How export works\n"))
+        (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="x").replace("| yes | calc.py:1 |", "| maybe |  |")))
         out = self.premises(ok=False)
-        self.assertIn(":3: Holds must be yes or no, not 'maybe'", out)
-        self.assertIn(":3: Evidence is empty; cite the file:line on main", out)
-        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="x"))
-        os.utime(self.folder / "grounding.md", (1, 1))
-        self.assertIn(f"{self.folder / 'grounding.md'} predates the base commit", self.premises(ok=False))
-        (self.folder / "premises.md").write_text("no table here\n")
+        self.assertIn(":5: Holds must be yes or no, not 'maybe'", out)
+        self.assertIn(":5: Evidence is empty; cite the file:line on main", out)
+        (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="x")))
+        self.premises()
+        base, old = self.rev(), self.git("rev-list", "--max-parents=0", "HEAD")
         (self.folder / "grounding.md").write_text("# How export works\n")
+        os.utime(self.folder / "grounding.md")
+        self.assertIn(f"{self.folder / 'grounding.md'} names no 'Base: <sha>' line; the explainer writes the commit it checked the code at, "
+                      f"the adopted base: 'Base: {base}'", self.premises(ok=False))
+        (self.folder / "grounding.md").write_text(self.based("# How export works\n", old))
+        self.assertIn(f"{self.folder / 'grounding.md'} was checked at {old}, not at the adopted base {base[:12]}", self.premises(ok=False))
+        (self.folder / "grounding.md").write_text(self.based("# How export works\n", f"`{base[:9]}`"))
+        self.premises()
+        (self.folder / "premises.md").write_text("no table here\n")
         self.assertIn("holds no table with the columns Check | Premise | Holds | Evidence | Resolution", self.premises(ok=False))
 
     def test_without_a_plan_folder_they_sit_in_the_verification_directory(self):
         where = pathlib.Path(self.verify("where").strip())
         (where / "base.json").unlink()
         (where / "plan.md").write_text(plan(CHECKS, PERF_MAIN))
-        (where / "grounding.md").write_text("# How export works\n")
-        (where / "premises.md").write_text(self.TABLE.format(resolution=""))
+        base = self.git("merge-base", "main", "HEAD")
+        (where / "grounding.md").write_text(self.based("# How export works\n", base))
+        (where / "premises.md").write_text(self.based(self.TABLE.format(resolution=""), base))
         self.assertIn("premises ok: 2 premises cover 2 checks", self.premises())
 
 
@@ -1640,6 +1753,15 @@ class ReportWrite(RepoFixture):
         self.write("--note", "only this")
         self.assertIn("## Notes\n\n- only this\n", self.report())
 
+    def test_a_relaxed_fix_review_is_listed_in_the_report(self):
+        self.observe(B1="3 records", U1="6", W1="right of Share")
+        (self.where / "review.md").write_text(review_md(self.rev(), fix_reviewer="claude:claude-opus-5-5",
+                                                        relaxed="codex was limited until 14:00, so quota pick --relax gave claude"))
+        out = self.write("--author", "a:x", "--verifier", "b:y")
+        line = "fix review relaxed: claude:claude-opus-5-5 took it: codex was limited until 14:00, so quota pick --relax gave claude"
+        self.assertIn(line, out)
+        self.assertIn(f"## Revisions and fixes\n\n- {line}\n", self.report())
+
 
 class Spec(RepoFixture):
     def test_the_spec_change_log_names_the_phase_and_the_later_phases_still_pass(self):
@@ -1658,6 +1780,27 @@ class Spec(RepoFixture):
         self.assertEqual(self.verify("spec"), "spec ok: spec.md's change log names 01-json; phases ok: 1 phases, 1 checks\n")
         (root / "phases" / "02-csv").mkdir()
         self.assertIn("02-csv/plan.md: missing", self.verify("spec", ok=False))
+
+
+    def test_an_older_adopt_record_names_its_phase_through_the_plan_copy(self):
+        root = (self.repo / "docs" / "export").resolve()
+        for name, check in (("01-json", "B1"), ("02-csv", "C1")):
+            (root / "phases" / name).mkdir(parents=True)
+            (root / "phases" / name / "plan.md").write_text(plan(CHECKS.replace("B1", check), PERF_NA))
+        where = pathlib.Path(self.verify("where").strip())
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "base.json").write_text(json.dumps({"base": self.rev(), "plan": str(root)}))
+        (where / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        (root / "spec.md").write_text("# Export\n\n## Change log\n\n- 02-csv: no design change\n")
+        self.assertIn("'## Change log' has no line for 01-json", self.verify("spec", ok=False))
+        (root / "spec.md").write_text("# Export\n\n## Change log\n\n- 01-json: no design change\n")
+        self.assertEqual(self.verify("spec"), "spec ok: spec.md's change log names 01-json; phases ok: 2 phases, 2 checks\n")
+        (where / "plan.md").write_text(plan(CHECKS.replace("B1", "Z9"), PERF_NA))
+        out = self.verify("spec", ok=False)
+        self.assertIn(f"this branch records the plan folder {root}, but no phase under {root / 'phases'} holds the checks", out)
+        self.assertIn("Run `verify.py adopt <phase folder>` with this branch's phase", out)
+        (where / "plan.md").unlink()
+        self.assertIn("but no phase under", self.verify("spec", ok=False))
 
 
 class Units(RepoFixture):

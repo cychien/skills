@@ -34,30 +34,36 @@ directory.
               every command reads the plan where it lives and `lock` measures code from where the phase starts. The plan
               must pass `plan --checks`. A plan.md left in the verification directory by an older adopt is removed when it
               matches, and refused when it differs.
-  premises    premises.md and grounding.md sit beside the plan (the phase folder, else the verification directory), both
-              newer than the base commit. premises.md holds a table with the columns Check | Premise | Holds | Evidence |
-              Resolution: every check id of the plan in at least one row, Holds yes or no, and Evidence on every row.
-              --resolved also needs a Resolution on every row whose premise does not hold.
+  premises    premises.md and grounding.md sit beside the plan (the phase folder, else the verification directory), each
+              with a line 'Base: <sha>' naming the base it was checked at, which must be the phase's base (the commit
+              `adopt` recorded, else the merge-base with main); a full or abbreviated sha of it counts. premises.md holds
+              a table with the columns Check | Premise | Holds | Evidence | Resolution: every check id of the plan in at
+              least one row, Holds yes or no, and Evidence on every row. --resolved also needs a Resolution on every row
+              whose premise does not hold.
   driver      a project verification skill is on main, or was committed before any product change, or HEAD holds a
               driver-only commit whose patch (git patch-id) matches a commit on a local branch whose commits since the
               phase base (the commit `adopt` recorded, else the merge-base with main) touch only the driver: the
               verifier built or extended it there, on the unchanged app, and cherry-picked it onto the change
   freeze      record the plan, its hash, the Drive contract and Sensitive paths included, before a verifier runs. A later
-              change that only adds checks or Drive contract lines records itself as an automatic revision. Any other
-              change (a check removed, a Drive contract line removed or changed, or an existing check's Scenario, Pass,
-              Tier, Oracle, Seed, Tolerance, or perf Path, Metric, Probe, Baseline, or Rule changed) needs --revision
-              "<what changed and why>", and in an autonomous run also --gate <id> of an autorun gate the user answered,
-              each gate backing one revision.
+              change that only adds checks, Drive contract lines, or Sensitive paths records itself as an automatic
+              revision. Any other change (any field, the title, or the text of an existing check; a removed check or line;
+              any other added or changed line, the perf decision and its n/a reason included) needs --revision "<what
+              changed and why>", and in an autonomous run also --gate <id> of an autorun gate the user answered, each gate
+              backing one revision.
   lock        freeze the plan before any code exists: refuses while the working tree changes product files since the
               base (the commit `adopt` recorded, else the merge-base with main), leaving the project's verification
               skill and the adopted plan folder aside. Once locked, passes while the plan is unchanged or every change
               is a recorded revision, and fails for a plan first frozen after code existed.
   oracles     every oracle check has its expected value, computed from the spec after the freeze
   compare     every oracle check's observed value matches its expected value
-  review      review.md holds a '## Review' section and a '## Fix review' section, each with its own 'Head:' line, the
-              commit the reviewer read, as its first line, and every finding triaged ('Triage: fixed | new check | follow-up | pre-existing | dismissed'), or
-              'none found', written after the freeze. The fix review's Head is HEAD or a commit with HEAD's product tree;
-              only fixes for findings it triaged as fixed may follow it, proved by their unit specs with no further review.
+  review      review.md, written after the freeze, names its 'Reviewer:' (agent:model) under the title and holds a
+              '## Review' section and a '## Fix review' section, each with its own 'Head:' line, the commit the reviewer
+              read, and nothing else but finding bullets, each triaged ('Triage: fixed | new check | follow-up |
+              pre-existing | dismissed'), or 'none found'; any other line fails. The fix review names its own 'Reviewer:',
+              the review's, unless a 'Relaxed: <reason>' line says why another took it (a quota fallback), and the report
+              lists that. The lead adds 'Fixed at: <sha>' to the fix review once its fixes land: a commit at or after its
+              Head, with the Head's product tree when no finding is triaged fixed. HEAD must hold Fixed at's product tree,
+              so no product change follows the reviewed fixes.
   scripts     every e2e check, perf checks included, has its <id>.check.<ext> script and an <id>.base.log from
               `dryrun` of that same script that reached "verify: ready" and failed a predicate: exit 1 with a FAIL line
               last on stdout. A script that crashed (no ready line, any other exit, or no FAIL line) fails the gate; one
@@ -74,7 +80,8 @@ directory.
               last `units` result, after the freeze, passing, on HEAD's product code, with a spec that names the check id; walk
               by a screenshot or video in evidence/<id>/ written after the freeze. Every row has an observation; a FAIL
               row's starts with 'defect:', an INCONCLUSIVE row's with 'blocker:', and an INCONCLUSIVE row needs no
-              evidence. review.md passes the review rules. A passing report lists each plan revision, each full rerun
+              evidence. review.md passes the review rules except the one on HEAD after Fixed at, since fixes for e2e
+              FAILs follow the review. A passing report lists a relaxed fix review, each plan revision, each full rerun
               after the prove, and each script fix, with its reason, and the checks that are not ready to merge.
               --write builds report.md first: Head, Main, --author and --verifier (else the ones report.md names), and one
               row per check from its evidence (e2e from the latest <id>.rerun.log, unit from units.json, walk from
@@ -86,8 +93,10 @@ directory.
               of a '## Notes' section (a quota fallback that relaxed a separation rule, for example); without --note the
               notes report.md already holds stay.
   spec        with an adopted phase of a plan folder, the folder's spec.md has a '## Change log' section with a line
-              naming this phase's folder, or '<phase>: no design change', and `phases` passes. Without a plan folder it
-              passes with a note.
+              naming this phase's folder, or '<phase>: no design change', and `phases` passes. A base.json an older
+              `adopt` wrote names only the plan folder: the phase is the one whose plan shares a check id with the plan.md
+              copy in the verification directory, and when none or several do, the gate fails. Only without any plan
+              folder does it pass, with a note.
   decisions   the hillclimb decision log is well formed
   units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
               base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
@@ -177,6 +186,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import fcntl
 import glob
 import hashlib
 import importlib.util
@@ -216,7 +226,12 @@ MISSING = "missing"
 NO_EVIDENCE = "none"
 HEADER_FIELD = re.compile(r"^(Head|Main|Author|Verifier):\s*(.*)$", re.M)
 MIN_REASON = 10
-REVIEW_META = re.compile(r"^\s*(?:[-*]\s+)?(?:Head|Reviewer|Base|Diff):")
+SECTION_META = re.compile(r"^\s*(?:[-*]\s+)?(Head|Reviewer|Fixed at|Relaxed):[ \t]*(.*?)\s*$", re.M)
+REVIEW_META = ("Head", "Reviewer")
+FIX_REVIEW_META = ("Head", "Reviewer", "Fixed at", "Relaxed")
+BULLET = re.compile(r"^\s*[-*] ")
+NONE_FOUND = re.compile(r"^none found\.?$", re.I)
+BASE_LINE = re.compile(r"^\s*(?:[-*]\s+)?Base:\s*`?([0-9a-fA-F]{7,40})`?\s*$", re.M)
 FIXED = re.compile(r"\bTriage:\s*fixed\b", re.I)
 TRIAGE = re.compile(r"\bTriage:\s*(fixed|new check|follow-up|pre-existing|dismissed)\b", re.I)
 TIERS = ("e2e", "unit", "walk")
@@ -251,6 +266,8 @@ RERUN_TIMEOUT = 300
 RERUN_STAMP = "rerun.stamp.json"
 SCRIPTS_LOCK = "scripts.lock.json"
 RERUN_LEDGER = "rerun.ledger.json"
+STATE_LOCK = ".rerun-state.lock"
+TMP_SUFFIX = ".verify-tmp"
 RERUN_PASS = "rerun: PASS"
 BASE_LOG = ".base.log"
 DRYRUN_VERDICT = re.compile(r"^dryrun: (FAIL|PASS|CRASH)\b")
@@ -649,23 +666,28 @@ def utc_now():
 
 
 def plan_structure(text):
-    """({check id: (heading, {field: value})}, [Drive contract lines], [every other non-blank line]) for a plan."""
+    """({check id: (heading, {field: value}, [its other lines])}, {section: [lines]}) for a plan: every non-blank line,
+    stripped, outside the checks goes under its section ('' before the first)."""
     lines = text.splitlines()
     found = sections(lines)
-    checks, other = {}, [line.strip() for line in itertools.takewhile(lambda line: not line.startswith("## "), lines) if line.strip()]
+    checks, other = {}, {"": [line.strip() for line in itertools.takewhile(lambda line: not line.startswith("## "), lines) if line.strip()]}
     for name, body in found.items():
-        if name == CONTRACT:
-            continue
         if name not in ("Checks", "Perf"):
-            other += [f"{name}: {line.strip()}" for _, line in body if line.strip()]
+            other[name] = [line.strip() for _, line in body if line.strip()]
             continue
         preamble, found_entries = entries(body)
-        other += [f"{name}: {line.strip()}" for _, line in preamble if line.strip() and not NA.match(line.strip())]
+        other[name] = [line.strip() for _, line in preamble if line.strip()]
         for entry in found_entries:
             if check_id := entry_id(entry):
-                checks[check_id] = (entry["heading"], {k: v for k, (_, v) in entry["fields"].items()})
-    contract = [line.strip() for _, line in found.get(CONTRACT, []) if line.strip()]
-    return checks, contract, other
+                rest = [line.strip() for _, line in body_lines(body, entry) if line.strip() and not FIELD.match(line)]
+                checks[check_id] = (entry["heading"], {k: v for k, (_, v) in entry["fields"].items()}, rest)
+    return checks, other
+
+
+def body_lines(body, entry):
+    """The lines of a check entry after its heading, up to the next heading."""
+    after = [(n, line) for n, line in body if n > entry["line"]]
+    return list(itertools.takewhile(lambda item: not item[1].startswith("### "), after))
 
 
 def contract_name(line):
@@ -673,33 +695,42 @@ def contract_name(line):
     return f"`{names[0]}`" if names else line.removeprefix("- ")[:60]
 
 
+ADDITIVE = (CONTRACT, SENSITIVE)
+
+
 def classify_revision(old, new):
-    """([why a change needs the user], None), or ([], summary) when the new plan only adds checks or Drive contract lines."""
-    old_checks, old_contract, old_other = plan_structure(old)
-    new_checks, new_contract, new_other = plan_structure(new)
-    needs, edits = [], []
-    for check_id, (heading, fields) in old_checks.items():
+    """([why a change needs the user], None), or ([], summary) when the new plan only adds checks, Drive contract lines, or
+    Sensitive paths. Any change to an existing check, any removal, and any other edit needs the user."""
+    old_checks, old_other = plan_structure(old)
+    new_checks, new_other = plan_structure(new)
+    needs = []
+    for check_id, (heading, fields, rest) in old_checks.items():
         if check_id not in new_checks:
             needs.append(f"{check_id} was removed")
             continue
-        new_heading, new_fields = new_checks[check_id]
-        for name in sorted({*fields, *new_fields}, key=lambda f: (f not in PROTECTED_FIELDS, f)):
-            if fields.get(name) == new_fields.get(name):
-                continue
-            change = "removed" if name not in new_fields else "added" if name not in fields else "changed"
-            (needs if name in PROTECTED_FIELDS else edits).append(f"{check_id} {name} {change}")
+        new_heading, new_fields, new_rest = new_checks[check_id]
         if heading != new_heading:
-            edits.append(f"{check_id} title")
-    removed = collections.Counter(old_contract) - collections.Counter(new_contract)
-    needs += [f"{CONTRACT} line removed or changed: {line[:80]}" for line in removed.elements()]
+            needs.append(f"{check_id} title changed")
+        for name in sorted({*fields, *new_fields}, key=lambda f: (f not in PROTECTED_FIELDS, f)):
+            if fields.get(name) != new_fields.get(name):
+                needs.append(f"{check_id} {name} " + ("removed" if name not in new_fields else "added" if name not in fields else "changed"))
+        if rest != new_rest:
+            needs.append(f"{check_id} text changed")
+    added_lines = {}
+    for name in dict.fromkeys([*old_other, *new_other]):
+        before, after = collections.Counter(old_other.get(name, [])), collections.Counter(new_other.get(name, []))
+        where = f"{name} " if name else "the plan's preamble "
+        needs += [f"{where}line removed or changed: {line[:80]}" for line in (before - after).elements()]
+        if added := list((after - before).elements()):
+            if name in ADDITIVE:
+                added_lines[name] = added
+            else:
+                needs += [f"{where}line added: {line[:80]}" for line in added]
     if needs:
         return needs, None
-    added = [f"{i} ({re.sub(r'^### \S+\.\s*', '', heading).strip()})" for i, (heading, _) in new_checks.items() if i not in old_checks]
-    names = [contract_name(line) for line in (collections.Counter(new_contract) - collections.Counter(old_contract)).elements()]
-    if old_other != new_other:
-        edits.append("other plan text")
-    parts = ([f"additions: {', '.join(added)}"] if added else []) + ([f"{CONTRACT}: {', '.join(names)}"] if names else [])
-    parts += [f"other edits: {', '.join(edits)}"] if edits else []
+    checks = [f"{i} ({re.sub(r'^### \S+\.\s*', '', heading).strip()})" for i, (heading, _, _) in new_checks.items() if i not in old_checks]
+    parts = [f"additions: {', '.join(checks)}"] if checks else []
+    parts += [f"{name}: {', '.join(contract_name(line) for line in added_lines[name])}" for name in ADDITIVE if name in added_lines]
     return [], "; ".join(parts) or "formatting only"
 
 
@@ -762,8 +793,8 @@ def cmd_freeze(directory, args):
         revision.update(why=summary, auto=True)
     else:
         if not args.revision or len(args.revision.strip()) < MIN_REASON:
-            raise Failed("the plan changed after it was frozen" + (f", beyond adding checks or Drive contract lines: {listed(needs)}"
-                                                                    if needs else "")
+            raise Failed("the plan changed after it was frozen" + (f", beyond adding checks, Drive contract lines, or Sensitive paths: "
+                                                                    f"{listed(needs)}" if needs else "")
                          + ". A check changes only when the user agrees it was wrong (a looser perf budget also "
                          "needs vetted evidence and a countersign). Record it with --revision \"<what changed and why>\", plus "
                          "--gate <id> of the autorun gate the user answered in an autonomous run, and the report lists it.")
@@ -1039,31 +1070,100 @@ def section(text, name):
     return m.group(1).strip() if m else ""
 
 
-def untriaged(body):
-    findings = [line.strip() for line in body.splitlines() if re.match(r"^\s*[-*] ", line)]
-    return [f"has no 'Triage: fixed | new check | follow-up | pre-existing | dismissed': {f[:80]}" for f in findings if not TRIAGE.search(f)]
+def review_meta(body, name):
+    """The value of a section's '<name>:' line, '' when the line is empty, or None when there is none."""
+    return next((m.group(2) for m in SECTION_META.finditer(body) if m.group(1) == name), None)
+
+
+def finding_problems(name, body, meta):
+    """Every line of a review section is a meta line, a finding bullet (with its indented continuation), or 'none found'."""
+    findings, stray, none = [], [], False
+    for line in body.splitlines():
+        if not line.strip() or ((m := SECTION_META.match(line)) and m.group(1) in meta):
+            continue
+        if BULLET.match(line):
+            findings.append(line.strip())
+        elif NONE_FOUND.match(line.strip()):
+            none = True
+        elif line[:1].isspace() and findings:
+            findings[-1] += " " + line.strip()
+        else:
+            stray.append(line.strip())
+    if not findings and not none and not stray:
+        return [f"the '## {name}' section of {REVIEW} is empty; list each finding with its triage, or write 'none found'"]
+    problems = [f"the '## {name}' section of {REVIEW} holds a line that is not a finding bullet: {line[:80]}; write each finding "
+                "as a bullet with its triage" for line in stray]
+    return problems + [f"{name.lower()} finding has no 'Triage: fixed | new check | follow-up | pre-existing | dismissed': {f[:80]}"
+                       for f in findings if not TRIAGE.search(f)]
 
 
 def review_head(text):
-    m = re.search(r"^\s*(?:[-*]\s+)?Head:\s*(\S+)", text, re.M)
-    return m.group(1) if m else None
+    return review_meta(text, "Head") or None
 
 
-def finding_problems(name, body):
-    rest = "\n".join(line for line in body.splitlines() if not REVIEW_META.match(line)).strip()
-    if not rest:
-        return [f"the '## {name}' section of {REVIEW} is empty; list each finding with its triage, or write 'none found'"]
-    return [f"{name.lower()} finding {p}" for p in untriaged(rest)]
+def is_ancestor(old, new):
+    return subprocess.run(["git", "merge-base", "--is-ancestor", old, new], capture_output=True).returncode == 0
+
+
+NO_FIXED_AT = (f"the '## {FIX_REVIEW}' section of {REVIEW} names no 'Fixed at:' line. Once its findings' fixes land, the lead writes "
+               "'Fixed at: <sha>', the commit that holds them, or the section's Head when nothing was fixed")
+
+
+def fixed_at_problems(directory, body, head, fix_head):
+    """The fix review's 'Fixed at:' line names the commit that holds its fixes (its Head when nothing was fixed), at or after
+    its Head; with fix_head, HEAD holds that commit's product tree, so no product change follows the reviewed fixes."""
+    fixed_at, skip = review_meta(body, "Fixed at"), plan_skip(directory)
+    if not fixed_at:
+        return [NO_FIXED_AT]
+    if tree_of(fixed_at) is None:
+        return [f"the fix review's Fixed at {fixed_at} is not a commit in this repository"]
+    if not is_ancestor(head, fixed_at):
+        return [f"the fix review's Fixed at {fixed_at[:12]} does not descend from its Head {head[:12]}; its fixes land after the "
+                "head it read"]
+    if not FIXED.search(body) and (changed := product_diff(head, fixed_at, skip)):
+        return [f"no fix review finding is triaged fixed, yet product files changed from its Head {head[:12]} to Fixed at "
+                f"{fixed_at[:12]}: {listed(changed)}. Fixed at is the section's Head when nothing was fixed"]
+    if fix_head and not same_product(fixed_at, skip):
+        changed = product_diff(fixed_at, "HEAD", skip) or ["HEAD's tree"]
+        return [f"product files changed after the fix review's fixes (Fixed at {fixed_at[:12]}): {listed(changed)}. No reviewer "
+                "read them: send the same reviewer Mode fix on that diff, then update the section's Head and Fixed at"]
+    return []
+
+
+def reviewer_problems(text, body):
+    """The fix review names its Reviewer, the review's own, unless a 'Relaxed: <reason>' line says why another took it."""
+    top = review_meta("\n".join(itertools.takewhile(lambda line: not line.startswith("## "), text.splitlines())), "Reviewer") \
+        or review_meta(section(text, "Review"), "Reviewer")
+    fixer, relaxed = review_meta(body, "Reviewer"), review_meta(body, "Relaxed")
+    problems = []
+    if not top:
+        problems.append(f"{REVIEW} names no 'Reviewer:' line; the reviewer writes its agent:model under the title")
+    if not fixer:
+        problems.append(f"the '## {FIX_REVIEW}' section of {REVIEW} names no 'Reviewer:' line; the reviewer writes its agent:model there")
+    if relaxed is not None and len(relaxed) < MIN_REASON:
+        problems.append(f"the '## {FIX_REVIEW}' section's 'Relaxed:' line needs the reason another reviewer took the fix review")
+    elif top and fixer and fixer != top and relaxed is None:
+        problems.append(f"the fix review's Reviewer {fixer} is not the review's {top}; the same reviewer reviews the fixes. When its "
+                        f"quota ran out and `guard.py quota pick --relax` gave another, add 'Relaxed: <reason>' to the section")
+    return problems
+
+
+def relaxed_review(directory):
+    """A report note for a fix review another reviewer took, from its 'Relaxed:' line."""
+    path = directory / REVIEW
+    body = section(path.read_text(), FIX_REVIEW) if path.is_file() else ""
+    relaxed = review_meta(body, "Relaxed")
+    return [f"fix review relaxed: {review_meta(body, 'Reviewer') or 'another reviewer'} took it: {relaxed}"] if relaxed else []
 
 
 def review_problems(directory, frozen_ts, in_repo, fix_head=False):
     """review.md: a '## Review' and a '## Fix review', each naming the Head it read and triaging every finding, written after
-    the freeze. With fix_head, the fix review read HEAD's product tree, or HEAD differs only by fixes for its own findings."""
+    the freeze, by the same Reviewer unless relaxed. With fix_head, no product change follows the fix review's Fixed at."""
     path = directory / REVIEW
     if not path.is_file():
-        return [f"no {REVIEW}. The reviewer writes a '## Review' section with the 'Head:' it read and every finding triaged, or "
-                f"'none found'; once the review's fixes land, the same reviewer reviews their diff once into a '## {FIX_REVIEW}' "
-                "section of the same shape"]
+        return [f"no {REVIEW}. The reviewer writes a 'Reviewer:' line, then a '## Review' section with the 'Head:' it read and every "
+                f"finding triaged, or 'none found'; once the review's fixes land, the same reviewer reviews their diff once into a "
+                f"'## {FIX_REVIEW}' section of the same shape, and the lead adds its 'Fixed at:' line"]
     text = path.read_text()
     found = sections(text.splitlines())
     problems = []
@@ -1074,7 +1174,7 @@ def review_problems(directory, frozen_ts, in_repo, fix_head=False):
                         "each finding triaged, or 'none found'")
     else:
         body = "\n".join(line for _, line in found["Review"])
-        problems += finding_problems("Review", body)
+        problems += finding_problems("Review", body, REVIEW_META)
         reviewed = review_head(body)
         if not reviewed:
             problems.append(f"the '## Review' section of {REVIEW} names no 'Head:' line; the reviewer writes the commit it read "
@@ -1086,17 +1186,17 @@ def review_problems(directory, frozen_ts, in_repo, fix_head=False):
                         "diff once, writes the 'Head:' it read, and triages every finding, or writes 'none found'")
         return problems
     body = "\n".join(line for _, line in found[FIX_REVIEW])
-    problems += finding_problems(FIX_REVIEW, body)
+    problems += finding_problems(FIX_REVIEW, body, FIX_REVIEW_META) + reviewer_problems(text, body)
     fixed = review_head(body)
     if not fixed:
         problems.append(f"the '## {FIX_REVIEW}' section of {REVIEW} names no 'Head:' line; the reviewer writes the commit it "
                         "read as the section's first line")
     elif in_repo and tree_of(fixed) is None:
         problems.append(f"the fix review read Head {fixed}, which is not a commit in this repository")
-    elif in_repo and fix_head and (changed := product_diff(fixed, "HEAD", plan_skip(directory))) and not FIXED.search(body):
-        problems.append(f"the fix review read {fixed[:12]}, but product files changed since: {listed(changed)}. The fix review "
-                        "covers every review fix, so its Head is HEAD or a commit with HEAD's product tree; only fixes for its own "
-                        "findings may follow it")
+    elif in_repo:
+        problems += fixed_at_problems(directory, body, fixed, fix_head)
+    if not in_repo and not review_meta(body, "Fixed at"):
+        problems.append(NO_FIXED_AT)
     return problems
 
 
@@ -1189,8 +1289,9 @@ def walk_media(directory, check_id, frozen_ts):
             and p.stat().st_size and p.stat().st_mtime >= frozen_ts] if folder.is_dir() else []
 
 
-def report_notes(lock, scripts_lock):
-    notes = [f"revision {r['at']}{' (automatic)' if r.get('auto') else ''}: {r['why']}" + (f" (gate {r['gate']})" if r.get("gate") else "")
+def report_notes(directory, lock):
+    scripts_lock = load_scripts_lock(directory) or {}
+    notes = relaxed_review(directory) + [f"revision {r['at']}{' (automatic)' if r.get('auto') else ''}: {r['why']}" + (f" (gate {r['gate']})" if r.get("gate") else "")
              for r in lock["revisions"]]
     notes += [f"full rerun {r['at']}: {r['why']}" for r in scripts_lock.get("full_reruns", [])]
     notes += [f"script fix {r['at']} {r['file']}: {r['why']}" for r in scripts_lock.get("script_fixes", [])]
@@ -1277,7 +1378,7 @@ def report_gate(directory):
                 problems.append(f"{number}: {check_id} is {'an' if tier == 'e2e' else 'a'} {tier} check marked PASS, but {gap}")
     if problems:
         raise Failed("\n".join(f"{path}: {p}" for p in problems))
-    notes = report_notes(lock, load_scripts_lock(directory) or {})
+    notes = report_notes(directory, lock)
     if not_ready:
         notes.insert(0, f"not ready to merge: {', '.join(not_ready)}; the PR lists them at the top and carries the 'do not merge' label")
     return "\n  ".join([f"report ok: {len(ids)} checks have verdicts backed by evidence", *([same_tree] if same_tree else []), *notes])
@@ -1366,7 +1467,7 @@ def write_report(directory, args):
         lines += ["## Not ready to merge", "", *not_ready, ""]
     lines += [f"Head: {head}", f"Main: {main}", f"Author: {author}", f"Verifier: {verifier}", "",
               "| Check | Verdict | Evidence | Observed |", "|---|---|---|---|", *rows, ""]
-    if extra := report_notes(lock, load_scripts_lock(directory) or {}):
+    if extra := report_notes(directory, lock):
         lines += ["## Revisions and fixes", "", *(f"- {note}" for note in extra), ""]
     kept = [line[2:].strip() for line in section(previous, "Notes").splitlines() if line.startswith("- ")]
     if given := [note.strip() for note in args.note if note.strip()] if args.note is not None else kept:
@@ -1427,13 +1528,29 @@ def head_sha():
         return None
 
 
+@contextlib.contextmanager
+def rerun_state(directory):
+    """Hold the verification directory's rerun bookkeeping: scripts.lock.json, the run ledger, the fix ledger, the stamp,
+    and the <id>.rerun.log files. Concurrent reruns serialize their updates here while their scripts run in parallel."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / STATE_LOCK, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        yield
+
+
+def write_json(path, data):
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}{TMP_SUFFIX}")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
 def load_scripts_lock(directory):
     path = directory / SCRIPTS_LOCK
     return load_json(path) if path.is_file() else None
 
 
 def write_scripts_lock(directory, lock):
-    (directory / SCRIPTS_LOCK).write_text(json.dumps(lock, indent=2) + "\n")
+    write_json(directory / SCRIPTS_LOCK, lock)
 
 
 def unrecorded_edits(directory, lock):
@@ -1481,6 +1598,11 @@ def cmd_script_fix(directory, args):
         raise Failed("script-fix takes one <file>: a check script or helper in the verification directory")
     if not args.reason or len(args.reason.strip()) < MIN_REASON:
         raise Failed("script-fix needs --reason \"<why it crashed before its predicate>\"")
+    with rerun_state(directory):
+        return record_script_fix(directory, args)
+
+
+def record_script_fix(directory, args):
     lock = load_scripts_lock(directory)
     if lock is None:
         raise Failed(f"no {SCRIPTS_LOCK} in {directory}; the prove's full `verify.py rerun` writes it, and until then a "
@@ -1519,16 +1641,14 @@ def load_ledger(directory):
     return load_json(path) if path.is_file() else {}
 
 
-def record_runs(directory, results, state):
+def record_run(directory, path, verdict, state):
+    """Record a check's run as its latest in the ledger; the caller holds rerun_state, with the run's log just written."""
     head, dirty, product_dirty, product_patch = state
     ledger = load_ledger(directory)
-    for check_id, (verdict, _, _) in results.items():
-        if verdict in ("PASS", "FAIL"):
-            script = next((p for p in check_scripts(directory) if script_id(p) == check_id), None)
-            ledger[check_id] = {"head": head, "dirty": dirty, "product_dirty": product_dirty, "product_patch": product_patch,
-                                "script": hashlib.sha256(script.read_bytes()).hexdigest() if script else None,
-                                "verdict": verdict, "at": now_iso()}
-    (directory / RERUN_LEDGER).write_text(json.dumps(dict(sorted(ledger.items())), indent=2) + "\n")
+    ledger[script_id(path)] = {"head": head, "dirty": dirty, "product_dirty": product_dirty, "product_patch": product_patch,
+                               "script": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
+                               "verdict": verdict, "at": now_iso()}
+    write_json(directory / RERUN_LEDGER, dict(sorted(ledger.items())))
 
 
 def stale_checks(directory):
@@ -1555,7 +1675,7 @@ def file_sizes(directory):
     sizes = {}
     for root, dirs, names in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in DEPENDENCY_DIRS]
-        for name in names:
+        for name in (n for n in names if not n.endswith(TMP_SUFFIX)):
             path = pathlib.Path(root, name)
             with contextlib.suppress(OSError):
                 sizes[path.relative_to(directory)] = path.stat().st_size
@@ -1602,9 +1722,10 @@ def fix_attempts(directory):
         return {}
 
 
-def run_check(directory, path, args, env, concurrent=set, run=None):
-    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log. concurrent() names the checks
-    that ran beside it. run, when given, learns the script's pid and readiness, and a run the watchdog evicted is REQUEUED."""
+def run_check(directory, path, args, env, concurrent=set, run=None, state=None):
+    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log, and with state, the run goes to
+    the ledger in the same step. concurrent() names the checks that ran beside it. run, when given, learns the script's pid
+    and readiness, and a run the watchdog evicted is REQUEUED."""
     check_id = script_id(path)
     command = script_command(path)
     before = file_sizes(directory)
@@ -1632,7 +1753,10 @@ def run_check(directory, path, args, env, concurrent=set, run=None):
             "deleted or emptied files that are not its own"
         detail = f"{culprit}: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
     reason = detail.partition("\n")[0]
-    (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}" + (f" ({reason})" if reason else "") + "\n")
+    with rerun_state(directory):
+        (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}" + (f" ({reason})" if reason else "") + "\n")
+        if state is not None:
+            record_run(directory, path, verdict, state)
     return verdict, detail
 
 
@@ -1771,32 +1895,33 @@ def cmd_rerun(directory, args):
         scripts = only_scripts(scripts, args.only)
     if not scripts:
         return f"no saved check scripts (<id>.check.<ext>) in {directory}; nothing to rerun"
-    failing, attempts = reported_failures(directory), fix_attempts(directory)
-    left = sorted(i for i in failing if attempts.get(i, 0) >= FIX_ATTEMPTS)
-    skipped = [script_id(p) for p in scripts if script_id(p) in left]
-    lock = load_scripts_lock(directory)
-    hold_script_lock(directory, lock)
-    stamp_path = directory / RERUN_STAMP
-    inputs = None if args.only else rerun_inputs(directory, scripts, args.rest, left)
-    if inputs and not args.force and stamp_path.exists():
-        try:
-            stamp = json.loads(stamp_path.read_text())
-        except ValueError:
-            stamp = {}
-        if {k: stamp.get(k) for k in inputs} == inputs:
-            known = stamp.get("known") or []
-            return (f"rerun: {len(scripts)} checks passed at {stamp.get('at')} on this tree"
-                    + (f" except {', '.join(known)}, left FAIL after the fix budget" if known else "")
-                    + "; nothing changed since (pass --force to run again)")
-    if not args.only:
-        claim_full_rerun(directory, lock, check_scripts(directory), args)
-        stamp_path.unlink(missing_ok=True)
+    with rerun_state(directory):
+        failing, attempts = reported_failures(directory), fix_attempts(directory)
+        left = sorted(i for i in failing if attempts.get(i, 0) >= FIX_ATTEMPTS)
+        skipped = [script_id(p) for p in scripts if script_id(p) in left]
+        lock = load_scripts_lock(directory)
+        hold_script_lock(directory, lock)
+        stamp_path = directory / RERUN_STAMP
+        inputs = None if args.only else rerun_inputs(directory, scripts, args.rest, left)
+        if inputs and not args.force and stamp_path.exists():
+            try:
+                stamp = json.loads(stamp_path.read_text())
+            except ValueError:
+                stamp = {}
+            if {k: stamp.get(k) for k in inputs} == inputs:
+                known = stamp.get("known") or []
+                return (f"rerun: {len(scripts)} checks passed at {stamp.get('at')} on this tree"
+                        + (f" except {', '.join(known)}, left FAIL after the fix budget" if known else "")
+                        + "; nothing changed since (pass --force to run again)")
+        if not args.only:
+            claim_full_rerun(directory, lock, check_scripts(directory), args)
+            stamp_path.unlink(missing_ok=True)
+        before = load_ledger(directory)
     runnable = [p for p in scripts if script_id(p) not in left]
     env = {**os.environ, "VERIFY_DIR": str(directory)}
     state = working_state(directory)
-    before = load_ledger(directory)
-    results, requeued = run_checks(directory, runnable, args, lambda path, beside, run: run_check(directory, path, args, env, beside, run))
-    record_runs(directory, results, state)
+    results, requeued = run_checks(directory, runnable, args,
+                                   lambda path, beside, run: run_check(directory, path, args, env, beside, run, state))
     lines, failed = [*requeued, *map(spent_line, skipped)], []
     not_run = [i for i, (verdict, _, _) in results.items() if verdict == "NOT RUN"]
     for path in runnable:
@@ -1811,23 +1936,24 @@ def cmd_rerun(directory, args):
     summary += f", {len(not_run)} not run for lack of capacity" if not_run else ""
     summary += f", {len(requeued)} requeued" if requeued else ""
     lines.append(summary + (" (--only: no stamp; the ledger records these runs)" if args.only else ""))
-    counted = False
-    for check_id in (i for i in failed if i in failing):
-        script = next(p for p in runnable if script_id(p) == check_id)
-        if not fix_attempt(before.get(check_id), state, hashlib.sha256(script.read_bytes()).hexdigest(), plan_skip(directory)):
-            lines.append(f"{check_id} still fails with no product or script change since its previous failing run, so this run "
-                         "is not a fix attempt")
-            continue
-        counted = True
-        attempts[check_id] = attempts.get(check_id, 0) + 1
-        lines.append(f"fix attempt {attempts[check_id]} of {FIX_ATTEMPTS} for {check_id} failed"
-                     + ("; that was the last one, so the next rerun skips it" if attempts[check_id] >= FIX_ATTEMPTS else ""))
-    if counted:
-        (directory / FIX_LEDGER).write_text(json.dumps(attempts, indent=2) + "\n")
-    if failed or not_run:
-        raise Failed("\n" + "\n".join(lines))
-    if inputs:
-        stamp_path.write_text(json.dumps({**inputs, "at": now_iso(), "known": skipped}, indent=2) + "\n")
+    with rerun_state(directory):
+        attempts, counted = fix_attempts(directory), False
+        for check_id in (i for i in failed if i in failing):
+            script = next(p for p in runnable if script_id(p) == check_id)
+            if not fix_attempt(before.get(check_id), state, hashlib.sha256(script.read_bytes()).hexdigest(), plan_skip(directory)):
+                lines.append(f"{check_id} still fails with no product or script change since its previous failing run, so this run "
+                             "is not a fix attempt")
+                continue
+            counted = True
+            attempts[check_id] = attempts.get(check_id, 0) + 1
+            lines.append(f"fix attempt {attempts[check_id]} of {FIX_ATTEMPTS} for {check_id} failed"
+                         + ("; that was the last one, so the next rerun skips it" if attempts[check_id] >= FIX_ATTEMPTS else ""))
+        if counted:
+            write_json(directory / FIX_LEDGER, attempts)
+        if failed or not_run:
+            raise Failed("\n" + "\n".join(lines))
+        if inputs:
+            write_json(stamp_path, {**inputs, "at": now_iso(), "known": skipped})
     return "\n".join(lines)
 
 
@@ -2037,13 +2163,17 @@ def cmd_premises(directory, args):
     folder = plan_file(directory).parent
     path, grounding = folder / PREMISES, folder / GROUNDING
     base = phase_base(base_record(directory))
-    since = int(git("show", "-s", "--format=%ct", base))
     problems = []
     for name, file in ((PREMISES, path), (GROUNDING, grounding)):
         if not file.is_file():
-            problems.append(f"no {name} beside the plan, in {folder}; the explainer writes it from the explorers' findings")
-        elif file.stat().st_mtime <= since:
-            problems.append(f"{file} predates the base commit {base[:12]}; check the premises against the code as it is now")
+            problems.append(f"no {name} beside the plan, in {folder}; the explainer writes it from the explorers' findings, with "
+                            f"the line 'Base: {base}'")
+        elif not (named := BASE_LINE.search(file.read_text())):
+            problems.append(f"{file} names no 'Base: <sha>' line; the explainer writes the commit it checked the code at, the "
+                            f"adopted base: 'Base: {base}'")
+        elif not base.startswith(named.group(1).lower()):
+            problems.append(f"{file} was checked at {named.group(1)}, not at the adopted base {base[:12]}; check the premises "
+                            f"against the base again and write 'Base: {base}'")
     if not path.is_file():
         raise Failed("\n".join(problems))
     rows = premise_rows(path)
@@ -2070,11 +2200,35 @@ def cmd_premises(directory, args):
             + (", each with its resolution" if args.resolved and false else "") + open_note)
 
 
-def cmd_spec(directory, args):
+def adopted_phase(directory):
+    """(plan folder, phase folder) of the phase this branch carries, or (None, None) when no plan folder is recorded. An older
+    adopt recorded only the plan folder and copied the phase plan here; that phase is the one whose plan shares a check id with
+    the copy. A plan folder whose phase cannot be told is Failed, never a pass."""
     record = base_record(directory)
-    if not record.get("plan_file") or not record.get("plan"):
+    if record.get("plan_file"):
+        phase = pathlib.Path(record["plan_file"]).parent
+        return pathlib.Path(record.get("plan") or phase.parent.parent), phase
+    pointer = directory / PHASES_POINTER
+    root = record.get("plan") or (json.loads(pointer.read_text()).get("root") if pointer.is_file() else None)
+    if not root:
+        return None, None
+    root, copy = pathlib.Path(root), directory / "plan.md"
+    _, ids, _, _ = lint_plan(copy.read_text(), full=False) if copy.is_file() else ([], [], {}, {})
+    owners = [p.parent for p in sorted(root.glob("phases/*/plan.md"))
+              if {i for i, _ in ids if i} & {i for i, _ in lint_plan(p.read_text(), full=False)[1] if i}]
+    if len(owners) != 1:
+        found = "no phase" if not owners else f"{len(owners)} phases ({', '.join(o.name for o in owners)})"
+        raise Failed(f"this branch records the plan folder {root}, but {found} under {root / 'phases'} holds the checks of "
+                     f"{copy if copy.is_file() else 'an adopted plan'}, so the change log cannot be checked. Run "
+                     "`verify.py adopt <phase folder>` with this branch's phase")
+    return root, owners[0]
+
+
+def cmd_spec(directory, args):
+    root, folder = adopted_phase(directory)
+    if root is None:
         return "spec: no plan folder adopted on this branch, so there is no spec.md to reconcile"
-    root, phase = pathlib.Path(record["plan"]), pathlib.Path(record["plan_file"]).parent.name
+    phase = folder.name
     path = root / SPEC
     text = read(path, f"{SPEC} in the plan folder (the plan-feature skill writes it)")
     if not re.search(rf"^## {re.escape(CHANGE_LOG)}\s*$", text, re.M):

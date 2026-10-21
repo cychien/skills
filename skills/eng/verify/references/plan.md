@@ -51,7 +51,7 @@ Cover:
 
 ## Premises
 
-Before the design, test every check's premises against the code as it is, because a false premise found before the code costs a line and one found at the e2e run costs a fix round. The how skill's explorers do it, and its explainer writes two files beside the plan (the phase's folder, else the verification directory):
+Before the design, test every check's premises against the code as it is, because a false premise found before the code costs a line and one found at the e2e run costs a fix round. The how skill's explorers do it, and its explainer writes two files beside the plan (the phase's folder, else the verification directory), each starting with a line `Base: <sha>`, the base commit it checked the code at:
 
 - `grounding.md`: how the subsystems the checks run through work today, the starting model for the design and for the next phase.
 - `premises.md`: one table with a row per premise and at least one row per check.
@@ -62,7 +62,7 @@ Before the design, test every check's premises against the code as it is, becaus
 | <id> | <the fact the check depends on> | <yes or no> | <file:line, or the command and its output> | <empty until the design; for a no: what the design adds, how the check changes, or where it moves> |
 ```
 
-`verify.py premises` passes when both files were written after the base, every check id has a row, and every row has Holds `yes` or `no` and its Evidence. The design fills the Resolution of every `no` row, and `verify.py premises --resolved` checks it. Never resolve a premise by guessing. A check the code cannot satisfy changes with the user's agreement, or the design adds what it needs.
+`verify.py premises` passes when both files name the phase's base in their `Base:` line (the commit `verify.py adopt` recorded, else the merge-base with main), every check id has a row, and every row has Holds `yes` or `no` and its Evidence. The design fills the Resolution of every `no` row, and `verify.py premises --resolved` checks it. Never resolve a premise by guessing. A check the code cannot satisfy changes with the user's agreement, or the design adds what it needs.
 
 ## Drive contract
 
@@ -101,7 +101,7 @@ A check that compares against a baseline treats the baseline as the spec. Captur
 
 ## Revising the plan
 
-A design, a prototype, or a false premise can show that a predicate or a budget was wrong, or that a check is missing. Revise the plan then, with the user's agreement, before the lock. After the lock, `verify.py freeze` sorts each change on its own. A change that only adds checks or adds Drive contract names is recorded as an addition and passes, because it narrows nothing. Any other change, to an existing check's Scenario, Pass, Tier, Oracle, or Seed, a removed check, or a removed contract name, happens only under the verify skill's Fixed goalposts rule, recorded with `verify.py freeze --revision "<what and why>"` and, in an autonomous run, `--gate <id>` of the autorun gate the user answered, never to make a check pass. The report lists every revision.
+A design, a prototype, or a false premise can show that a predicate or a budget was wrong, or that a check is missing. Revise the plan then, with the user's agreement, before the lock. After the lock, `verify.py freeze` sorts each change on its own. A change that only adds checks, Drive contract names, or Sensitive paths is recorded as an addition and passes, because it narrows nothing. Any other change, to any field, the title, or the text of an existing check, a removed check or line, any other added line, or the perf decision and its n/a reason, happens only under the verify skill's Fixed goalposts rule, recorded with `verify.py freeze --revision "<what and why>"` and, in an autonomous run, `--gate <id>` of the autorun gate the user answered, never to make a check pass. The report lists every revision.
 
 ## Autonomous runs
 

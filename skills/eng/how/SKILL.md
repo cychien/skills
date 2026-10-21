@@ -35,11 +35,11 @@ Present the explainer's output. Light edits for clarity or context from the conv
 
 ## With a verification plan
 
-The feature skill's grounding step passes the plan, and the place its files go: the plan's phase folder, else the verification directory. Then:
+The feature skill's grounding step passes the plan, the place its files go (the plan's phase folder, else the verification directory), and the base commit the premises are checked at. Then:
 
 - Give every check to at least one explorer, beside its angle: the checks whose scenario runs through its slice. The explorer lists each fact the check depends on (a route exists, a dialog asks before it acts, an adapter queues while offline), whether it holds on current main, and the file and line or the command output that shows it, because a false premise found before the design costs a line.
 - When the caller passes an earlier `grounding.md`, the explorers start from it and look only at what changed since and at the premises.
-- The explainer writes two files there: `grounding.md`, the explanation in the sections below, whole even when it started from an earlier one; and `premises.md`, the table of `../verify/references/plan.md`'s Premises section, one row per premise and at least one per check. It checks every `no` row in the code itself before writing it, and leaves every Resolution empty, because the design resolves premises, not how.
+- The explainer writes two files there: `grounding.md`, the explanation in the sections below, whole even when it started from an earlier one; and `premises.md`, the table of `../verify/references/plan.md`'s Premises section, one row per premise and at least one per check. Each file starts with the line `Base: <sha>`, the base commit the caller passed, because `verify.py premises` accepts the files only for that base. It checks every `no` row in the code itself before writing it, and leaves every Resolution empty, because the design resolves premises, not how.
 
 ## Output format
 
