@@ -13,7 +13,7 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [code-comments](./skills/eng/code-comments/) - how code is commented in every file a playbook produces
 - [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements, one living spec, phases, and every phase's checks before any code
 - [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground and test the checks' premises, design, lock the plan before code, implement beside the e2e scripts, review, prove once, open a PR; builds a plan-feature plan one phase per session, one PR per phase, stacked while an earlier phase is open
-- [quick-feature](./skills/eng/quick-feature/) - build a small feature in one PR with the same verification floor: plan locked before code, fail-first specs, scripts dry-run on the base, review before the one e2e run, oracle
+- [quick-feature](./skills/eng/quick-feature/) - build a small change about as fast as asking an agent: do it yourself, test it, run it once, open a PR; no plan lock, verifier, or review
 - [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, review the fix before one e2e run, land the failing repro before the fix
 - [perf-issue](./skills/eng/perf-issue/) - fix a slowness against a vetted baseline, cheapest performance mantra first
 - [hillclimb](./skills/eng/hillclimb/) - improve one metric against a target: frozen harness, keep or revert, decision log
