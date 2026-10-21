@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from . import pr, skills, state, verifiers
+from . import pr, quota, skills, state, verifiers
 
 PASS = ("pass", None)
 DECISION = re.compile(r"guard\.py['\"]?\s+todo\b|autorun\.py['\"]?\s+(start|mode)\b")
@@ -47,6 +47,14 @@ LEFTOVERS_DENIED = ("Processes from earlier delegates or tasks are still running
 BACKGROUND_DENIED = ("A subagent cannot run an agent in the background: when your turn ends, the harness kills your background children "
                      "mid-work. Run it in the foreground; for parallel work, put several foreground Agent calls in one message.")
 TODO_CLI = re.compile(r"guard\.py['\"]?\s+(?:todo\b|\"\$@\")")
+HANDBACK_LIMIT = 300
+HANDBACK_TARGET = 200
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]")
+HANDBACK_TOOLS = {"subagenthandback"}
+LIMIT_TOOLS = {"agent", "task", "sendmessage"}
+GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
+OPEN_PR = "../open-pr/SKILL.md"
+RERUN_DENIED = "A fix group is still working; rerun once every group has handed back, so one run grades every fix."
 OWN_LIST = ("You are a subagent, and guard keeps your todo list apart from your lead's, so your items never land in its list and "
             "only your own list holds your turn. Add `--agent {agent_id}` to every guard todo command, after `--session`:\n"
             "   {cmd} todo from <skill> {sess}")
@@ -112,6 +120,13 @@ def handle(event):
     return PASS
 
 
+def active_hold(event):
+    """The stopping agent's own `todo hold` while it lasts, else None."""
+    if not event.session or not state.exists(event.agent, event.session):
+        return None
+    return state.held(state.own_list(state.load(event.agent, event.session), event.agent_id))
+
+
 def delegate_acts(event):
     """Mark a subagent running from its first tool call; one whose stop went through but that acts again keeps its start."""
     if state.exists(event.agent, event.session) and state.load(event.agent, event.session).get("delegates", {}).get(event.agent_id, {}).get("running"):
@@ -147,7 +162,7 @@ def todo_hint(skill, event):
    {cmd} todo add "<item>" ["<item>" ...] {sess}
 If this task needs no list, say why:
    {cmd} todo none {sess} --reason "<why>"
-Resolve each item as you go with `todo done <n> [<n> ...]` or `todo skip <n> [<n> ...] --reason "..."`. The turn cannot end while an item is open, except to ask the user a question: mark the items that wait on the answer with `todo wait <n> [<n> ...] --reason "..."` first."""
+Before each item, print it with `todo show <n>`; resolve it as you go with `todo done <n> --token <token>` (the token `show` printed) or `todo skip <n> [<n> ...] --reason "..."`. The turn cannot end while an item is open, except to ask the user a question: mark the items that wait on the answer with `todo wait <n> [<n> ...] --reason "..."` first."""
 
 
 def on_prompt(event):
@@ -249,6 +264,7 @@ def on_post_tool(event):
             delegates_end(event, {stopped})
         swept = sweep_leftovers(event, "--kill")
         return ("context", swept[1]) if swept and swept[1] and event.can_inject else PASS
+    note_limits(event)
     loaded, read, invoked = [], [], set()
     if event.tool and event.tool.lower() == "skill" and isinstance(event.tool_input, dict) and event.tool_input.get("skill"):
         loaded.append(event.tool_input["skill"].split(":")[-1])
@@ -277,6 +293,29 @@ def on_post_tool(event):
     return PASS
 
 
+def note_limits(event):
+    """Record a usage limit the result of a subagent or an agent CLI reports, so every session hands that agent's work on."""
+    tool = (event.tool or "").lower()
+    command = shell_command(event)
+    if tool not in LIMIT_TOOLS and not (command and quota.runs_agent(command)):
+        return
+    for agent, until, source in quota.scan("\n".join(strings(event.tool_response))):
+        try:
+            quota.record(agent, until, source)
+        except OSError:
+            pass
+
+
+def strings(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in strings(v)]
+    return []
+
+
 def on_pre_tool(event):
     command = shell_command(event) or ""
     if detached_salvo(command):
@@ -292,6 +331,16 @@ def on_pre_tool(event):
     if event.agent_id and runs_todo(command) and not re.search(rf"--agent[ =]['\"]?{re.escape(event.agent_id)}(?![\w-])", command):
         cmd, sess = cli(event)
         return "deny", OWN_LIST.format(agent_id=event.agent_id, cmd=cmd, sess=sess)
+    if (event.tool or "").lower() in HANDBACK_TOOLS and isinstance(event.tool_input, dict):
+        long = oversized_handback(event, event.tool_input.get("message"))
+        if long:
+            return "deny", long
+    stalled = quota.spawn_problem(command, event.cwd, event.agent) if command else None
+    if stalled:
+        return "deny", stalled
+    out_of_order = order_problem(event, command)
+    if out_of_order:
+        return "deny", out_of_order
     spent = verifiers.over_budget(prompt)
     if spent:
         return "deny", spent
@@ -316,6 +365,26 @@ def on_pre_tool(event):
     if not found:
         return PASS
     return "deny", "The open-pr skill's PR rules reject this command:\n- " + "\n- ".join(found) + "\nFix the command and run it again."
+
+
+def order_problem(event, command):
+    """Why a command is early for the flow: a rerun while fix groups still work, or a PR before the close step."""
+    bare = QUOTED.sub("", HEREDOC.sub("", command))
+    rerun, create = quota.RERUN.search(bare), GH_PR_CREATE.search(bare)
+    if not (rerun or create) or not state.exists(event.agent, event.session):
+        return None
+    data = state.load(event.agent, event.session)
+    if rerun and any(d.get("running") and i != event.agent_id for i, d in data.get("delegates", {}).items()):
+        return RERUN_DENIED
+    if create:
+        for closing in (i for i in data["todo"] if i["source"] and OPEN_PR in i["text"]):
+            early = [i for i in state.unresolved(data) if i["source"] == closing["source"] and i["n"] < closing["n"]]
+            if early:
+                cmd, sess = cli(event)
+                return (f"The PR opens in item {closing['n']} ({closing['title']}), the close step, and earlier steps are unresolved: "
+                        + ", ".join(f"{i['n']}. {i['title']}" for i in early)
+                        + f". Resolve them first (`{cmd} todo done <n> {sess}`), then open the PR.")
+    return None
 
 
 def runs_todo(command):
@@ -402,14 +471,6 @@ def em_dash(message):
     return "—" in prose
 
 
-def uncited_principles(event, data, message):
-    if not message or not ("principles" in data["skills"] or data["principles_read"]):
-        return []
-    titles = skills.principles(event.cwd)
-    lowered = CODE.sub("", message).lower()
-    return sorted({stem for t, stem in titles.items() if t in lowered and stem not in data["principles_read"]})
-
-
 def on_stop(event):
     message = event.last_message or ""
     problems = []
@@ -418,10 +479,6 @@ def on_stop(event):
     if not state.exists(event.agent, event.session):
         return ("block", "\n".join(problems)) if problems else PASS
     data = state.load(event.agent, event.session)
-    unread = uncited_principles(event, data, message)
-    if unread:
-        files = ", ".join(f"references/principles/{s}.md" for s in unread)
-        problems.append(f"Your reply cites principles whose file you did not read this session ({files} in the principles skill). Read them, or remove those citations.")
     sources = {i["source"]: i["source_path"] for i in data["todo"] if i["source"] and i["source_path"]}
     needs_reply = [name for name, path in sources.items() if "../reply/SKILL.md" in (skills.read(path) or "")]
     if needs_reply and data["todo"] and not state.unresolved(data) and "reply" not in data["skills"]:
@@ -431,17 +488,41 @@ def on_stop(event):
 
 
 def on_subagent_stop(event):
-    """A subagent's turn holds only on its own list; the lead's items are the lead's."""
-    if not state.exists(event.agent, event.session):
-        return PASS
-    problems = open_item_problems(event, event.last_message or "", state.load(event.agent, event.session), others=False)
+    """A subagent's turn holds on its own list, never the lead's, and on a hand-back too long for the lead's context."""
+    long = oversized_handback(event, event.last_message)
+    problems = [long] if long else []
+    if state.exists(event.agent, event.session):
+        problems += open_item_problems(event, event.last_message or "", state.load(event.agent, event.session), others=bool(problems))
     return ("block", "\n\n".join(problems)) if problems else PASS
+
+
+def words(text):
+    """Words in text, each CJK character counting as half a word."""
+    cjk = len(CJK.findall(text))
+    return len(CJK.sub(" ", text).split()) + cjk / 2
+
+
+def oversized_handback(event, message):
+    """Once per hand-back length: why a subagent's hand-back is too long. An unchanged length passes the second time,
+    so an agent type that cannot write files is not looped."""
+    message = (message or "").strip()
+    count = words(message)
+    if not event.agent_id or count <= HANDBACK_LIMIT:
+        return None
+    with state.update(event.agent, event.session) as data:
+        seen = data.setdefault("handbacks", {})
+        if seen.get(event.agent_id) == len(message):
+            return None
+        seen[event.agent_id] = len(message)
+    return (f"Your hand-back is {count:g} words, over the {HANDBACK_LIMIT}-word limit, and every word of it stays in the lead's context "
+            f"for the rest of the run. Put the details in a file and hand back at most {HANDBACK_TARGET} words with the file path.")
 
 
 def open_item_problems(event, message, data, others):
     """Why the turn cannot end while this agent's own list has open items; others says whether other problems block it already."""
-    items = state.open_items(state.own_list(data, event.agent_id))
-    if not items:
+    own = state.own_list(data, event.agent_id)
+    items = state.open_items(own)
+    if not items or state.held(own):
         return []
     problems = []
     if not others and event.waiting_on_background and headless():
@@ -460,7 +541,7 @@ def open_item_problems(event, message, data, others):
     if idle_blocks < IDLE_LIMIT or mandatory:
         cmd, sess = cli(event)
         lines = ["The todo list has open items:"] + [f"   {i['n']}. {i['title']}" for i in items]
-        problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> {sess}`, or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. To end the turn on a question only the user can answer, even one asked in plain text after they declined a question tool, first mark the items that wait on the answer with `{cmd} todo wait <n> {sess} --reason \"<what the user must answer>\"`; they reopen when the user replies.")
+        problems.append("\n".join(lines) + f"\nDo each one and mark it `{cmd} todo done <n> --token <token> {sess}` (an item from a skill takes the token `todo show <n>` prints), or skip it with `{cmd} todo skip <n> {sess} --reason \"...\"`. To end the turn on a question only the user can answer, even one asked in plain text after they declined a question tool, first mark the items that wait on the answer with `{cmd} todo wait <n> {sess} --reason \"<what the user must answer>\"`; they reopen when the user replies.")
     if idle_blocks >= IDLE_LIMIT and mandatory:
         problems.append("Item(s) {} are mandatory, so stopping repeatedly does not release them. If something outside your control "
                         "keeps one from closing, ask the user a question that names the item and what blocks it.".format(

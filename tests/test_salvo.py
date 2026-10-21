@@ -67,7 +67,8 @@ class Harness(unittest.TestCase):
             path.chmod(0o755)
         self.source = self.root / "source"
         self.source.mkdir()
-        self.env = mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_HOME": str(self.root)})
+        self.env = mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_HOME": str(self.root),
+                                                "ORCHESTRATOR_HOME": str(self.root / "orchestrator")})
         self.env.start()
         self.cwd = os.getcwd()
         os.chdir(self.source)
@@ -115,6 +116,20 @@ class LimitWait(Harness):
         self.assertIn('sandbox_mode="workspace-write"', resumed)
         self.assertEqual(calls[1]["stdin"], salvo.CONTINUE_PROMPT)
         self.assertEqual(len(sleeps), 1)
+
+    def test_every_limit_a_run_hits_is_recorded_for_other_sessions(self):
+        registry = self.root / "orchestrator" / "limits.json"
+        registry.parent.mkdir()
+        registry.write_text(json.dumps({"claude": {"until": "2020-01-01T00:00+00:00", "seen": "x", "source": "old"}}))
+        before = time.time()
+        self.salvo("limit:600,ok", "codex:m")
+        entry = json.loads(registry.read_text())
+        self.assertEqual(set(entry), {"codex"})
+        until = datetime.datetime.fromisoformat(entry["codex"]["until"]).timestamp()
+        self.assertAlmostEqual(until, before + 600, delta=120)
+        self.assertEqual(entry["codex"]["source"], "salvo run 1-m hit the codex usage limit")
+        self.salvo("ok", "claude:m")
+        self.assertEqual(set(json.loads(registry.read_text())), {"codex"})
 
     def test_a_reset_more_than_a_day_away_is_not_waited_for(self):
         run, calls, sleeps = self.salvo("limit:90000", "claude:m")

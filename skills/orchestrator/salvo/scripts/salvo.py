@@ -17,7 +17,9 @@ in that session. `clean` stops any process still running from a workspace, the s
 process hides it.
 
 A run stopped by a usage limit that resets within 24 hours waits for the reset and resumes
-its own session, up to 3 times; salvo.json lists each wait under "limit_waits".
+its own session, up to 3 times; salvo.json lists each wait under "limit_waits". Every limit a run
+hits is also recorded in the orchestrator's limits registry (~/.agents/orchestrator/limits.json,
+$ORCHESTRATOR_HOME overrides the folder), so other sessions hand that agent's work to another candidate.
 
 --clean-room keeps the setup invisible to the runs: each workspace lives at
 /tmp/<random>/<source directory name>, unconnected to --out or the source, and the prompt
@@ -31,6 +33,7 @@ skills disabled by path.
 """
 import argparse
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -216,6 +219,42 @@ def limit_reset(agent, events, now):
     return codex_reset(found.group(1), now) if found else None
 
 
+def record_limit(agent, reset, source):
+    """Add the limit to the orchestrator's limits registry, in the format guard's quota rules read."""
+    folder = os.environ.get("ORCHESTRATOR_HOME") or os.path.expanduser("~/.agents/orchestrator")
+    now = time.time()
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, ".limits.lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path = os.path.join(folder, "limits.json")
+            try:
+                with open(path) as f:
+                    current = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                current = {}
+            current = {a: e for a, e in current.items() if isinstance(e, dict) and limit_until(e) > now}
+            current[agent] = {"until": local_iso(reset), "seen": local_iso(now), "source": source}
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(current, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, path)
+    except OSError as e:
+        print(f"salvo: could not record the {agent} usage limit: {e}", file=sys.stderr)
+
+
+def local_iso(ts):
+    return datetime.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="minutes")
+
+
+def limit_until(entry):
+    try:
+        return datetime.datetime.fromisoformat(entry.get("until")).timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
 def kill_group(pgid):
     try:
         os.killpg(pgid, signal.SIGKILL)
@@ -361,6 +400,8 @@ def execute(run, prompt, manifest, timeout, hidden):
         session, is_error, resume = collect(agent, run, log_path, result_path)
         ok = code == 0 and not is_error and os.path.exists(result_path) and os.path.getsize(result_path) > 0
         reset = None if ok or timed_out else limit_reset(agent, read_events(log_path, offset), time.time())
+        if reset is not None:
+            record_limit(agent, reset, f"salvo run {run['label']} hit the {agent} usage limit")
         if reset is None or len(waits) == LIMIT_RESUMES or reset - time.time() > MAX_LIMIT_WAIT_S:
             break
         wake = max(reset, time.time()) + RESET_MARGIN_S

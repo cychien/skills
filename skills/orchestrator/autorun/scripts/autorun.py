@@ -38,6 +38,8 @@ def hook(agent, native_event):
     event = adapters.parse(agent, native_event, payload)
     if not event:
         return
+    if guard and event.kind in ("stop", "subagent_stop"):
+        event.hold = guard.active_hold(event)
     decisions = ([hooks.handle(event)] if autonomous else []) + ([guard.handle(event)] if guard else [])
     decision = combine(decisions)
     out, code = adapters.render(agent, native_event, event, decision)
@@ -64,7 +66,7 @@ def load_guard():
     return None
 
 
-ORDER = ["deny", "refuse", "block", "allow", "retry", "context"]
+ORDER = ["deny", "refuse", "block", "allow", "retry", "context", "note"]
 
 
 def combine(decisions):

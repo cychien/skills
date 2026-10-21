@@ -5,7 +5,7 @@ import shlex
 
 GH_PR = re.compile(r"\bgh\s+pr\s+(create|edit)\b")
 TITLE = re.compile(r"^(feat|fix|docs|refactor|test|chore|perf|build|ci|style|revert)(\([^)\s]+\))?!?: \S.*[^.]$")
-SECTIONS = ["Why", "What changed", "Scope", "Tradeoffs", "Blast Radius", "Verification"]
+SECTIONS = ["Not ready to merge", "Why", "What changed", "Scope", "Tradeoffs", "Blast Radius", "Verification"]
 HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\1\b", re.S)
 
 

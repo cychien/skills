@@ -1,3 +1,5 @@
+import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -31,7 +33,7 @@ class Guard(unittest.TestCase):
             2. Hand it off. Mandatory: no skip.
                This continues step two.
             3. Report back.
-            4. Read every principle file it indexes.
+            4. Apply what the facts show.
 
             ## Notes
 
@@ -43,7 +45,8 @@ class Guard(unittest.TestCase):
         principles.mkdir(parents=True)
         (principles / "fix-root-causes.md").write_text("# Fix Root Causes\n\nReproduce first.\n")
         (principles / "prove-it-works.md").write_text("# Prove It Works\n\nCheck the real thing.\n")
-        self.env = {**os.environ, "AUTORUN_HOME": str(base / "autorun"), "GUARD_HOME": str(base / "guard"), "GUARD_SKILL_ROOTS": str(self.skills)}
+        self.env = {**os.environ, "AUTORUN_HOME": str(base / "autorun"), "GUARD_HOME": str(base / "guard"), "GUARD_SKILL_ROOTS": str(self.skills),
+                    "ORCHESTRATOR_HOME": str(base / "orchestrator")}
         self.env["GUARD_HEADLESS"] = "0"
         for k in ("AUTORUN_RUN", "AUTORUN_DISABLE", "CURSOR_VERSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             self.env.pop(k, None)
@@ -79,6 +82,13 @@ class Guard(unittest.TestCase):
 
     def todo(self, *args, ok=True):
         return self.step(*args, ok=ok)
+
+    def token(self, n, *agent):
+        return self.todo("show", str(n), *agent).strip().splitlines()[-1].removeprefix("token: ")
+
+    def close(self, *ns, ok=True, agent=()):
+        tokens = [a for n in ns for a in ("--token", self.token(n, *agent))]
+        return self.todo("done", *map(str, ns), *tokens, *agent, ok=ok)
 
     def test_a_slash_skill_holds_tools_until_the_todo_is_decided(self):
         hint = self.hook("UserPromptSubmit", {"prompt": "/demo build the thing"})["hookSpecificOutput"]["additionalContext"]
@@ -116,11 +126,9 @@ class Guard(unittest.TestCase):
         self.assertIn("5. Update the changelog", blocked["reason"])
         self.assertIsNone(self.stop("Which output format do you want?"))
         self.assertIn("mandatory", self.todo("skip", "2", "--reason", "small", ok=False))
-        self.todo("done", "1", "2", "--note", "did both")
+        self.todo("done", "1", "2", "--token", self.token(1), "--token", self.token(2), "--note", "did both")
         self.todo("skip", "3", "--reason", "nothing to report")
-        self.assertIn("fix-root-causes.md", self.todo("done", "4", ok=False))
-        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cat {self.skills}/principles/references/principles/*.md"}})
-        self.todo("done", "4")
+        self.close(4)
         self.assertIn("Every item is resolved", self.todo("done", "5"))
         self.assertIsNone(self.stop("All done."))
         self.assertIn("1. Next task", self.todo("add", "Next task"))
@@ -175,9 +183,9 @@ class Guard(unittest.TestCase):
             """)
         self.todo("from", "outer")
         self.todo("from", "demo")
-        self.todo("done", "1")
+        self.close(1)
         self.assertIn("Also skipped 4 item(s) from demo", self.todo("skip", "2", "--reason", "too small"))
-        self.todo("done", "3")
+        self.close(3)
         self.assertIsNone(self.stop("Done."))
 
     def test_todo_from_recognizes_each_shape_of_steps(self):
@@ -243,36 +251,28 @@ class Guard(unittest.TestCase):
             2. Name a missing gate `../absent/scripts/check.py`.
             """)
         self.todo("from", "gated")
-        out = self.todo("done", "1", ok=False)
+        out = self.close(1, ok=False)
         self.assertIn("not ready: write the ready file", out)
         self.assertIn("stays open", out)
-        self.assertIn("not installed", self.todo("done", "2", ok=False))
         pathlib.Path(self.tmp.name, "ready").write_text("")
-        self.todo("done", "1")
+        self.close(1)
+        self.assertIn("not installed", self.close(2, ok=False))
 
-    def test_principle_citations_need_a_read(self):
+    def test_a_reply_naming_principles_no_longer_needs_their_files_read(self):
         self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
-        out = self.stop("Applied Fix Root Causes: reproduced first.")
-        self.assertIn("fix-root-causes.md", out["reason"])
-        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "principles/references/principles/fix-root-causes.md")}})
         self.assertIsNone(self.stop("Applied Fix Root Causes: reproduced first."))
 
+    def asks_for_a_decision(self):
+        out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     def test_shell_variables_in_read_paths_are_expanded(self):
-        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
-        d = self.skills / "principles" / "references" / "principles"
-        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"D={d}; cat $D/fix-root-causes.md; echo ---; cat ${{D}}/prove-it-works.md"}})
-        self.assertIsNone(self.stop("Applied Fix Root Causes, then Prove It Works."))
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"D={self.skills}; echo ---; cat ${{D}}/demo/SKILL.md"}})
+        self.assertTrue(self.asks_for_a_decision())
 
     def test_reads_inside_a_for_loop_count(self):
-        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "principles"}})
-        d = self.skills / "principles" / "references" / "principles"
-        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f'for f in {d}/*.md; do echo "== $f"; cat "$f"; done'}})
-        self.assertIsNone(self.stop("Applied Fix Root Causes, then Prove It Works."))
-
-    def test_principle_rule_stays_off_without_eng_principles(self):
-        self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "open-pr"}})
-        self.assertIsNone(self.stop("I want to prove it works."))
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f'for f in {self.skills}/demo/*.md; do echo "== $f"; cat "$f"; done'}})
+        self.assertTrue(self.asks_for_a_decision())
 
     def test_pr_rules_apply_after_open_pr_is_used(self):
         bad = {"tool_name": "Bash", "tool_input": {"command": "gh pr create --title 'Add export.' --draft --body 'stuff'"}}
@@ -295,6 +295,10 @@ class Guard(unittest.TestCase):
             EOF
             )\"""")
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": good}}))
+        not_ready = "gh pr create --title 'fix: refuse stale keys' --body '## Not ready to merge\n- T1 FAIL\n\n## Why\ny\n\n## Scope\nx'"
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": not_ready}}))
+        late = "gh pr create --title 'fix: refuse stale keys' --body '## Why\ny\n\n## Not ready to merge\n- T1\n\n## Scope\nx'"
+        self.assertIn("order", self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": late}})["hookSpecificOutput"]["permissionDecisionReason"])
         misordered = "gh pr create --title 'fix: x' --body '## Scope\nx\n\n## Why\ny'"
         self.assertIn("order", self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": misordered}})["hookSpecificOutput"]["permissionDecisionReason"])
 
@@ -372,34 +376,22 @@ class Guard(unittest.TestCase):
         unrelated = {"tool_name": "Agent", "tool_input": {"prompt": "Summarize <head SHA> notes."}}
         self.assertIsNone(self.hook("PreToolUse", unrelated))
 
-    def test_an_item_closes_without_reading_a_named_skill_that_did_not_run_and_records_why(self):
+    def test_an_item_naming_skills_closes_on_its_token_and_not_run_is_ignored_with_a_deprecation_line(self):
         self.write_skill("alpha", "---\nname: alpha\ndescription: x\n---\n")
-        self.write_skill("beta", "---\nname: beta\ndescription: x\n---\n")
-        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Settle the design. Run alpha (`../alpha/SKILL.md`) when it spans modules, and beta (`../beta/SKILL.md`) when a prototype helps.\n2. Wrap up.\n")
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Settle the design. Run alpha (`../alpha/SKILL.md`) when it spans modules.\n2. Wrap up.\n")
         self.todo("from", "flow")
-        self.assertIn("--not-run", self.todo("done", "1", ok=False))
-        self.assertIn("--reason", self.todo("done", "1", "--not-run", "alpha", ok=False))
-        self.assertIn("../beta/SKILL.md", self.todo("done", "1", "--not-run", "alpha", "--reason", "single module", ok=False))
-        self.assertIn("../gamma/SKILL.md", self.todo("done", "1", "--not-run", "gamma", "--reason", "x", ok=False))
-        out = self.todo("done", "1", "--not-run", "alpha", "--not-run", "beta", "--reason", "single module, no premise to test")
-        self.assertIn("not run: alpha, beta - single module, no premise to test", out)
-        self.assertIn("not run: alpha, beta", self.todo("list"))
+        self.close(1)
+        self.assertIn("--note", self.todo("done", "2", "--reason", "x", ok=False))
+        out = self.todo("done", "2", "--not-run", "gamma", "--reason", "single module", "--token", self.token(2))
+        self.assertIn("--not-run is deprecated and ignored", out)
+        self.assertIn("[x] 2. Wrap up. (flow) - single module", out)
 
-    def test_not_run_accepts_the_skill_path_the_refusal_prints(self):
-        self.write_skill("alpha", "---\nname: alpha\ndescription: x\n---\n")
-        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Run alpha (`../alpha/SKILL.md`) when it spans modules.\n")
-        self.todo("from", "flow")
-        out = self.todo("done", "1", "--not-run", "../alpha/SKILL.md", "--reason", "single module")
-        self.assertIn("not run: alpha - single module", out)
-
-    def test_an_item_naming_a_skill_needs_it_read_and_the_reply_skill_is_enforced(self):
+    def test_the_reply_skill_is_enforced(self):
         self.write_skill("reply", "---\nname: reply\ndescription: x\n---\n\n# Writing the reply\n")
         self.write_skill("helper", "---\nname: helper\ndescription: x\n---\n\n# Helper\n")
         self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Use the helper skill (`../helper/SKILL.md`).\n\n**Reply:** per the reply skill (`../reply/SKILL.md`).\n")
         self.todo("from", "flow")
-        self.assertIn("../helper/SKILL.md", self.todo("done", "1", ok=False))
-        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "helper" / "SKILL.md")}})
-        self.todo("done", "1")
+        self.close(1)
         self.assertIn("reply", self.stop("All done.")["reason"])
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "reply" / "SKILL.md")}})
         self.assertIsNone(self.stop("All done."))
@@ -413,7 +405,7 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.hook("PreToolUse", bash))
         self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cat {demo}"}})
         self.assertIsNone(self.hook("PreToolUse", bash))
-        self.todo("done", "1")
+        self.close(1)
         self.hook("PostToolUse", {"tool_name": "Skill", "tool_input": {"skill": "demo"}})
         self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.todo("none", "--reason", "demo is only a reference here")
@@ -422,10 +414,10 @@ class Guard(unittest.TestCase):
     def test_a_step_continued_after_a_blank_line_keeps_its_citations(self):
         self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Settle the design.\n   - Case A: write a note.\n\n   When it reaches past the diff, run the demo skill (`../demo/SKILL.md`).\n2. Wrap up.\n")
         self.todo("from", "flow")
-        self.assertIn("../demo/SKILL.md", self.todo("done", "1", ok=False))
+        self.assertIn("When it reaches past the diff, run the demo skill (`../demo/SKILL.md`).", self.todo("show", "1"))
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}}))
-        self.todo("done", "1")
+        self.close(1)
 
     def test_polling_for_a_subagent_is_denied_once_one_was_spawned(self):
         poll = {"tool_name": "Bash", "tool_input": {"command": "for i in $(seq 1 60); do grep -q end_turn /tmp/x/tasks/abc123.output && break; sleep 10; done"}}
@@ -473,7 +465,7 @@ class Guard(unittest.TestCase):
     def test_mandatory_items_are_not_released_by_idle_stops(self):
         self.hook("UserPromptSubmit", {"prompt": "/demo build the thing"})
         self.todo("from", "demo")
-        self.todo("done", "1")
+        self.close(1)
         self.todo("skip", "3", "4", "--reason", "n/a")
         for _ in range(4):
             blocked = self.stop("Still working.")
@@ -499,12 +491,12 @@ class Guard(unittest.TestCase):
         self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_editing_a_skill_file_does_not_count_as_reading_it(self):
-        principles = self.skills / "principles" / "SKILL.md"
-        for command in [f"python3 - <<'EOF'\nopen('{principles}').read()\nEOF", f"grep -n x {principles}", f"sed -i '' 's/a/b/' {principles}"]:
+        demo = self.skills / "demo" / "SKILL.md"
+        for command in [f"python3 - <<'EOF'\nopen('{demo}').read()\nEOF", f"grep -n x {demo}", f"sed -i '' 's/zzz/yyy/' {demo}"]:
             self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
-        self.assertIsNone(self.stop("Applied Fix Root Causes."))
-        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd /tmp && sed -n '1,80p' {principles}"}})
-        self.assertEqual(self.stop("Applied Fix Root Causes.")["decision"], "block")
+        self.assertFalse(self.asks_for_a_decision())
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd /tmp && sed -n '1,80p' {demo}"}})
+        self.assertTrue(self.asks_for_a_decision())
 
     def fake_verify(self, mode):
         self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
@@ -666,7 +658,7 @@ class Guard(unittest.TestCase):
         self.assertEqual(held["decision"], "block")
         self.assertIn("1. Owner: build it", held["reason"])
         self.assertNotIn("Lead", held["reason"])
-        self.assertIn("todo done <n> --session claude:s1 --agent owner-1", held["reason"])
+        self.assertIn("todo done <n> --token <token> --session claude:s1 --agent owner-1", held["reason"])
         self.assertIsNone(self.hook("SubagentStop", {"agent_id": "other-2", "last_assistant_message": "Done."}))
         self.assertIn("Every item is resolved", self.todo("done", "1", "--agent", "owner-1"))
         self.assertIsNone(self.hook("SubagentStop", {"agent_id": "owner-1", "last_assistant_message": "Handing back."}))
@@ -679,9 +671,457 @@ class Guard(unittest.TestCase):
         self.assertIn("em dash", out["reason"])
         self.assertIn("done condition", out["reason"])
 
+    def state(self):
+        return json.loads(pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json").read_text())
+
+    def guard(self, *args, ok=True):
+        r = subprocess.run([sys.executable, str(GUARD), *args], capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout + r.stderr
+
+    def test_todo_from_orders_items_and_done_waits_on_open_dependencies(self):
+        self.write_skill("flow", """\
+            ---
+            name: flow
+            description: x
+            ---
+
+            1. Plan it.
+            2. Build it.
+            3. Write the checks, in parallel with step 2.
+            4. Review it. Starts after step 2.
+            5. Prove it.
+            """)
+        self.todo("from", "flow")
+        self.assertEqual({i["n"]: i["after"] for i in self.state()["todo"]}, {1: [], 2: [1], 3: [1], 4: [2], 5: [3, 4]})
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import order
+        texts = ["A.", "B.", "C.", "D, starts after steps 1 and 3.", "E. Starts after steps 1, 2 and 4.", "F, beside step 2.", "G."]
+        self.assertEqual(order.dependencies([(n, t, t, False) for n, t in enumerate(texts, 1)]),
+                         {1: [], 2: [1], 3: [2], 4: [1, 3], 5: [1, 2, 4], 6: [1], 7: [5, 6]})
+        self.assertIn("[ ] 5. Prove it. (flow) [after 3, 4]", self.todo("list"))
+        refused = self.close(3, ok=False)
+        self.assertIn("item 3 waits on item 1 (Plan it.), still open", refused)
+        self.todo("wait", "1", "--reason", "scope")
+        self.assertIn("still waiting", self.close(2, ok=False))
+        self.close(1)
+        self.close(3)
+        self.assertIn("waits on item 2 (Build it.)", self.close(4, ok=False))
+        self.assertIn("item 5 waits on item 4 (Review it.), still open", self.close(5, ok=False))
+        self.todo("skip", "2", "--reason", "already built")
+        self.close(4)
+        self.todo("add", "Loose end")
+        self.todo("done", "6")
+        self.assertIn("Every item is resolved", self.close(5))
+
+    def test_todo_show_attaches_the_principles_an_item_names_and_done_needs_its_token(self):
+        self.write_skill("principles", "---\nname: principles\ndescription: x\n---\n\n# Principles\n\nThe index.\n")
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n"
+                                 "1. Design it from the index (`../principles/SKILL.md`) and Fix Root Causes (`../principles/references/principles/fix-root-causes.md`).\n"
+                                 "2. Read every principle file, then wrap up.\n")
+        self.todo("from", "flow")
+        shown = self.todo("show", "1")
+        text = self.state()["todo"][0]["text"]
+        principle = self.skills / "principles" / "references" / "principles" / "fix-root-causes.md"
+        expected = hashlib.sha256((text + "# Principles\n\nThe index." + principle.read_text()).encode()).hexdigest()[:6]
+        self.assertEqual(shown.strip().splitlines()[-1], f"token: {expected}")
+        for fragment in ("Item 1 (from flow):", text, "--- ../principles/SKILL.md ---", "The index.",
+                         "--- ../principles/references/principles/fix-root-causes.md ---", "Reproduce first."):
+            self.assertIn(fragment, shown)
+        self.assertNotIn("name: principles", shown)
+        self.assertEqual(self.state()["principles_read"], ["fix-root-causes"])
+        refused = self.todo("done", "1", ok=False)
+        self.assertIn("needs proof you read it", refused)
+        self.assertIn("todo show 1 --session claude:s1", refused)
+        self.assertIn("does not match its current text", self.todo("done", "1", "--token", "abcdef", ok=False))
+        principle.write_text("# Fix Root Causes\n\nReproduce first, then fix.\n")
+        self.assertIn("does not match", self.todo("done", "1", "--token", expected, ok=False))
+        self.close(1)
+        self.todo("add", "Ad hoc")
+        self.todo("done", "3")
+        self.close(2)
+
+    def test_a_hold_lets_the_turn_end_with_open_items_until_it_expires(self):
+        self.todo("add", "Run the codex check")
+        self.assertEqual(self.stop("Waiting for the codex limit.")["decision"], "block")
+        later = (datetime.datetime.now() + datetime.timedelta(minutes=90)).strftime("%H:%M")
+        out = self.todo("hold", "--until", later, "--reason", "codex usage limit resets")
+        self.assertIn(f"Held until {later}: codex usage limit resets", out)
+        self.assertIsNone(self.stop("Waiting for the codex limit."))
+        self.assertIn("has already passed", self.todo("hold", "--until", "2020-01-01T00:00", "--reason", "x", ok=False))
+        self.assertIn("HH:MM or an ISO time", self.todo("hold", "--until", "soon", "--reason", "x", ok=False))
+        path = pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json")
+        data = self.state()
+        data["hold"]["until"] = time.time() - 1
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.stop("Waiting for the codex limit.")["decision"], "block")
+        self.assertNotIn("Held until", self.todo("list"))
+
+    def test_an_autonomous_run_lets_a_held_turn_end_without_counting_it_as_idle(self):
+        home = pathlib.Path(self.env["AUTORUN_HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.json").write_text(json.dumps({"review": False}))
+        self.hook("UserPromptSubmit", {"prompt": "going to bed, build it"})
+        run = next((home / "active").iterdir()).name
+        subprocess.run([sys.executable, str(HOOK), "start", "--run", run, "--session", "claude:s1", "--done", "shipped"], env=self.env, capture_output=True, text=True, cwd=self.tmp.name)
+        self.todo("add", "Run the codex check")
+        for _ in range(2):
+            self.assertEqual(self.stop("Waiting for the codex limit.")["decision"], "block")
+        later = (datetime.datetime.now() + datetime.timedelta(minutes=90)).strftime("%H:%M")
+        self.todo("hold", "--until", later, "--reason", "codex usage limit resets")
+        for _ in range(5):
+            out = self.stop("Waiting for the codex limit.")
+            self.assertNotIn("decision", out)
+            self.assertEqual(out["systemMessage"], f"autorun: run {run} paused on a timed hold until {later}: codex usage limit resets")
+        self.assertEqual(self.stop("Waiting \u2014 for the limit.")["decision"], "block")
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": "Waiting?"})["decision"], "block")
+        self.todo("add", "Sub item", "--agent", "ex-1")
+        self.todo("hold", "--until", later, "--reason", "claude limit", "--agent", "ex-1")
+        self.assertIn("claude limit", self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": "Waiting?"})["systemMessage"])
+        path = pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json")
+        data = self.state()
+        data["hold"]["until"] = time.time() - 1
+        path.write_text(json.dumps(data))
+        blocked = self.stop("Waiting for the codex limit.")
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("is not done", blocked["reason"])
+        self.assertFalse(any((home / "runs").glob("*/gates/*")) if (home / "runs").exists() else False)
+
+    def test_todo_check_exits_zero_only_when_nothing_is_open_or_waiting(self):
+        self.assertIn("empty", self.todo("check"))
+        self.todo("add", "One")
+        self.assertIn("[ ] 1. One", self.todo("check", ok=False))
+        self.todo("wait", "1", "--reason", "answer")
+        self.assertIn("[?] 1. One", self.todo("check", ok=False))
+        self.todo("done", "1")
+        self.assertIn("Every item is resolved", self.todo("check"))
+
+    def test_lint_reports_errors_and_warnings_in_a_skill_as_todo_from_reads_it(self):
+        self.write_skill("checker", "---\nname: checker\ndescription: x\n---\n")
+        (self.skills / "checker" / "scripts").mkdir()
+        (self.skills / "checker" / "scripts" / "check.py").write_text("")
+        self.write_skill("good", "---\nname: good\ndescription: x\n---\n\n1. Build. Close this step only when `../checker/scripts/check.py plan --checks` passes.\n"
+                                 "2. Check, in parallel with step 1. Uses the demo skill (`../demo/SKILL.md`).\n")
+        self.assertIn("no errors", self.guard("lint", "good"))
+        self.write_skill("bad", "---\nname: bad\ndescription: x\n---\n\n"
+                                "1. Plan. Starts after step 2.\n4. Ship. Starts after steps 2, 3 and 9.\n"
+                                "2. Build, beside step 7. Close this step only when `../checker/scripts/gone.py lock` passes.\n"
+                                "3. Review. Close this step only when the reviewer agrees. Mandatory. Skip this step when tiny. Run `../absent/SKILL.md`.\n")
+        out = self.guard("lint", str(self.skills / "bad" / "SKILL.md"), ok=False)
+        for fragment in ("error: step 2: \"beside step 7\" names step 7, which this skill does not have",
+                         "error: step 4: \"Starts after steps 2, 3 and 9\" names step 9, which this skill does not have",
+                         "error: step 2: the gate `../checker/scripts/gone.py lock` names a script that is not installed beside this skill",
+                         "error: the steps wait on each other in a cycle",
+                         "warning: step 3: says \"Close this step only when\" but names no backticked gate",
+                         "warning: step 3: is Mandatory and also says \"Skip this step\"",
+                         "warning: step 3: names ../absent/SKILL.md, which is not installed beside this skill"):
+            self.assertIn(fragment, out)
+        self.write_skill("vague", "---\nname: vague\ndescription: x\n---\n\n# Vague\n\nFollow the steps below.\n\n- Do it.\n")
+        self.assertIn("no steps found", self.guard("lint", "vague", ok=False))
+        self.write_skill("rules", "---\nname: rules\ndescription: x\n---\n\n# Rules\n\nLifecycle steps converge. A how-to lists steps to a goal.\n")
+        self.assertIn("no errors", self.guard("lint", "rules"))
+        everything = self.guard("lint", "--all", ok=False)
+        self.assertIn("bad/SKILL.md: error", everything)
+        self.assertIn("vague/SKILL.md: error", everything)
+        self.assertNotIn("good/SKILL.md: error", everything)
+        self.assertIn("a cycle (", self.todo("from", "bad", ok=False))
+
+    def test_a_long_subagent_hand_back_is_sent_back_once_per_length(self):
+        long = " ".join(["word"] * 320)
+        held = self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": long})
+        self.assertEqual(held["decision"], "block")
+        self.assertIn("320 words", held["reason"])
+        self.assertIn("Put the details in a file and hand back at most 200 words with the file path.", held["reason"])
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": long}))
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": long + " more"})["decision"], "block")
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "ex-2", "last_assistant_message": "字" * 580}))
+        self.assertIn("310 words", self.hook("SubagentStop", {"agent_id": "ex-3", "last_assistant_message": "字" * 620})["reason"])
+        self.assertIsNone(self.stop(long))
+        handback = {"agent_id": "ex-4", "tool_name": "SubagentHandback", "tool_input": {"message": long}}
+        out = self.hook("PreToolUse", handback)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("at most 200 words", out["permissionDecisionReason"])
+        self.assertIsNone(self.hook("PreToolUse", handback))
+
+    def test_a_rerun_waits_until_every_running_fix_group_has_handed_back(self):
+        rerun = {"tool_name": "Bash", "tool_input": {"command": "python3 ../verify/scripts/verify.py rerun --only T1 T2"}}
+        full = {"tool_name": "Bash", "tool_input": {"command": "python3 ../verify/scripts/verify.py rerun"}}
+        self.assertIsNone(self.hook("PreToolUse", rerun))
+        self.hook("PreToolUse", {"agent_id": "fix-1", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        for command in (rerun, full):
+            out = self.hook("PreToolUse", command)["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("A fix group is still working; rerun once every group has handed back", out["permissionDecisionReason"])
+        self.assertIsNone(self.hook("PreToolUse", {**rerun, "agent_id": "fix-1"}))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "grep -n 'verify.py rerun' notes.md"}}))
+        self.hook("SubagentStop", {"agent_id": "fix-1", "last_assistant_message": "Fixed T1."})
+        self.assertIsNone(self.hook("PreToolUse", rerun))
+
+    def test_a_pr_waits_for_every_step_before_the_close_step(self):
+        self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Build.\n2. Prove.\n3. Close, then open the PR with the open-pr skill (`../open-pr/SKILL.md`).\n")
+        self.todo("from", "flow")
+        create = {"tool_name": "Bash", "tool_input": {"command": "gh pr create --title 'feat: x' --body '## Scope\nx'"}}
+        out = self.hook("PreToolUse", create)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("The PR opens in item 3", out["permissionDecisionReason"])
+        self.assertIn("1. Build., 2. Prove.", out["permissionDecisionReason"])
+        self.close(1)
+        self.todo("skip", "2", "--reason", "no checks")
+        self.assertIsNone(self.hook("PreToolUse", create))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "gh pr edit 4 --add-label x"}}))
+
+    def limits(self):
+        path = pathlib.Path(self.env["ORCHESTRATOR_HOME"]) / "limits.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def test_usage_limits_in_agent_results_are_recorded_and_other_output_is_never_scanned(self):
+        codex = "■ You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), or try again at Oct 23rd, 2026 3:05 PM."
+        for command in ("cat build.log", "grep -n 'usage limit' notes.md", "python3 ../verify/scripts/verify.py rerun"):
+            self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": command}, "tool_response": {"stdout": codex}})
+        self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": "x.log"}, "tool_response": codex})
+        self.assertEqual(self.limits(), {})
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": "codex exec -m gpt - < task.md"}, "tool_response": {"stdout": "", "stderr": codex}})
+        entry = self.limits()["codex"]
+        self.assertTrue(entry["until"].startswith("2026-10-23T15:05"), entry)
+        self.assertIn("try again at", entry["source"])
+        self.assertTrue(entry["seen"])
+        claude = {"content": [{"type": "text", "text": "Stopped early.\nClaude usage limit reached. Your limit will reset at 11:59pm (America/Los_Angeles)."}]}
+        self.hook("PostToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "x"}, "tool_response": claude})
+        until = datetime.datetime.fromisoformat(self.limits()["claude"]["until"])
+        self.assertEqual((until.hour, until.minute), (23, 59))
+        self.assertIn("codex", self.limits())
+
+    def test_limit_times_parse_in_the_local_zone_with_a_date_in_the_text_winning(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import quota
+        now = datetime.datetime(2026, 10, 21, 14, 0).timestamp()
+
+        def at(*moment):
+            return datetime.datetime(*moment).timestamp()
+
+        cases = {
+            "You've hit your usage limit. Upgrade to Pro, or try again at 3:05 PM.": ("codex", at(2026, 10, 21, 15, 5)),
+            "You've hit your usage limit, try again at 1:30 PM.": ("codex", at(2026, 10, 22, 13, 30)),
+            "You've hit your usage limit. Try again in 2 hours 5 minutes.": ("codex", now + 7500),
+            "You've hit your usage limit. Try again at Nov 2nd, 2026 9:00 AM.": ("codex", at(2026, 11, 2, 9, 0)),
+            "Claude usage limit reached · resets 5pm (Europe/London)": ("claude", at(2026, 10, 21, 17, 0)),
+            "You've reached your usage limit. It resets at 2026-10-22T08:30": ("claude", at(2026, 10, 22, 8, 30)),
+            "Claude AI usage limit reached|1792600000": ("claude", 1792600000),
+            "Your usage limit resets soon.": ("claude", now + 3600),
+        }
+        for text, expected in cases.items():
+            self.assertEqual([(a, u) for a, u, _ in quota.scan(text, now)], [expected], text)
+        self.assertEqual(quota.scan("The usage limit page explains plans.", now), [])
+        self.assertEqual(quota.scan("You've hit your usage limit.", now), [])
+
+    def models(self, base=None, planner=("claude:a:high", "codex:b:high"), executor=("claude:c:high", "codex:d:medium")):
+        base = pathlib.Path(base or self.env["ORCHESTRATOR_HOME"])
+        base.mkdir(parents=True, exist_ok=True)
+
+        def entry(spec):
+            return dict(zip(("agent", "model", "effort"), spec.split(":")))
+
+        (base / "models.json").write_text(json.dumps({"version": 2, "roles": {"planner": [entry(s) for s in planner], "executor": [entry(s) for s in executor]}}))
+
+    def limit(self, agent, minutes=60):
+        path = pathlib.Path(self.env["ORCHESTRATOR_HOME"]) / "limits.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self.limits()
+        data[agent] = {"until": (datetime.datetime.now().astimezone() + datetime.timedelta(minutes=minutes)).isoformat(timespec="minutes"),
+                       "seen": "2026-10-21T10:00+00:00", "source": f"{agent} limit"}
+        path.write_text(json.dumps(data))
+
+    def test_quota_pick_skips_limited_and_avoided_candidates(self):
+        self.models()
+        self.assertEqual(self.guard("quota", "pick", "--role", "executor").strip(), "claude:c:high")
+        self.assertIn("No agent is limited", self.guard("quota", "status"))
+        self.limit("claude")
+        self.limit("gemini", minutes=-5)
+        self.assertIn("claude: limited until", self.guard("quota", "status"))
+        self.assertNotIn("gemini", self.guard("quota", "status"))
+        self.assertEqual(self.guard("quota", "pick", "--role", "planner").strip(), "codex:b:high")
+        self.assertIn("every planner candidate is avoided", self.guard("quota", "pick", "--role", "planner", "--avoid", "codex:b", ok=False))
+        self.limit("codex", minutes=30)
+        self.assertIn("every candidate is limited until", self.guard("quota", "pick", "--role", "executor", ok=False))
+        self.assertIn("hold until then", self.guard("quota", "pick", "--role", "executor", ok=False))
+        self.models(pathlib.Path(self.tmp.name) / ".agents" / "orchestrator", executor=("codex:e:low", "claude:f:low"))
+        self.assertIn("every candidate is limited", self.guard("quota", "pick", "--role", "executor", ok=False))
+        (pathlib.Path(self.env["ORCHESTRATOR_HOME"]) / "limits.json").unlink()
+        self.assertEqual(self.guard("quota", "pick", "--role", "executor").strip(), "codex:e:low")
+
+    def test_quota_pick_relax_walks_the_fallback_order(self):
+        self.models(planner=("claude:a:high", "codex:b:high"), executor=("claude:c:high", "codex:d:medium"))
+        self.limit("claude")
+        out = self.guard("quota", "pick", "--role", "planner", "--avoid", "codex", "--relax")
+        for line in ("1. a candidate that keeps every separation rule", "2. one that relaxes \"reviewer from a different family\"",
+                     "3. one that relaxes \"verifier on a different entry from the executor\"", "4. a candidate from the other role",
+                     "codex:b:high", "relaxed: one that relaxes \"reviewer from a different family\""):
+            self.assertIn(line, out)
+        out = self.guard("quota", "pick", "--role", "executor", "--avoid", "codex:d", "--relax")
+        self.assertIn("relaxed: one that relaxes \"verifier on a different entry from the executor\"", out)
+        self.models(planner=("codex:b:high",), executor=("claude:c:high",))
+        out = self.guard("quota", "pick", "--role", "executor", "--relax")
+        self.assertIn("codex:b:high", out)
+        self.assertIn("relaxed: a candidate from the other role (planner)", out)
+        self.assertNotIn("relaxed", self.guard("quota", "pick", "--role", "planner", "--relax"))
+
+    def test_a_limited_agent_is_not_launched_and_the_deny_names_the_next_candidates(self):
+        self.models()
+        launches = ["python3 /x/salvo/scripts/salvo.py run --out /tmp/s codex:d:medium < task.md",
+                    "cd /repo && CODEX_HOME=/tmp/c codex exec -m gpt-5 - < task.md"]
+        for command in launches:
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}}), command)
+        self.limit("codex")
+        for command in launches:
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny")
+            self.assertIn("codex is limited until", out["permissionDecisionReason"])
+            self.assertIn("planner: claude:a:high", out["permissionDecisionReason"])
+            self.assertIn("executor: claude:c:high", out["permissionDecisionReason"])
+        for command in ("python3 /x/salvo/scripts/salvo.py run --out /tmp/codex:d claude:c:high < task.md", "grep -n 'codex exec' notes.md",
+                        "echo 'codex exec -m x'"):
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}}), command)
+        self.limit("claude")
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "Implement it."}}))
+        out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launches[0]}})["hookSpecificOutput"]
+        self.assertIn("every candidate is limited until", out["permissionDecisionReason"])
+
+    def plan_with(self, plan, record=None):
+        self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
+        scripts = self.skills / "verify" / "scripts"
+        scripts.mkdir(exist_ok=True)
+        directory = pathlib.Path(self.tmp.name) / "verification"
+        directory.mkdir(exist_ok=True)
+        (scripts / "verify.py").write_text(f"import sys\nif sys.argv[1:] == ['where']:\n    print({str(directory)!r})\n")
+        if record:
+            phase = pathlib.Path(self.tmp.name) / "plan" / "phases" / "05" / "plan.md"
+            phase.parent.mkdir(parents=True)
+            phase.write_text(plan)
+            (directory / "base.json").write_text(json.dumps({"base": "abc", "plan": str(phase.parent.parent.parent), "phase_plan": str(phase)}))
+        else:
+            (directory / "base.json").unlink(missing_ok=True)
+            (directory / "plan.md").write_text(plan)
+
+    def test_an_agent_that_real_agent_checks_drive_is_reserved_for_them(self):
+        self.models()
+        codex = {"tool_name": "Bash", "tool_input": {"command": "codex exec -m gpt-5 - < review.md"}}
+        claude = {"tool_name": "Bash", "tool_input": {"command": "python3 salvo.py run --out /tmp/s claude:a:high < review.md"}}
+        self.assertIsNone(self.hook("PreToolUse", codex))
+        plan = ("# Plan\n\nChecks marked `Agent: real` run once with Claude Code and once with Codex.\n\n## Checks\n\n"
+                "### T1. A real turn\n\n- Tier: e2e\n- Agent: real: a model must choose the command\n\n"
+                "### T2. A fake turn\n\n- Agent: fake: wire logic\n")
+        self.plan_with(plan, record=True)
+        out = self.hook("PreToolUse", codex)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("codex is reserved for this branch's real-agent checks (T1)", out["permissionDecisionReason"])
+        self.assertIn("quota pick --role <role> --avoid codex", out["permissionDecisionReason"])
+        self.assertIn("planner: claude:a:high", out["permissionDecisionReason"])
+        self.assertIsNone(self.hook("PreToolUse", claude))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "python3 ../verify/scripts/verify.py rerun --only T1"}}))
+        self.plan_with(plan.replace("Agent: real", "Agent: fake"))
+        self.assertIsNone(self.hook("PreToolUse", codex))
+        self.plan_with("# Plan\n\n### T3. Codex asks\n\n- Agent: real: Claude Code is the lead, this drives Codex\n")
+        self.assertIn("(T3)", self.hook("PreToolUse", codex)["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(self.hook("PreToolUse", {**codex, "tool_input": {"command": "codex exec -m gpt-5 -"}}, agent="codex"))
+
+
+FEATURE_V2 = """\
+---
+name: feature
+description: x
+---
+
+# Feature
+
+1. Clarify the requirements and run the basic checks. Close this step only when `../verify/scripts/verify.py plan --checks` passes. Mandatory: no skip-with-reason escape.
+2. Ground in the code with the how skill (`../how/SKILL.md`) and check every check's premises. Close this step only when `../verify/scripts/verify.py premises` passes.
+3. Design. Read the principles index (`../principles/SKILL.md`) and the principles you apply. Close this step only when `../verify/scripts/verify.py plan` and `../verify/scripts/verify.py premises --resolved` pass.
+4. Lock. Close this step only when `../verify/scripts/verify.py lock` passes. Mandatory: no skip-with-reason escape.
+5. Implement with one executor. Close this step only when `../verify/scripts/verify.py units` passes. Mandatory: no skip-with-reason escape.
+6. Write the e2e scripts, in parallel with step 5, and dry-run each on the base. Close this step only when `../verify/scripts/verify.py scripts` passes. Skip this step with the reason only when the plan has no e2e or walk check.
+7. Review the code. Starts after step 5. Close this step only when `../verify/scripts/verify.py review` passes. Mandatory: no skip-with-reason escape.
+8. Prove with one full e2e run, then `verify.py report --write`. Starts after steps 6 and 7. Close this step only when `../verify/scripts/verify.py oracles` passes. Mandatory: no skip-with-reason escape.
+9. Fix the e2e FAILs, classified first, then one rerun. Skip this step with the reason when nothing failed.
+10. Close, then open the PR with the open-pr skill (`../open-pr/SKILL.md`). Close this step only when `../verify/scripts/verify.py report`, `../verify/scripts/verify.py spec` and `../verify/scripts/verify.py leftovers` pass. Mandatory: no skip-with-reason escape.
+"""
+FEATURE_V2_AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
+FEATURE_V2_GATES = {1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
+                    7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
+REPO_FEATURE = ROOT / "skills" / "eng" / "feature" / "SKILL.md"
+
+
+def step_count(path):
+    sys.path.insert(0, str(GUARD.parent))
+    try:
+        from guard_lib import skills
+        return len(skills.steps(path))
+    finally:
+        sys.path.remove(str(GUARD.parent))
+
+
+class FeatureFlow(unittest.TestCase):
+    """`todo from feature` turns the ten-step flow into ordered, gated items: scripts open with the code, review waits on the code,
+    and the one e2e run waits on both."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = pathlib.Path(self.tmp.name)
+        self.env = {**os.environ, "AUTORUN_HOME": str(base / "autorun"), "GUARD_HOME": str(base / "guard"), "ORCHESTRATOR_HOME": str(base / "orchestrator")}
+        for k in ("AUTORUN_RUN", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+            self.env.pop(k, None)
+
+    def items(self, roots):
+        self.env["GUARD_SKILL_ROOTS"] = str(roots)
+        r = subprocess.run([sys.executable, str(GUARD), "todo", "from", "feature", "--session", "claude:s1"], capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import gates
+        todo = json.loads(pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json").read_text())["todo"]
+        return {i["n"]: (i["after"], i["mandatory"], {" ".join(args) for _, _, args in gates.named(i["text"])}) for i in todo}
+
+    def assert_flow(self, items, exact_gates):
+        self.assertEqual(sorted(items), list(range(1, 11)))
+        self.assertEqual({n: after for n, (after, _, _) in items.items()}, FEATURE_V2_AFTER)
+        mandatory = {n for n, (_, m, _) in items.items() if m}
+        self.assertLessEqual({1, 4, 5, 7, 8, 10}, mandatory)
+        self.assertFalse({6, 9} & mandatory)
+        for n, expected in FEATURE_V2_GATES.items():
+            found = items[n][2]
+            self.assertTrue(found == expected if exact_gates else expected <= found, (n, found))
+            self.assertNotIn("report --write", found, n)
+
+    def test_the_ten_step_flow_orders_its_items_with_their_gates(self):
+        skill = pathlib.Path(self.tmp.name) / "skills" / "feature" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(FEATURE_V2)
+        self.assert_flow(self.items(skill.parent.parent), exact_gates=True)
+        verify = skill.parent.parent / "verify"
+        (verify / "scripts").mkdir(parents=True)
+        (verify / "SKILL.md").write_text("---\nname: verify\ndescription: x\n---\n")
+        (verify / "scripts" / "verify.py").write_text("")
+        r = subprocess.run([sys.executable, str(GUARD), "lint", str(skill)], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    @unittest.skipUnless(step_count(REPO_FEATURE) == 10, "the feature skill is not on the ten-step flow yet")
+    def test_the_repo_feature_skill_orders_its_items_with_their_gates(self):
+        self.assert_flow(self.items(REPO_FEATURE.parent.parent), exact_gates=False)
+
 
 class ShippedPlaybooks(unittest.TestCase):
     """The verification floor of each feature tier is held by gates on steps guard will not let be skipped."""
+
+    def test_every_skill_in_this_repo_lints_without_errors(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import lint
+        paths = sorted(ROOT.glob("skills/*/*/SKILL.md"))
+        self.assertGreater(len(paths), 20)
+        errors = {str(p.relative_to(ROOT)): lint.lint(p)[0] for p in paths}
+        self.assertEqual({p: e for p, e in errors.items() if e}, {})
 
     def gated_mandatory_steps(self, skill):
         sys.path.insert(0, str(GUARD.parent))
@@ -694,10 +1134,12 @@ class ShippedPlaybooks(unittest.TestCase):
         mandatory = self.gated_mandatory_steps("quick-feature")
         self.assertEqual(mandatory, {1: set(), 3: {"plan", "lock"}, 4: {"driver"}, 6: {"oracles"}, 8: {"report", "leftovers"}})
 
+    @unittest.skipIf(step_count(REPO_FEATURE) == 10, "the twelve-step flow it describes was replaced by the ten-step one")
     def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_report(self):
         mandatory = self.gated_mandatory_steps("feature")
         self.assertEqual(mandatory, {1: set(), 5: {"lock"}, 7: {"units"}, 9: {"oracles"}, 10: set(), 12: {"report", "leftovers"}})
 
+    @unittest.skipIf(step_count(REPO_FEATURE) == 10, "the twelve-step flow it describes was replaced by the ten-step one")
     def test_feature_gets_the_driver_in_the_verifier_step(self):
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))

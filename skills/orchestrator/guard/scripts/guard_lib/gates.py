@@ -10,7 +10,7 @@ import time
 
 from . import skills
 
-GATE = re.compile(r"`\.\./([a-z0-9][a-z0-9-]*)/scripts/([A-Za-z0-9_-]+\.py)((?: [a-z][a-z-]*)*)`")
+GATE = re.compile(r"`\.\./([a-z0-9][a-z0-9-]*)/scripts/([A-Za-z0-9_-]+\.py)((?: -{0,2}[a-z][a-z-]*)*)`")
 TIMEOUT = 300
 TERM_WAIT = 3
 OUTPUT_LIMIT = 4000
