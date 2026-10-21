@@ -31,6 +31,13 @@ What changed in the skill texts, what the other workstreams must match, and wher
 
 quick-feature: 3 implement (`units`), 4 scripts "in parallel with step 3", 5 review. bug-fix: 6 implement, 7 scripts "in parallel with step 6", 8 review.
 
+## Coordinator decisions applied
+
+- Dependencies: steps say "Starts after step N" or "Starts after steps N and M", which guard reads as explicit dependencies. feature 7 after 5, 8 after 6 and 7; quick-feature 5 after 3, 6 after 4 and 5; bug-fix 8 after 6, 9 after 7 and 8. This resolves gap 1.
+- Stacking stays: feature step 1 checks the previous phase is merged and the base is current main, or its PR is open and this phase stacks on its branch with the PR against that branch. phases.md has its stack and landing guidance back, with the patch-id regrade for a stacked base. This resolves gap 4.
+- `report --write` takes `--author <agent:model>`, `--verifier <agent:model>`, and repeatable `--note "<text>"` for each quota fallback that relaxed a separation rule; the report template shows a Notes section, and fallbacks also go in the PR's Verification section. This resolves gaps 6 and 7.
+- The gates.py regex commit stays; A builds the same change.
+
 ## Spec gaps and contradictions
 
 1. **Dependencies of step 7 (A.1 vs A.14).** A.1's default makes 7 depend on 6 (the previous item), so review would wait for the scripts. A.14 and the flow want 7 after 5 only, and 8 after 6 and 7. A.1 has no rule that yields this. Suggest: the item after a parallel group depends on the group's first member, and the next one on every member; or parse "as soon as step N closes" (step 7 says exactly that, and quick-feature 5 and bug-fix 8 say the same of their implement step).
