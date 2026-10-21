@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -96,7 +97,12 @@ class Guard(unittest.TestCase):
         bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
         self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIsNone(self.hook("PreToolUse", {**bash, "agent_id": "a1"}))
-        for allowed in (f"python3 {GUARD} todo none --reason x; ls", f"python3 {HOOK} mode interactive --reason x", f"cat {self.skills}/demo/SKILL.md"):
+        for text in ("make deploy; # guard.py todo", f"make deploy # python3 {GUARD} todo none", "echo 'guard.py todo none --reason x'",
+                     "git commit -m 'autorun.py start later'", f"grep -n 'guard.py todo' {self.skills}/demo/SKILL.md"):
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": text}})
+            self.assertEqual(out and out["hookSpecificOutput"]["permissionDecision"], "deny", text)
+        for allowed in (f"python3 {GUARD} todo none --reason x; ls", f"python3 {HOOK} mode interactive --reason x", f"cat {self.skills}/demo/SKILL.md",
+                        f"bash -lc 'python3 {GUARD} todo none --reason x'"):
             self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": allowed}}), allowed)
         self.todo("none", "--reason", "one-line change")
         self.assertIsNone(self.hook("PreToolUse", bash))
@@ -346,6 +352,28 @@ class Guard(unittest.TestCase):
         (evidence / "evidence" / "C1").mkdir(parents=True)
         (evidence / "evidence" / "C1" / "shot.png").write_text("x")
         self.assertIn("already had a verifier", self.verifier(evidence, "C1"))
+
+    def test_concurrent_verifier_spawns_keep_every_ledger_entry(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import verifiers
+        evidence = pathlib.Path(self.tmp.name) / "verification"
+        rounds = verifiers.rounds
+
+        def slow(*args):
+            time.sleep(0.3)
+            return rounds(*args)
+
+        prompt = "You are verifying a change you did not write.\nEvidence directory: {}\nChecks: {}\n"
+        with mock.patch.object(verifiers, "rounds", slow):
+            spawns = [threading.Thread(target=verifiers.over_budget, args=(prompt.format(evidence, c),)) for c in ("C1", "C2", "C3")]
+            for spawn in spawns:
+                spawn.start()
+            for spawn in spawns:
+                spawn.join()
+        self.assertEqual(sorted(json.loads((evidence / verifiers.LEDGER).read_text())), ["C1", "C2", "C3"])
+        (evidence / "C2.rerun.log").write_text("rerun: PASS\n")
+        self.assertIn("Checks C2 already had a verifier", self.verifier(evidence, "C2"))
 
     def test_a_verifier_prompt_must_name_its_checks(self):
         self.assertIn("no 'Checks:' line", self.verifier(pathlib.Path(self.tmp.name), ""))
@@ -758,6 +786,19 @@ class Guard(unittest.TestCase):
         self.assertEqual(self.stop("Waiting for the codex limit.")["decision"], "block")
         self.assertNotIn("Held until", self.todo("list"))
 
+    def test_a_hold_ends_with_the_list_it_was_set_on(self):
+        later = (datetime.datetime.now() + datetime.timedelta(minutes=90)).strftime("%H:%M")
+        self.todo("add", "Run the codex check")
+        self.todo("hold", "--until", later, "--reason", "codex usage limit resets")
+        self.todo("done", "1")
+        self.todo("add", "Next task's first item")
+        self.assertEqual(self.stop("Done for now.")["decision"], "block")
+        self.assertNotIn("Held until", self.todo("list"))
+        self.todo("hold", "--until", later, "--reason", "codex usage limit resets")
+        self.todo("clear", "--reason", "the user stopped the work")
+        self.todo("add", "Another task")
+        self.assertEqual(self.stop("Done for now.")["decision"], "block")
+
     def test_an_autonomous_run_lets_a_held_turn_end_without_counting_it_as_idle(self):
         home = pathlib.Path(self.env["AUTORUN_HOME"])
         home.mkdir(parents=True, exist_ok=True)
@@ -844,6 +885,21 @@ class Guard(unittest.TestCase):
         self.assertIn("at most 200 words", out["permissionDecisionReason"])
         self.assertIsNone(self.hook("PreToolUse", handback))
 
+    def test_a_hand_back_passes_once_per_text_and_only_until_its_delegate_ends(self):
+        long, other = " ".join(["word"] * 320), " ".join(["ward"] * 320)
+        self.hook("PreToolUse", {"agent_id": "ex-1", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": long})["decision"], "block")
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": other})["decision"], "block")
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": other}))
+        self.assertNotIn("ex-1", self.state().get("handbacks", {}))
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": other})["decision"], "block")
+        self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": other})
+        handback = {"agent_id": "ex-1", "tool_name": "SubagentHandback", "tool_input": {"message": other}}
+        self.assertEqual(self.hook("PreToolUse", handback)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.hook("PreToolUse", handback))
+        self.hook("PostToolUse", {"tool_name": "TaskStop", "tool_input": {"task_id": "ex-1"}})
+        self.assertNotIn("ex-1", self.state().get("handbacks", {}))
+
     def test_a_rerun_waits_until_every_running_fix_group_has_handed_back(self):
         rerun = {"tool_name": "Bash", "tool_input": {"command": "python3 ../verify/scripts/verify.py rerun --only T1 T2"}}
         full = {"tool_name": "Bash", "tool_input": {"command": "python3 ../verify/scripts/verify.py rerun"}}
@@ -855,6 +911,15 @@ class Guard(unittest.TestCase):
             self.assertIn("A fix group is still working; rerun once every group has handed back", out["permissionDecisionReason"])
         self.assertIsNone(self.hook("PreToolUse", {**rerun, "agent_id": "fix-1"}))
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "grep -n 'verify.py rerun' notes.md"}}))
+        for wrapped in ("bash -lc 'python3 ../verify/scripts/verify.py rerun'", "sh -c \"cd /repo && python3 '../verify/scripts/verify.py' rerun --only T1\"",
+                        "env FOO=1 zsh -c 'python3 ../verify/scripts/verify.py rerun'", "eval 'python3 ../verify/scripts/verify.py rerun'",
+                        "bash -c \"bash -c 'python3 ../verify/scripts/verify.py rerun'\""):
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": wrapped}})
+            self.assertEqual(out and out["hookSpecificOutput"]["permissionDecision"], "deny", wrapped)
+        out = self.hook("PreToolUse", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "python3 ../verify/scripts/verify.py rerun"]}})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        for text in ("echo \"bash -lc 'verify.py rerun'\" >> notes.md", "git commit -m 'run verify.py rerun after fixes'", "ls # verify.py rerun"):
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": text}}), text)
         self.hook("SubagentStop", {"agent_id": "fix-1", "last_assistant_message": "Fixed T1."})
         self.assertIsNone(self.hook("PreToolUse", rerun))
 
@@ -866,6 +931,10 @@ class Guard(unittest.TestCase):
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn("The PR opens in item 3", out["permissionDecisionReason"])
         self.assertIn("1. Build., 2. Prove.", out["permissionDecisionReason"])
+        for wrapped in ("bash -lc \"gh pr create --title 'feat: x' --body x\"", "env GH_TOKEN=x gh pr create --title x", "eval 'gh pr create -t x'"):
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": wrapped}})
+            self.assertEqual(out and out["hookSpecificOutput"]["permissionDecision"], "deny", wrapped)
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "echo 'gh pr create next' >> plan.md"}}))
         self.close(1)
         self.todo("skip", "2", "--reason", "no checks")
         self.assertIsNone(self.hook("PreToolUse", create))
@@ -875,22 +944,36 @@ class Guard(unittest.TestCase):
         path = pathlib.Path(self.env["ORCHESTRATOR_HOME"]) / "limits.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
-    def test_usage_limits_in_agent_results_are_recorded_and_other_output_is_never_scanned(self):
+    def test_a_limit_is_recorded_only_from_an_agent_cli_that_failed_on_it(self):
         codex = "■ You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), or try again at Oct 23rd, 2026 3:05 PM."
-        for command in ("cat build.log", "grep -n 'usage limit' notes.md", "python3 ../verify/scripts/verify.py rerun"):
-            self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": command}, "tool_response": {"stdout": codex}})
+        claude = "Claude usage limit reached. Your limit will reset at 11:59pm (America/Los_Angeles)."
+        quoted = {"content": [{"type": "text", "text": f"Review done. A fixture says {codex}\nAnd: {claude}"}]}
+        for tool in ("Agent", "Task", "SendMessage"):
+            self.hook("PostToolUse", {"tool_name": tool, "tool_input": {"prompt": "x"}, "tool_response": quoted})
+        for command in ("cat build.log", "grep -n 'usage limit' notes.md", "python3 ../verify/scripts/verify.py rerun",
+                        "python3 /x/salvo/scripts/salvo.py run --out /tmp/s codex:d < t.md", "echo 'codex exec -m x'"):
+            self.hook("PostToolUseFailure", {"tool_name": "Bash", "tool_input": {"command": command}, "error": f"Exit code 1\n{codex}"})
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": "x.log"}, "tool_response": codex})
+        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": "codex exec -m gpt - < task.md"}, "tool_response": {"stdout": codex, "stderr": ""}})
+        self.hook("PostToolUseFailure", {"tool_name": "Bash", "tool_input": {"command": "codex exec -m gpt - < review.md"}, "error": f"Exit code 1\n{claude}"})
         self.assertEqual(self.limits(), {})
-        self.hook("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": "codex exec -m gpt - < task.md"}, "tool_response": {"stdout": "", "stderr": codex}})
+        self.hook("PostToolUseFailure", {"tool_name": "Bash", "tool_input": {"command": "codex exec -m gpt - < task.md"}, "error": f"Exit code 1\n{codex}"})
         entry = self.limits()["codex"]
         self.assertTrue(entry["until"].startswith("2026-10-23T15:05"), entry)
         self.assertIn("try again at", entry["source"])
         self.assertTrue(entry["seen"])
-        claude = {"content": [{"type": "text", "text": "Stopped early.\nClaude usage limit reached. Your limit will reset at 11:59pm (America/Los_Angeles)."}]}
-        self.hook("PostToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "x"}, "tool_response": claude})
+        self.hook("PostToolUseFailure", {"tool_name": "Bash", "tool_input": {"command": "bash -lc 'cd /repo && claude -p --model x < t.md'"},
+                                         "error": f"Exit code 1\nStopped early.\n{claude}"})
         until = datetime.datetime.fromisoformat(self.limits()["claude"]["until"])
         self.assertEqual((until.hour, until.minute), (23, 59))
-        self.assertIn("codex", self.limits())
+        (pathlib.Path(self.env["ORCHESTRATOR_HOME"]) / "limits.json").unlink()
+        for response in (f"Exit code: 0\nWall time: 3 seconds\nOutput:\n{codex}", {"exit_code": 0, "output": codex}):
+            self.hook("PostToolUse", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "codex exec - < t.md"]}, "tool_response": response}, agent="codex")
+        self.assertEqual(self.limits(), {})
+        for response in (f"Exit code: 1\nWall time: 3 seconds\nOutput:\n{codex}", {"exit_code": 1, "output": codex}):
+            self.hook("PostToolUse", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "codex exec - < t.md"]}, "tool_response": response}, agent="codex")
+            self.assertIn("codex", self.limits())
+            (pathlib.Path(self.env["ORCHESTRATOR_HOME"]) / "limits.json").unlink()
 
     def test_limit_times_parse_in_the_local_zone_with_a_date_in_the_text_winning(self):
         sys.path.insert(0, str(GUARD.parent))

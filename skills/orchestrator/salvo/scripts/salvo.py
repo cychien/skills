@@ -2,7 +2,7 @@
 """Run one task on several agent:model[:effort] specs in parallel, each in its own workspace.
 
 usage:
-  salvo.py run --out <dir> [--clean-room] [--hide-skill <name> ...] agent:model[:effort] ... < task.md
+  salvo.py run --out <dir> [--clean-room] [--hide-skill <name> ...] [--wait-for-reset] agent:model[:effort] ... < task.md
   salvo.py clean <dir>
 
 Inside a git repo, every run gets a detached worktree (a standalone clone with
@@ -16,10 +16,11 @@ in that session. `clean` stops any process still running from a workspace, the s
 (SIGTERM, then SIGKILL) and refuses to delete anything while one survives, because a directory removed under a live
 process hides it.
 
-A run stopped by a usage limit that resets within 24 hours waits for the reset and resumes
-its own session, up to 3 times; salvo.json lists each wait under "limit_waits". Every limit a run
-hits is also recorded in the orchestrator's limits registry (~/.agents/orchestrator/limits.json,
-$ORCHESTRATOR_HOME overrides the folder), so other sessions hand that agent's work to another candidate.
+A run stopped by a usage limit fails at once: its "error" names the reset time and its "limited_until" holds it, and
+the limit is recorded in the orchestrator's limits registry (~/.agents/orchestrator/limits.json, $ORCHESTRATOR_HOME
+overrides the folder), so this and every other session hands that agent's work to the next candidate
+(`guard.py quota pick`). With --wait-for-reset, a run whose limit resets within 24 hours instead waits for the reset
+and resumes its own session, up to 3 times; salvo.json lists each wait under "limit_waits".
 
 --clean-room keeps the setup invisible to the runs: each workspace lives at
 /tmp/<random>/<source directory name>, unconnected to --out or the source, and the prompt
@@ -371,7 +372,7 @@ def record_changes(run, manifest):
     run["patch"] = patch if names else None
 
 
-def execute(run, prompt, manifest, timeout, hidden):
+def execute(run, prompt, manifest, timeout, hidden, wait_for_reset=False):
     agent, model, effort = run["agent"], run["model"], run["effort"]
     log_path = os.path.join(run["dir"], "transcript.jsonl")
     err_path = os.path.join(run["dir"], "stderr.log")
@@ -402,7 +403,7 @@ def execute(run, prompt, manifest, timeout, hidden):
         reset = None if ok or timed_out else limit_reset(agent, read_events(log_path, offset), time.time())
         if reset is not None:
             record_limit(agent, reset, f"salvo run {run['label']} hit the {agent} usage limit")
-        if reset is None or len(waits) == LIMIT_RESUMES or reset - time.time() > MAX_LIMIT_WAIT_S:
+        if reset is None or not wait_for_reset or len(waits) == LIMIT_RESUMES or reset - time.time() > MAX_LIMIT_WAIT_S:
             break
         wake = max(reset, time.time()) + RESET_MARGIN_S
         print(f"waiting  {run['label']} for its usage limit to reset, resuming at {clock(wake)}", flush=True)
@@ -422,8 +423,14 @@ def execute(run, prompt, manifest, timeout, hidden):
             tail = [line for line in f.read().splitlines() if line.strip()][-5:]
         run["error"] = run.pop("agent_error", None) or "\n".join(tail) or f"exit code {code}"
         if reset is not None:
-            why = "more than 24 hours away" if reset - time.time() > MAX_LIMIT_WAIT_S else f"gave up after {LIMIT_RESUMES} resumes"
-            run["error"] += f" (usage limit resets at {clock(reset)}; not resumed: {why})"
+            run["limited_until"] = local_iso(reset)
+            if not wait_for_reset:
+                why = "hand the work to the next candidate with `guard.py quota pick`, or run again with --wait-for-reset"
+            elif reset - time.time() > MAX_LIMIT_WAIT_S:
+                why = "not resumed: more than 24 hours away"
+            else:
+                why = f"not resumed: gave up after {LIMIT_RESUMES} resumes"
+            run["error"] += f" (usage limit resets at {clock(reset)}; {why})"
     run["ok"] = ok
     print(f"finished {run['label']} {'ok' if ok else 'FAILED'} in {run['duration_s']}s", flush=True)
     return run
@@ -502,7 +509,7 @@ def run_salvo(args):
     def one(run):
         prompt = prompt_task + footer.format(work=run["work"], source=source) + FOOTER_COMMON
         try:
-            return execute(run, prompt, manifest, args.timeout, args.hide_skill)
+            return execute(run, prompt, manifest, args.timeout, args.hide_skill, args.wait_for_reset)
         except Exception as e:
             run.update(ok=False, error=f"{type(e).__name__}: {e}")
             return run
@@ -547,6 +554,7 @@ def main():
     p_run.add_argument("--timeout", type=int, default=None, help="seconds per run")
     p_run.add_argument("--clean-room", action="store_true", help="hide the orchestration from the runs")
     p_run.add_argument("--hide-skill", action="append", default=[], metavar="NAME", help="hide the user-level installs of this skill")
+    p_run.add_argument("--wait-for-reset", action="store_true", help="wait for a usage limit to reset and resume, instead of failing")
     p_run.add_argument("specs", nargs="+")
     p_clean = sub.add_parser("clean")
     p_clean.add_argument("dir")

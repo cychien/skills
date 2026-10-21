@@ -4,8 +4,8 @@ import json
 from .hooks import Event
 
 EVENTS = {
-    "claude": {"UserPromptSubmit": "prompt", "PreToolUse": "pre_tool", "PostToolUse": "post_tool", "Stop": "stop",
-               "SubagentStop": "subagent_stop", "PermissionRequest": "permission", "PermissionDenied": "permission_denied"},
+    "claude": {"UserPromptSubmit": "prompt", "PreToolUse": "pre_tool", "PostToolUse": "post_tool", "PostToolUseFailure": "post_tool_failure",
+               "Stop": "stop", "SubagentStop": "subagent_stop", "PermissionRequest": "permission", "PermissionDenied": "permission_denied"},
     "codex": {"UserPromptSubmit": "prompt", "PreToolUse": "pre_tool", "PostToolUse": "post_tool", "Stop": "stop",
               "SubagentStop": "subagent_stop", "PermissionRequest": "permission"},
     "cursor": {"beforeSubmitPrompt": "prompt", "preToolUse": "pre_tool", "postToolUse": "post_tool", "stop": "stop",
@@ -55,7 +55,7 @@ def parse(agent, native_event, payload):
         prompt=_get(payload, "prompt", default="") or "",
         tool=_get(payload, "tool_name", "toolName", default=None),
         tool_input=_tool_input(payload),
-        tool_response=_get(payload, "tool_response", "toolResult", "tool_output", default=None),
+        tool_response=_get(payload, "tool_response", "toolResult", "tool_output", "error", default=None),
         last_message=_get(payload, "last_assistant_message", "prompt_response", default="") or "",
         stop_hook_active=bool(_get(payload, "stop_hook_active", default=False)) or (payload.get("loop_count") or 0) > 0,
         waiting_on_background=background,

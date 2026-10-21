@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from . import skills
+from . import shell, skills
 
 AGENTS = ("claude", "codex")
 ROLES = ("planner", "executor")
@@ -29,12 +29,8 @@ MONTH = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.
 ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 CLOCK = re.compile(r"(?<![\d:])(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b\.?|(?<![\d:])(\d{1,2}):(\d{2})(?![\d])", re.I)
 DURATION = re.compile(r"(\d+)\s*(day|hour|hr|minute|min)s?\b", re.I)
-SEGMENTS = re.compile(r"&&|\|\||;|\||\n")
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\b", re.S)
-PREFIXES = {"env", "nohup", "exec", "time", "command", "caffeinate"}
 SALVO_VALUED = {"--out", "--timeout", "--hide-skill"}
 SPEC = re.compile(r"^(claude|codex):[^:\s]+(?::[^:\s]+)?$")
-RERUN = re.compile(r"verify\.py['\"]?\s+rerun\b")
 AGENT_NAME = re.compile(r"\b(claude(?: code)?|codex)\b", re.I)
 REAL = re.compile(r"^- Agent:\s*real\b", re.I | re.M)
 FALLBACK = ["a candidate that keeps every separation rule",
@@ -142,43 +138,21 @@ def scan(text, now=None):
     return found
 
 
-def commands(command):
-    """The argv of each simple command a shell line runs, past assignments and wrappers, outside heredoc bodies."""
-    found = []
-    for segment in SEGMENTS.split(HEREDOC.sub("", command or "")):
-        try:
-            tokens = shlex.split(re.sub(r"^\s*(do|then|\(+)\s*", "", segment))
-        except ValueError:
-            continue
-        while tokens and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]) or tokens[0] in PREFIXES or tokens[0] == "timeout"):
-            tokens = tokens[2:] if tokens[0] == "timeout" else tokens[1:]
-        if tokens:
-            found.append(tokens)
-    return found
-
-
-def script(tokens):
-    """The script a command runs: argv[0], or the first argument of a python interpreter."""
-    first = os.path.basename(tokens[0])
-    if re.fullmatch(r"python[\d.]*", first) and len(tokens) > 1:
-        return os.path.basename(tokens[1]), tokens[2:]
-    return first, tokens[1:]
-
-
 def runs_agent(command):
-    """Whether the shell line runs codex, claude -p, or salvo.py, whose output may carry a usage-limit message."""
-    for tokens in commands(command):
-        name, rest = script(tokens)
-        if name in ("codex", "salvo.py") or (name == "claude" and ({"-p", "--print"} & set(rest))):
-            return True
-    return False
+    """The agents whose CLI a shell line runs headless: codex, and claude with -p or --print."""
+    found = set()
+    for tokens in shell.commands(command):
+        name, rest = shell.script(tokens)
+        if name == "codex" or (name == "claude" and {"-p", "--print"} & set(rest)):
+            found.add(name)
+    return found
 
 
 def launches(command):
     """[(agent, spec)] for each agent a shell line starts: salvo.py run entries and codex exec."""
     found = []
-    for tokens in commands(command):
-        name, rest = script(tokens)
+    for tokens in shell.commands(command):
+        name, rest = shell.script(tokens)
         if name == "codex" and "exec" in rest:
             found.append(("codex", "codex exec"))
         elif name == "salvo.py" and rest[:1] == ["run"]:
@@ -271,7 +245,7 @@ def spawn_problem(command, cwd, lead):
             entry = limited[agent]
             return (f"{agent} is limited until {clock(epoch(entry['until']))} ({entry.get('source', '')}), so `{launched}` would stall. "
                     f"Hand the work to the next candidate (`{guard_cli()} quota pick --role <role>`):\n{picks(cwd)}")
-    if RERUN.search(command):
+    if any(rest[:1] == ["rerun"] for rest in shell.invocations(command, "verify.py")):
         return None
     others = {a for a, _ in started if a != lead}
     if not others:

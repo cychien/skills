@@ -255,8 +255,10 @@ class FlowV2(unittest.TestCase):
         self.assertIn("Item 6 done.", self.close(6))
 
         self.assertEqual(self.guard("quota", "pick", "--role", "executor").strip(), "claude:sonnet:high")
-        limit = {"content": [{"type": "text", "text": "Stopped early.\nClaude usage limit reached. Your limit will reset at 11:59pm."}]}
-        self.hook("PostToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "Implement mul."}, "tool_response": limit})
+        limit = "Claude usage limit reached. Your limit will reset at 11:59pm."
+        self.hook("PostToolUse", {"tool_name": "Agent", "tool_input": {"prompt": "Implement mul."}, "tool_response": {"content": [{"type": "text", "text": limit}]}})
+        self.assertIn("No agent is limited", self.guard("quota", "status"))
+        self.hook("PostToolUseFailure", {**self.bash("claude -p --model sonnet < t.md"), "error": f"Exit code 1\n{limit}"})
         self.assertIn("claude: limited until", self.guard("quota", "status"))
         self.assertEqual(self.guard("quota", "pick", "--role", "executor").strip(), "codex:gpt-5.6:medium")
         self.assertIn("claude is limited until", self.denied(self.bash("python3 /x/salvo/scripts/salvo.py run --out /tmp/s claude:sonnet:high < t.md")))

@@ -1,5 +1,6 @@
 """Guard's hard rules. Each hook event returns (action, message); the shared hook runtime renders it per agent."""
 import glob
+import hashlib
 import os
 import pathlib
 import re
@@ -8,10 +9,9 @@ import subprocess
 import sys
 import time
 
-from . import pr, quota, skills, state, verifiers
+from . import pr, quota, shell, skills, state, verifiers
 
 PASS = ("pass", None)
-DECISION = re.compile(r"guard\.py['\"]?\s+todo\b|autorun\.py['\"]?\s+(start|mode)\b")
 SLASH = re.compile(r"^\s*/([a-z0-9][a-z0-9-]*)\b")
 PRINCIPLE_FILE = re.compile(r"references/principles/([a-z0-9-]+)\.md$")
 SKILL_FILE = re.compile(r"(?:^|/)([a-z0-9][a-z0-9-]*)/SKILL\.md$")
@@ -51,8 +51,8 @@ HANDBACK_LIMIT = 300
 HANDBACK_TARGET = 200
 CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]")
 HANDBACK_TOOLS = {"subagenthandback"}
-LIMIT_TOOLS = {"agent", "task", "sendmessage"}
-GH_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
+EXIT_CODE = re.compile(r"^\s*(?:Error:\s*)?Exit code:?\s*(\d+)\b")
+EXIT_KEYS = ("exit_code", "exitCode", "returncode", "exit_status")
 OPEN_PR = "../open-pr/SKILL.md"
 RERUN_DENIED = "A fix group is still working; rerun once every group has handed back, so one run grades every fix."
 OWN_LIST = ("You are a subagent, and guard keeps your todo list apart from your lead's, so your items never land in its list and "
@@ -108,6 +108,9 @@ def handle(event):
         return on_pre_tool(event)
     if event.kind == "post_tool":
         return on_post_tool(event)
+    if event.kind == "post_tool_failure":
+        note_limits(event)
+        return PASS
     if event.kind == "stop" and not event.agent_id:
         if not event.waiting_on_background:
             delegates_end(event)
@@ -136,15 +139,20 @@ def delegate_acts(event):
 
 
 def delegates_end(event, ids=None):
-    """Mark these subagents, or all of them, no longer running: a lead stop with no background work outlives every delegate."""
+    """Mark these subagents, or all of them, no longer running, and forget the hand-backs they were let through: a lead
+    stop with no background work outlives every delegate."""
     if not state.exists(event.agent, event.session):
         return
-    ending = [i for i, d in state.load(event.agent, event.session).get("delegates", {}).items() if d.get("running") and (ids is None or i in ids)]
-    if not ending:
+    data = state.load(event.agent, event.session)
+    ending = [i for i, d in data.get("delegates", {}).items() if d.get("running") and (ids is None or i in ids)]
+    passed = [i for i in data.get("handbacks", {}) if ids is None or i in ids]
+    if not ending and not passed:
         return
     with state.update(event.agent, event.session) as data:
         for agent_id in ending:
             data["delegates"][agent_id]["running"] = False
+        for agent_id in passed:
+            data.get("handbacks", {}).pop(agent_id, None)
 
 
 def running_since(event):
@@ -294,16 +302,32 @@ def on_post_tool(event):
 
 
 def note_limits(event):
-    """Record a usage limit the result of a subagent or an agent CLI reports, so every session hands that agent's work on."""
-    tool = (event.tool or "").lower()
+    """Record a usage limit that a headless codex or claude run from the shell failed on, so every session hands that
+    agent's work on. Nothing else is scanned: a subagent's result or a log that quotes a limit message is not a limit."""
     command = shell_command(event)
-    if tool not in LIMIT_TOOLS and not (command and quota.runs_agent(command)):
+    agents = quota.runs_agent(command) if command else set()
+    if not agents or not failed(event):
         return
     for agent, until, source in quota.scan("\n".join(strings(event.tool_response))):
-        try:
-            quota.record(agent, until, source)
-        except OSError:
-            pass
+        if agent in agents:
+            try:
+                quota.record(agent, until, source)
+            except OSError:
+                pass
+
+
+def failed(event):
+    """Whether the shell command exited non-zero: a failure event, or an exit code its result states."""
+    if event.kind == "post_tool_failure":
+        return True
+    response = event.tool_response
+    if isinstance(response, dict):
+        for key in EXIT_KEYS:
+            if str(response.get(key, "")).lstrip("-").isdigit():
+                return int(response[key]) != 0
+        response = next((v for v in response.values() if isinstance(v, str) and EXIT_CODE.match(v)), None)
+    found = EXIT_CODE.match(response) if isinstance(response, str) else None
+    return bool(found and int(found.group(1)) != 0)
 
 
 def strings(value):
@@ -357,7 +381,7 @@ def on_pre_tool(event):
     if data.get("spawned") and not event.agent_id and polls_for_subagent(command):
         return "deny", POLLING_DENIED + (POLLING_HEADLESS if headless() else POLLING_INTERACTIVE)
     skill = data.get("todo_undecided")
-    if skill and not event.agent_id and not DECISION.search(command) and not reads_a_skill(event):
+    if skill and not event.agent_id and not decides(command) and not reads_a_skill(event):
         return "deny", todo_hint(skill, event)
     if "gh" not in command or "open-pr" not in data["skills"]:
         return PASS
@@ -367,10 +391,16 @@ def on_pre_tool(event):
     return "deny", "The open-pr skill's PR rules reject this command:\n- " + "\n- ".join(found) + "\nFix the command and run it again."
 
 
+def decides(command):
+    """Whether the command runs guard's todo CLI or autorun's start or mode, as a command and not as text."""
+    return (any(rest[:1] == ["todo"] for rest in shell.invocations(command, "guard.py"))
+            or any(rest[:1] in (["start"], ["mode"]) for rest in shell.invocations(command, "autorun.py")))
+
+
 def order_problem(event, command):
     """Why a command is early for the flow: a rerun while fix groups still work, or a PR before the close step."""
-    bare = QUOTED.sub("", HEREDOC.sub("", command))
-    rerun, create = quota.RERUN.search(bare), GH_PR_CREATE.search(bare)
+    rerun = any(rest[:1] == ["rerun"] for rest in shell.invocations(command, "verify.py"))
+    create = any(rest[:2] == ["pr", "create"] for rest in shell.invocations(command, "gh"))
     if not (rerun or create) or not state.exists(event.agent, event.session):
         return None
     data = state.load(event.agent, event.session)
@@ -461,7 +491,7 @@ def shell_command(event):
     for k in ("command", "cmd", "commandLine"):
         v = event.tool_input.get(k)
         if isinstance(v, list):
-            return " ".join(map(str, v))
+            return shell.line(v)
         if isinstance(v, str):
             return v
     return None
@@ -504,17 +534,18 @@ def words(text):
 
 
 def oversized_handback(event, message):
-    """Once per hand-back length: why a subagent's hand-back is too long. An unchanged length passes the second time,
-    so an agent type that cannot write files is not looped."""
+    """Once per hand-back: why a subagent's hand-back is too long. The same text passes the second time, so an agent type
+    that cannot write files is not looped; the pass lasts until the delegate ends."""
     message = (message or "").strip()
     count = words(message)
     if not event.agent_id or count <= HANDBACK_LIMIT:
         return None
+    digest = hashlib.sha256(message.encode()).hexdigest()
     with state.update(event.agent, event.session) as data:
         seen = data.setdefault("handbacks", {})
-        if seen.get(event.agent_id) == len(message):
+        if seen.get(event.agent_id) == digest:
             return None
-        seen[event.agent_id] = len(message)
+        seen[event.agent_id] = digest
     return (f"Your hand-back is {count:g} words, over the {HANDBACK_LIMIT}-word limit, and every word of it stays in the lead's context "
             f"for the rest of the run. Put the details in a file and hand back at most {HANDBACK_TARGET} words with the file path.")
 

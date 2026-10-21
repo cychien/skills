@@ -74,11 +74,11 @@ def unresolved(data):
 
 
 def add_items(data, texts, source=None, source_path=None, titles=None, mandatory=None, after=None):
-    """Append items; a list whose every item is resolved is archived first, so a new task starts a new list.
+    """Append items; a list whose every item is resolved is archived first, with its hold, so a new task starts a new list.
     after[i] lists the positions in texts that item i waits on."""
     if data["todo"] and not unresolved(data):
         data["archived"].append({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "items": data["todo"]})
-        data["todo"] = []
+        data["todo"], data["hold"] = [], None
     start = len(data["todo"]) + 1
     for i, text in enumerate(texts):
         data["todo"].append({

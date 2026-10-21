@@ -94,9 +94,21 @@ class Harness(unittest.TestCase):
 
 
 class LimitWait(Harness):
+    def test_a_run_that_hits_a_limit_fails_at_once_with_the_reset_time_and_records_it(self):
+        for spec in ("claude:m", "codex:m"):
+            before = time.time()
+            run, calls, sleeps = self.salvo("limit:3600,ok", spec)
+            self.assertFalse(run["ok"])
+            self.assertEqual((len(calls), sleeps), (1, []))
+            self.assertNotIn("limit_waits", run)
+            reset = datetime.datetime.fromisoformat(run["limited_until"]).timestamp()
+            self.assertAlmostEqual(reset, before + 3600, delta=120)
+            self.assertIn(f"usage limit resets at {salvo.clock(reset)}; hand the work to the next candidate with `guard.py quota pick`", run["error"])
+            self.assertIn(spec.split(":")[0], json.loads((self.root / "orchestrator" / "limits.json").read_text()))
+
     def test_a_claude_run_waits_for_the_reset_and_resumes_its_session(self):
         before = int(time.time())
-        run, calls, sleeps = self.salvo("limit:5,ok", "claude:m")
+        run, calls, sleeps = self.salvo("limit:5,ok", "claude:m", "--wait-for-reset")
         self.assertTrue(run["ok"], run)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1]["argv"][-2:], ["--resume", "s-1"])
@@ -107,7 +119,7 @@ class LimitWait(Harness):
         self.assertEqual(run["resume"], f"cd {run['work']} && claude --resume s-1")
 
     def test_a_codex_run_waits_for_the_reset_and_resumes_its_thread(self):
-        run, calls, sleeps = self.salvo("limit:5,ok", "codex:m")
+        run, calls, sleeps = self.salvo("limit:5,ok", "codex:m", "--wait-for-reset")
         self.assertTrue(run["ok"], run)
         resumed = calls[1]["argv"]
         self.assertEqual(resumed[1:3], ["exec", "resume"])
@@ -122,7 +134,7 @@ class LimitWait(Harness):
         registry.parent.mkdir()
         registry.write_text(json.dumps({"claude": {"until": "2020-01-01T00:00+00:00", "seen": "x", "source": "old"}}))
         before = time.time()
-        self.salvo("limit:600,ok", "codex:m")
+        self.salvo("limit:600,ok", "codex:m", "--wait-for-reset")
         entry = json.loads(registry.read_text())
         self.assertEqual(set(entry), {"codex"})
         until = datetime.datetime.fromisoformat(entry["codex"]["until"]).timestamp()
@@ -132,14 +144,14 @@ class LimitWait(Harness):
         self.assertEqual(set(json.loads(registry.read_text())), {"codex"})
 
     def test_a_reset_more_than_a_day_away_is_not_waited_for(self):
-        run, calls, sleeps = self.salvo("limit:90000", "claude:m")
+        run, calls, sleeps = self.salvo("limit:90000", "claude:m", "--wait-for-reset")
         self.assertFalse(run["ok"])
         self.assertEqual((len(calls), sleeps), (1, []))
         self.assertIn("more than 24 hours away", run["error"])
 
     def test_repeated_limit_hits_stop_after_the_resume_budget(self):
         plan = ",".join(["limit:5"] * (salvo.LIMIT_RESUMES + 1))
-        run, calls, sleeps = self.salvo(plan, "claude:m")
+        run, calls, sleeps = self.salvo(plan, "claude:m", "--wait-for-reset")
         self.assertFalse(run["ok"])
         self.assertEqual(len(sleeps), salvo.LIMIT_RESUMES)
         self.assertEqual(len(calls), salvo.LIMIT_RESUMES + 1)

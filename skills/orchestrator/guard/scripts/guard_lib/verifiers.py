@@ -1,5 +1,7 @@
 """The verification budget: one verifier per check. A fix is graded by `verify.py rerun --only` and `units`, never by another verifier."""
+import fcntl
 import json
+import os
 import pathlib
 import re
 import time
@@ -30,15 +32,19 @@ def over_budget(prompt):
     directory = pathlib.Path(evidence.group(1)).expanduser()
     ids = CHECK_ID.findall(checks.group(1))
     ledger = directory / LEDGER
-    spawns = json.loads(ledger.read_text()) if ledger.is_file() else {}
-    spent = [i for i in ids if rounds(spawns.get(i, []), evidence_times(directory, i)) >= ROUNDS]
-    if spent:
-        return SPENT.format(ids=", ".join(spent))
-    now = time.time()
-    for i in ids:
-        spawns.setdefault(i, []).append(now)
     directory.mkdir(parents=True, exist_ok=True)
-    ledger.write_text(json.dumps(spawns, indent=2) + "\n")
+    with open(directory / f".{LEDGER}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        spawns = json.loads(ledger.read_text()) if ledger.is_file() else {}
+        spent = [i for i in ids if rounds(spawns.get(i, []), evidence_times(directory, i)) >= ROUNDS]
+        if spent:
+            return SPENT.format(ids=", ".join(spent))
+        now = time.time()
+        for i in ids:
+            spawns.setdefault(i, []).append(now)
+        tmp = ledger.with_name(f"{LEDGER}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(spawns, indent=2) + "\n")
+        os.replace(tmp, ledger)
     return None
 
 
