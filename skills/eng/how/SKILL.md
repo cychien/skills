@@ -8,7 +8,9 @@ disable-model-invocation: true
 
 Explore the codebase to answer "how does X work?" questions. Produce architectural explanations at the level of a senior engineer onboarding onto a subsystem, enough to build a working mental model, not so much that it reads like annotated source code.
 
-Every spawn reads the repository and never edits it. Give an explainer that hands back a file an agent type that can write to the scratchpad, because a type without a write tool returns the whole explanation inline into the caller's context. Explorers use an executor model and every explainer a planner model from the orchestrator config (`<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`): the first entry in that role your agent can run as a subagent. Without a config, or when your agent cannot choose a subagent's model, use its default model.
+Every spawn reads the repository and never edits its code. Every explorer and explainer writes its findings to a file (in the scratchpad, or where the caller names) and hands back the path with at most 200 words, so give each an agent type with a write tool, never a read-only type, because a type without one returns everything inline into the caller's context. Explorers use an executor model and every explainer a planner model from the orchestrator config (`<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`): the first entry in that role your agent can run as a subagent. Without a config, or when your agent cannot choose a subagent's model, use its default model.
+
+When the caller gives a verification plan, how also tests every check's premises against current main, per "With a verification plan" below.
 
 ## 1. Assess complexity
 
@@ -29,7 +31,15 @@ Once all explorers have returned, spawn one explainer with `references/explainer
 
 ## 4. Present
 
-Present the explainer's output. Light edits for clarity or context from the conversation are fine. Do not substantially rewrite it.
+Present the explainer's output. Light edits for clarity or context from the conversation are fine. Do not substantially rewrite it. With a verification plan, present the paths of `grounding.md` and `premises.md` and one line per premise that does not hold.
+
+## With a verification plan
+
+The feature skill's grounding step passes the plan, and the place its files go: the plan's phase folder, else the verification directory. Then:
+
+- Give every check to at least one explorer, beside its angle: the checks whose scenario runs through its slice. The explorer lists each fact the check depends on (a route exists, a dialog asks before it acts, an adapter queues while offline), whether it holds on current main, and the file and line or the command output that shows it, because a false premise found before the design costs a line.
+- When the caller passes an earlier `grounding.md`, the explorers start from it and look only at what changed since and at the premises.
+- The explainer writes two files there: `grounding.md`, the explanation in the sections below, whole even when it started from an earlier one; and `premises.md`, the table of `../verify/references/plan.md`'s Premises section, one row per premise and at least one per check. It checks every `no` row in the code itself before writing it, and leaves every Resolution empty, because the design resolves premises, not how.
 
 ## Output format
 

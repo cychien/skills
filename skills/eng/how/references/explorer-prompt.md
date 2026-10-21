@@ -14,7 +14,15 @@ Other explorers are investigating different slices of the same subsystem in para
 
 {EXPLORATION_ANGLE}
 
+## Premises to Test
+
+{CHECKS_OR_NONE}
+
+When checks are listed above, test their premises: every fact each check depends on, whether it holds on current main, and the file and line or command output that shows it. Do not decide what to do about a false one.
+
 ## Output
+
+Write the sections below to {OUTPUT_FILE} and hand back its path with at most 200 words.
 
 ### Components Found
 The key types, services, classes, and abstractions. For each: name, file path, and a one-sentence description of what it does.
@@ -30,6 +38,9 @@ Where this subsystem connects to other parts of the codebase. The inputs and out
 
 ### Non-Obvious Things
 Anything surprising, historically motivated, or easy to get wrong. Things that look like they should work one way but work another.
+
+### Premises
+One line per premise when checks were listed: check id, the premise, holds yes or no, and the evidence. Skip this section otherwise.
 
 ### Open Questions
 Anything you couldn't fully trace or understand. Be honest about gaps.
