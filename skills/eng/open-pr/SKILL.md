@@ -1,6 +1,6 @@
 ---
 name: open-pr
-description: "Open pull requests the house way: a worktree off main, small ordered commits, Conventional Commits titles, and a one-minute PR description. Use at the end of every engineering playbook, or for /open-pr."
+description: "Open pull requests the house way: a worktree off main, small ordered commits, Conventional Commits titles, a one-minute PR description, and failing checks listed on top with a do-not-merge label. Use at the end of every engineering playbook, or for /open-pr."
 disable-model-invocation: true
 ---
 
@@ -20,16 +20,19 @@ Paths like `../how/SKILL.md` point to skills installed beside this one, relative
 
 **Descriptions.** The PR body is a one-minute briefing, not a lab notebook, for a reviewer who has the diff. It says why the change exists, what it leaves out, what it could break, and how you proved it works. Write short, simple sentences with few identifiers, no walls of text. The body becomes the squash commit body, so keep that commit under about 40 lines. Use `##` headings, not bold lead-ins, in this order, and drop a section with nothing to say:
 
+- `## Not ready to merge`: first, and only when the verification report has a FAIL or INCONCLUSIVE row. One bullet per such check: its id, what fails or what blocked it with the repro, and the next step you recommend, so the user sees at a glance why it must not land yet.
 - `## Why`: the problem and approach, 1–3 short sentences. No SHAs, rebase genealogy, or "based on main" preamble.
 - `## What changed`: 1–3 short bullets. Name a real symbol or path only when it carries the change. Name both sides of a rename or retarget.
 - `## Scope`: always. 1–3 short items on what it covers and what it deliberately leaves out (a follow-up, a known gap). No symbols, paths, or file-by-file essay.
 - `## Tradeoffs`: only rejected alternatives a reviewer would otherwise ask about. Skip when there was no real choice.
 - `## Blast Radius`: 1–2 sentences on who or what it touches and why that is safe or risky. If main is red, state the cost of leaving it red.
-- `## Verification`: 1–3 bullets, each a real run path and its outcome. Perf: one primary number with its unit, `before → after`, and a link to the arena directory for the rest. No sample-size methodology, run recitals, or metric tables.
+- `## Verification`: 1–3 bullets, each a real run path and its outcome. Perf: one primary number with its unit, `before → after`, and a link to the arena directory for the rest. No sample-size methodology, run recitals, or metric tables. Name each usage-limit relaxation the run made: who replaced whom, for which limit.
 
 After the sections, attach videos or screenshots when they prove a claim. Full SHAs, arena lane recitals, lever-correction essays, file-by-file checklists, and "CLEAN" verdicts go in a linked artifact, not the body.
 
 **Forge.** Use the GitHub CLI (`gh`) for every PR operation. Do not require Graphite (`gt`).
+
+**Not ready to merge.** Opening a PR is not shipping it; the user's merge is. A PR whose report has a FAIL or INCONCLUSIVE row still opens, with the `## Not ready to merge` section and the `do not merge` label, so the run ends instead of waiting on one check. Create the label once per repository when `gh label list` lacks it, with `gh label create "do not merge" --color B60205 --description "A check failed or could not run; see the top of the description"`, then pass `--label "do not merge"` to `gh pr create`. When a later run turns every row PASS, drop the section with `gh pr edit` and remove the label with `gh pr edit <number> --remove-label "do not merge"`.
 
 **Size and stacks.** Open one PR per feature carrying the executor's ordered commits. Stack only when the project's AGENTS.md or the user asks, or a phased feature opens one PR per phase, because every rebase repoints every child PR. A stack is a base-branch chain. The root PR targets trunk. Each child branch rebases onto its parent's exact tip and its PR targets the parent branch. Create a child with `gh pr create --base <parent-branch>`, and retarget one with `gh pr edit <pr> --base <parent-branch>`. A commit that fixes something unrelated to the feature, such as a pre-existing bug fixed on sight, goes in its own PR on a branch cut from trunk, and comes off the feature branch, because it must land or roll back without the feature. Rebase on trunk before substantial stack work.
 

@@ -14,13 +14,23 @@ You are writing an architectural explanation for a senior engineer. Multiple exp
 
 {EXPLORER_FINDINGS_ALL}
 
+## Verification Plan
+
+{PLAN_PATH_OR_NONE}
+
+## Output Files
+
+{OUTPUT_FILES}
+
 ## Instructions
 
 The explorers each investigated a different angle of the same subsystem. Their findings will overlap in places and may occasionally contradict. Reconcile them. Merge overlapping descriptions, resolve contradictions by checking the code yourself, and combine the separate slices into a unified picture.
 
 Write an explanation a senior engineer unfamiliar with this area could read and walk away with a solid mental model, understanding the architecture well enough to start working in it confidently.
 
-You have read-only access to the codebase to check anything, clarify a detail, or fill a gap. Use Read, Grep, and Glob as needed. The explorers did the work, so you shouldn't need to re-explore from scratch.
+Do not edit the codebase; write only the output files. Read it to check anything, clarify a detail, or fill a gap. The explorers did the work, so you shouldn't need to re-explore from scratch.
+
+Write the explanation to the output file named above and hand back its path with at most 200 words. When a verification plan is named, write two files in its place instead: `grounding.md`, the whole explanation, and `premises.md`, a table with the columns `Check | Premise | Holds | Evidence | Resolution`, one row per premise and at least one row per check id in the plan, Holds `yes` or `no`, Evidence a file and line or a command and its output, and Resolution empty. Check every `no` row in the code yourself before you write it.
 
 ## Output Format
 

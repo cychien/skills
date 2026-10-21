@@ -11,19 +11,19 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [eng-do](./skills/eng/eng-do/) - the engineering switchboard: routes engineering work to its playbook
 - [principles](./skills/eng/principles/) - the engineering principles playbooks read before they design or build
 - [code-comments](./skills/eng/code-comments/) - how code is commented in every file a playbook produces
-- [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements, design, phases, and every phase's verification plan before any code
-- [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground, design, lock the plan before code, delegate, verify once, open a PR; builds a plan-feature plan one phase per session as stacked PRs
-- [quick-feature](./skills/eng/quick-feature/) - build a small feature in one PR with the same verification floor: plan locked before code, fresh verifier, oracle, fail-first specs
-- [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, verify, land the failing repro before the fix
+- [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements, one living spec, phases, and every phase's checks before any code
+- [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground and test the checks' premises, design, lock the plan before code, implement beside the e2e scripts, review, prove once, open a PR; builds a plan-feature plan one phase per session, one PR per phase, stacked while an earlier phase is open
+- [quick-feature](./skills/eng/quick-feature/) - build a small feature in one PR with the same verification floor: plan locked before code, fail-first specs, scripts dry-run on the base, review before the one e2e run, oracle
+- [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, review the fix before one e2e run, land the failing repro before the fix
 - [perf-issue](./skills/eng/perf-issue/) - fix a slowness against a vetted baseline, cheapest performance mantra first
 - [hillclimb](./skills/eng/hillclimb/) - improve one metric against a target: frozen harness, keep or revert, decision log
-- [open-pr](./skills/eng/open-pr/) - open PRs as small ordered commits with a one-minute description
-- [how](./skills/eng/how/) - explain how a subsystem works
+- [open-pr](./skills/eng/open-pr/) - open PRs as small ordered commits with a one-minute description, failing checks on top and a `do not merge` label
+- [how](./skills/eng/how/) - explain how a subsystem works, and test a verification plan's premises against the code
 - [why](./skills/eng/why/) - find the rationale behind code from history, tickets, docs, and chat
 - [architect](./skills/eng/architect/) - design types and module structure across several models and deliver a skeleton patch that typechecks
 - [prototype](./skills/eng/prototype/) - settle a design or behavioral decision with throwaway variants observed on the real surface
 - [interrogate](./skills/eng/interrogate/) - adversarial review of changes by several models
-- [verify](./skills/eng/verify/) - prove a change works: a plan of checkable predicates, an independent verifier on the real surface, an evidence audit
+- [verify](./skills/eng/verify/) - prove a change works: a plan of checkable predicates, scripts dry-run on the base, a review before one e2e run by an independent verifier, an evidence audit
 - [create-verification-skill](./skills/eng/create-verification-skill/) - generate a project-local `verify-<app>` skill that launches and drives the app
 - [maintain-verification-skill](./skills/eng/maintain-verification-skill/) - keep a verification skill and its feature map honest as the app changes
 - [benchmark-checklist](./skills/eng/benchmark-checklist/) - vet a performance number before you report or act on it, measured on read-only production when available

@@ -9,8 +9,8 @@
 - Evidence: <the artifact that proves it>
 - Pass: <a predicate another agent can check against the evidence>
 - Oracle: n/a: <why the result is not a value computed from data>
-- Tier: <e2e, unit, or walk, per the Terms in plan.md>
-- Touches: <e2e only: `<path glob>`, `<path glob>`, every package the scenario runs through>
+- Tier: <e2e, unit, or walk, per the Terms in plan.md; e2e only for core behavior no unit spec can see>
+- Agent: <optional: real, fake, or n/a, with why>
 
 ### <id>. <title of a check whose result is computed from data>
 
@@ -22,7 +22,6 @@
 - Seed: <the dataset>
 - Shape: <the JSON both sides write>
 - Tier: <e2e or walk: an oracle value is read from the running app>
-- Touches: <e2e only: `<path glob>`, every package the scenario runs through>
 
 ## Perf
 
@@ -33,9 +32,10 @@
 - Probe: <the command or procedure, run on main and head, interleaved>
 - Baseline: <main, or none: why main lacks the path>
 - Rule: <the number that fails: a limit against main, or absolute budgets for the added work and the end state>
-- Touches: `<path glob>`, <every package on the measured path>
 
 ## Drive contract
+
+<Written at the design step, before the lock. A phase plan from the plan-feature skill leaves this section and the next out until then.>
 
 - <kind: test id, accessible name, route, HTTP path, CLI command or flag, wire or event name, or file path>: `<the exact name>`, <what it is and which checks drive it>
 
