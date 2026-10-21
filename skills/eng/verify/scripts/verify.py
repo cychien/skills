@@ -2228,9 +2228,8 @@ def adopted_phase(directory):
     if not root:
         return None, None
     root, copy = pathlib.Path(root), directory / "plan.md"
-    _, ids, _, _ = lint_plan(copy.read_text(), full=False) if copy.is_file() else ([], [], {}, {})
-    owners = [p.parent for p in sorted(root.glob("phases/*/plan.md"))
-              if {i for i, _ in ids if i} & {i for i, _ in lint_plan(p.read_text(), full=False)[1] if i}]
+    ids = set(lint_plan(copy.read_text(), full=False)[1]) if copy.is_file() else set()
+    owners = [p.parent for p in sorted(root.glob("phases/*/plan.md")) if ids & set(lint_plan(p.read_text(), full=False)[1])]
     if len(owners) != 1:
         found = "no phase" if not owners else f"{len(owners)} phases ({', '.join(o.name for o in owners)})"
         raise Failed(f"this branch records the plan folder {root}, but {found} under {root / 'phases'} holds the checks of "

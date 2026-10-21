@@ -1827,6 +1827,24 @@ class Spec(RepoFixture):
         (where / "plan.md").unlink()
         self.assertIn("but no phase under", self.verify("spec", ok=False))
 
+    def test_an_older_adopt_record_matches_whole_check_ids_across_phases_that_share_a_prefix(self):
+        root = (self.repo / "docs" / "export").resolve()
+        phases = {"01-json": ("T5-04", "B1"), "02-csv": ("T5-05", "B2"), "03-xml": ("T5-0", "B12")}
+        for name, ids in phases.items():
+            (root / "phases" / name).mkdir(parents=True)
+            checks = "".join(CHECKS.replace("B1", check_id).split("## Checks\n")[1] for check_id in ids)
+            (root / "phases" / name / "plan.md").write_text(plan(CHECKS.split("## Checks\n")[0] + "## Checks\n" + checks, PERF_NA))
+        where = pathlib.Path(self.verify("where").strip())
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "base.json").write_text(json.dumps({"base": self.rev(), "plan": str(root)}))
+        (root / "spec.md").write_text("# Export\n\n## Change log\n\n- 02-csv: no design change\n")
+        for name, ids in phases.items():
+            (where / "plan.md").write_text((root / "phases" / name / "plan.md").read_text())
+            if name == "02-csv":
+                self.assertEqual(self.verify("spec"), "spec ok: spec.md's change log names 02-csv; phases ok: 3 phases, 6 checks\n")
+            else:
+                self.assertIn(f"'## Change log' has no line for {name}", self.verify("spec", ok=False))
+
 
 class Units(RepoFixture):
     def test_specs_that_fail_on_base_and_pass_at_head_satisfy_the_gate(self):
