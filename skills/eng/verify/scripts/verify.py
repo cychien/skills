@@ -1072,7 +1072,7 @@ def section(text, name):
 
 def review_meta(body, name):
     """The value of a section's '<name>:' line, '' when the line is empty, or None when there is none."""
-    return next((m.group(2) for m in SECTION_META.finditer(body) if m.group(1) == name), None)
+    return next((m.group(2).strip("`* ") for m in SECTION_META.finditer(body) if m.group(1) == name), None)
 
 
 def finding_problems(name, body, meta):

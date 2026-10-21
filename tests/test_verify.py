@@ -1005,7 +1005,7 @@ class Driver(unittest.TestCase):
         (self.repo / "app.py").write_text("print('right')\n")
         self.commit("Fix the fix review's finding")
         self.assertIn(f"product files changed after the fix review's fixes (Fixed at {fixed[:12]}): app.py", run("review").stdout)
-        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings=triaged, fixed_at=self.head()))
+        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings=triaged, fixed_at=f"`{self.head()}`"))
         self.assertEqual(run("review").returncode, 0, "Fixed at names the commit that holds the fix review's fixes")
         fixed_at = self.head()
         (self.repo / "auth.py").write_text("ALLOW_ALL = True\n")
