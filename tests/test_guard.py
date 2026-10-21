@@ -690,38 +690,42 @@ class ShippedPlaybooks(unittest.TestCase):
         path = ROOT / "skills" / "eng" / skill / "SKILL.md"
         return {n: {" ".join(args) for _, _, args in gates.named(text)} for n, _, text, mandatory in skills.steps(path) if mandatory}
 
-    def test_quick_feature_freezes_the_plan_before_code_delegates_and_cannot_skip_verification(self):
+    def test_quick_feature_locks_the_plan_before_code_reviews_before_the_e2e_run_and_cannot_skip_verification(self):
         mandatory = self.gated_mandatory_steps("quick-feature")
-        self.assertEqual(mandatory, {1: set(), 3: {"plan", "lock"}, 4: {"driver"}, 6: {"oracles"}, 8: {"report", "leftovers"}})
+        self.assertEqual(mandatory, {1: set(), 2: {"plan", "lock"}, 3: {"units"}, 5: {"review"}, 6: {"oracles"}, 8: {"report", "leftovers"}})
 
-    def test_feature_locks_the_plan_before_code_and_gates_the_pr_on_the_report(self):
+    def test_feature_tests_premises_locks_before_code_reviews_before_the_e2e_run_and_gates_the_pr(self):
         mandatory = self.gated_mandatory_steps("feature")
-        self.assertEqual(mandatory, {1: set(), 5: {"lock"}, 7: {"units"}, 9: {"oracles"}, 10: set(), 12: {"report", "leftovers"}})
+        self.assertEqual(mandatory, {
+            1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"},
+            5: {"units"}, 7: {"review"}, 8: {"oracles"}, 10: {"report", "spec"},
+        })
 
-    def test_feature_gets_the_driver_in_the_verifier_step(self):
+    def test_e2e_scripts_are_written_beside_the_code_and_gated_on_their_base_dry_run(self):
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))
         from guard_lib import gates, skills
-        steps = skills.steps(ROOT / "skills" / "eng" / "feature" / "SKILL.md")
-        driver = [n for n, _, text, _ in steps if {"driver"} <= {" ".join(args) for _, _, args in gates.named(text)}]
-        self.assertEqual(driver, [8])
+        for skill, implement in (("feature", 5), ("quick-feature", 3), ("bug-fix", 6)):
+            steps = skills.steps(ROOT / "skills" / "eng" / skill / "SKILL.md")
+            scripts = [(n, text) for n, _, text, _ in steps if {"scripts"} <= {" ".join(args) for _, _, args in gates.named(text)}]
+            self.assertEqual([n for n, _ in scripts], [implement + 1], skill)
+            self.assertIn(f"in parallel with step {implement}", scripts[0][1], skill)
 
     def test_the_step_that_opens_the_pr_is_the_one_the_final_run_gates(self):
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))
         from guard_lib import gates, skills
-        for skill in ("feature", "quick-feature"):
+        for skill, final in (("feature", {"report", "spec"}), ("quick-feature", {"report", "leftovers"}), ("bug-fix", {"report", "leftovers"})):
             steps = skills.steps(ROOT / "skills" / "eng" / skill / "SKILL.md")
             opening = [n for n, _, text, _ in steps if "../open-pr/SKILL.md" in text]
             last = steps[-1]
             self.assertEqual(opening, [last[0]], skill)
             self.assertTrue(last[3], skill)
-            self.assertLessEqual({"report", "leftovers"}, {" ".join(args) for _, _, args in gates.named(last[2])}, skill)
+            self.assertLessEqual(final, {" ".join(args) for _, _, args in gates.named(last[2])}, skill)
 
     def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
         mandatory = self.gated_mandatory_steps("plan-feature")
-        self.assertEqual(mandatory, {2: set(), 6: {"phases"}})
-
+        self.assertEqual(mandatory, {5: {"phases"}})
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,8 @@
 # Phase plan
 
-`plan.md` in the plan folder. The feature skill reads it phase by phase, so every phase entry keeps every field.
+A plan folder holds `plan.md` (decisions, acceptance, phases), `spec.md` (the design), and `phases/<nn>-<name>/plan.md` (each phase's checks). The feature skill reads `plan.md` phase by phase, so every phase entry keeps every field.
+
+## plan.md
 
 ```
 # <Feature> plan
@@ -29,7 +31,24 @@
 
 - A phase lands and reverts alone. When it cannot ship visible to users, name the flag that hides it.
 - Heavy decides where expensive checks run: a native shell or perf check runs only in the phase that changes it.
-- Every check has a Tier per `../../verify/references/plan.md`. An `e2e` check is a script that starts an instance on every rerun of its phase, so give that tier only to what a unit test cannot see and what costs most when broken, at most 10 per phase.
-- Each phase plan holds the Drive contract for its e2e and walk checks and its Sensitive paths, both written from the design, so the feature skill locks them with the checks.
+- Every check has a Tier per `../../verify/references/plan.md`. An `e2e` check is a script that starts a real instance and runs for minutes on every rerun of its phase, so keep it to core behavior a unit spec cannot see. Fewer is better, and 10 per phase is a ceiling, not a target.
+- A phase plan holds its checks and its perf decision only. Its feature run adds the Drive contract and the Sensitive paths at its design step, from `spec.md` and the code as it is then, because names move with the design.
 - No phase reruns another phase's scripts, so each phase's plan holds Regression checks for the earlier behavior it could break.
 - Changes is the only way an earlier phase's check stops holding. The phase that changes it holds a check with the new predicate in its own plan, so the change is never silent.
+
+## spec.md
+
+```
+# <Feature> spec
+
+<The whole design, in the sections it needs: the data shape and who owns it, the modules and their boundaries, the flows, the wire and storage formats, failure behavior, and the names the design builds (routes, HTTP paths, commands and flags, test ids and accessible names, wire and event names, file paths). Fold in the skeleton's notes and its rationale's decisions.>
+
+## Change log
+
+- <phase folder name>: <what changed, why, and which later phases it affects>
+- <phase folder name>: no design change
+```
+
+- `spec.md` is the one design document. No phase keeps design decisions in a file of its own, because a later phase reads only the spec.
+- Any later phase may change `spec.md` and the plans of the phases after it, at its design step or whenever building shows the design was wrong. Each change adds a Change log line, and every later phase plan it touches is updated in the same edit.
+- Before its PR, every phase leaves a Change log line naming its folder, `<phase folder name>: no design change` when nothing moved, and `verify.py spec` checks it.
