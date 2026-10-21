@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -22,6 +23,9 @@ TEMPLATES = ROOT / "skills" / "eng" / "verify" / "references"
 spec = importlib.util.spec_from_file_location("verify", VERIFY)
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
+AUTORUN_HOME = tempfile.TemporaryDirectory()
+os.environ.update(AUTORUN_HOME=AUTORUN_HOME.name, VERIFY_MAX_LOAD_RATIO="1000")
+os.environ.pop("AUTORUN_RUN", None)
 
 CONTRACT = """
     ## Drive contract
@@ -41,7 +45,6 @@ CHECKS = """\
     - Pass: stdout parses as JSON and holds 3 records
     - Oracle: n/a: the output format is checked, no value is computed
     - Tier: e2e
-    - Touches: `src/export/**`, `bin/export`
     """
 PERF_NA = "\n## Perf\n\nn/a: only the help text changes, nothing a user waits on\n"
 PERF_MAIN = """
@@ -54,7 +57,6 @@ PERF_MAIN = """
     - Probe: hyperfine 'export --json' on main and head, interleaved
     - Baseline: main
     - Rule: fails when p50 is more than 5% slower than main or any query is added
-    - Touches: `src/export/**`
     """
 REPORT = """\
     # Verification report: json export
@@ -68,11 +70,12 @@ REPORT = """\
     |---|---|---|---|
     | B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |
     | P1 | PASS | P1-runs.txt | p50 41 ms on both sides |
-
-    ## Review
-
-    none found
     """
+REVIEW_MD = "# Code review\n\n## Review\n\nHead: {head}\n\n{findings}\n\n## Fix review\n\nHead: {fixed}\n\n{fix_findings}\n"
+
+
+def review_md(head="abc123", fixed=None, findings="none found", fix_findings="none found"):
+    return REVIEW_MD.format(head=head, fixed=fixed or head, findings=findings, fix_findings=fix_findings)
 
 UNIT = """
     ### U1. Multiplying two numbers
@@ -182,6 +185,7 @@ class Verify(unittest.TestCase):
         self.write("B1-terminal.txt", "[{...}]\n")
         self.write("P1-runs.txt", "41 ms\n")
         self.write("report.md", plan(REPORT))
+        self.write("review.md", review_md())
 
     def test_accepts_a_report_with_evidence_for_every_check(self):
         self.ready_report()
@@ -290,14 +294,13 @@ class Verify(unittest.TestCase):
     - Seed: tiers dataset
     - Shape: {"<tier>": <revenue in cents>}
     - Tier: e2e
-    - Touches: `src/revenue/**`
     """
 
     def oracle_plan(self, oracle=ORACLE):
         self.write("plan.md", plan(CHECKS, oracle, PERF_NA))
 
     def test_every_check_states_its_oracle(self):
-        bare = self.ORACLE.split("    - Oracle:")[0] + "    - Tier: e2e\n    - Touches: `src/revenue/**`\n"
+        bare = self.ORACLE.split("    - Oracle:")[0] + "    - Tier: e2e\n"
         self.oracle_plan(bare)
         self.assertIn("missing '- Oracle:'", self.run_verify("plan", ok=False))
         self.oracle_plan(bare + "    - Oracle: n/a: x\n")
@@ -332,6 +335,7 @@ class Verify(unittest.TestCase):
         self.write("A1.expected.json", '{"wholesale": 1200, "retail": 300}')
         self.write("A1.observed.json", '{"wholesale": 1200, "retail": 310}')
         self.write("report.md", self.oracle_report())
+        self.write("review.md", review_md())
         out = self.run_verify("report", ok=False)
         self.assertIn("differs from the oracle", out)
         self.assertIn("$.retail: expected 300, observed 310", out)
@@ -416,17 +420,46 @@ class Verify(unittest.TestCase):
 
     def test_rerun_jobs_runs_scripts_side_by_side_and_reports_them_in_id_order(self):
         self.meeting_checks()
-        self.assertRegex(self.run_verify("rerun", ok=False), r"FAIL\s+B1.*\n\s+B2 never ran beside it")
+        self.assertRegex(self.run_verify("rerun", "--jobs", "1", ok=False), r"FAIL\s+B1.*\n\s+B2 never ran beside it")
         self.meeting_checks()
         out = self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
         self.assertRegex(out, r"^PASS\s+B1 .*\nPASS\s+B2 .*\nrerun: 2 checks, 2 PASS, 0 FAIL\n$")
         self.assertEqual((self.dir / "B2.rerun.log").read_text(), "rerun: PASS\n")
 
-    def test_rerun_jobs_admits_another_script_only_while_the_machine_has_capacity(self):
-        self.meeting_checks()
-        out = self.run_verify("rerun", "--jobs", "2", ok=False, env={"VERIFY_MAX_LOAD_RATIO": "0.000001"})
-        self.assertRegex(out, r"FAIL\s+B1.*\n\s+B2 never ran beside it")
-        self.assertRegex(out, r"PASS\s+B2")
+    def capacity_rerun(self, load, wait=1.0):
+        args = mock.Mock(only=None, rest=[], jobs=None, timeout=30, force=False, full_reason=None)
+        with mock.patch.multiple(verify, CAPACITY_POLL_S=0.05, CAPACITY_WAIT_S=wait, ADMIT_POLL_S=0.05, WATCH_POLL_S=0.05), \
+                mock.patch.object(verify.os, "getloadavg", side_effect=lambda: (load(),) * 3), \
+                mock.patch.object(verify.os, "cpu_count", return_value=4), mock.patch.dict(os.environ):
+            os.environ.pop("VERIFY_MAX_LOAD_RATIO", None)
+            try:
+                return verify.cmd_rerun(self.dir, args)
+            except verify.Failed as e:
+                return str(e)
+
+    def test_rerun_starts_a_script_only_while_the_machine_has_capacity_and_requeues_one_that_waits_too_long(self):
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; touch "$d/B1.started"; echo "verify: ready"; sleep 0.2\n')
+        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.rerun.log" ] || { echo "started beside B1 without capacity"; exit 1; }\n')
+        out = self.capacity_rerun(lambda: 3.0 if (self.dir / "B1.started").exists() and not (self.dir / "B1.rerun.log").exists() else 0.0)
+        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertNotIn("REQUEUED", out)
+        self.new_prove()
+        for name in ("rerun.stamp.json", "B1.started", "B1.rerun.log"):
+            (self.dir / name).unlink(missing_ok=True)
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; touch "$d/B1.started"; echo "verify: ready"; sleep 1.5\n')
+        out = self.capacity_rerun(lambda: 3.0 if (self.dir / "B1.started").exists() and not (self.dir / "B1.rerun.log").exists() else 0.0)
+        self.assertRegex(out, r"REQUEUED B2  waited 0\.01\d* min for capacity \(load 3\.0 on 4 cores, threshold 2\.8\); queued again behind the rest\n")
+        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertIn("rerun: 2 checks, 2 PASS, 0 FAIL, 1 requeued", out)
+
+    def test_a_script_that_waits_twice_for_capacity_is_not_run_and_fails_the_rerun(self):
+        self.check_script("B1.check.sh", "exit 0\n")
+        out = self.capacity_rerun(lambda: 9.0, wait=0.2)
+        self.assertIn("REQUEUED B1  waited", out)
+        self.assertRegex(out, r"NOT RUN B1  \(0\.0s\)  waited .* twice; run it with --only B1 once the machine has room")
+        self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 not run for lack of capacity, 1 requeued", out)
+        self.assertFalse((self.dir / "B1.rerun.log").exists())
+        self.assertNotIn("B1", json.loads((self.dir / "rerun.ledger.json").read_text()))
         self.assertIn("--jobs needs at least 1", subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--jobs", "0", "--dir", str(self.dir)],
                                                                 capture_output=True, text=True).stderr)
 
@@ -460,11 +493,11 @@ class Verify(unittest.TestCase):
 
         def load():
             path = self.dir / "B2.count"
-            overloaded = path.exists() and path.read_text().strip() == "1"
+            overloaded = path.exists() and path.read_text().strip() == "1" and not (self.dir / "B1.done").exists()
             return (100.0 if overloaded else 0.0,) * 3
 
         args = mock.Mock(only=None, rest=[], jobs=3, timeout=30, force=False)
-        with mock.patch.multiple(verify, WATCH_POLL_S=0.05, OVERLOAD_S=0.3, ADMIT_POLL_S=0.05), \
+        with mock.patch.multiple(verify, WATCH_POLL_S=0.05, OVERLOAD_S=0.3, ADMIT_POLL_S=0.05, CAPACITY_POLL_S=0.05), \
                 mock.patch.object(verify, "default_roots", lambda d: [str(d)]), \
                 mock.patch.object(verify.os, "getloadavg", side_effect=load), mock.patch.object(verify.os, "cpu_count", return_value=4), \
                 mock.patch.dict(os.environ):
@@ -474,7 +507,7 @@ class Verify(unittest.TestCase):
         out = str(raised.exception)
         self.assertRegex(out, r"REQUEUED B2  load 100\.0 on 4 cores for 0s; stopped and queued again, --jobs now 1\n")
         self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 .*\nFAIL\s+B3 ")
-        self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL, 1 requeued under load", out)
+        self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL, 1 requeued", out)
         self.assertEqual((self.dir / "B2.count").read_text(), "2\n")
         self.assertEqual((self.dir / "B3.runs").read_text(), "x\n")
         self.assertFalse((self.dir / "fix-attempts.json").exists())
@@ -511,6 +544,7 @@ class Verify(unittest.TestCase):
         self.run_verify("freeze")
         self.write("B1-terminal.txt", "[{...}]\n")
         self.write("report.md", plan(REPORT).replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", ""))
+        self.write("review.md", review_md())
 
     def test_an_e2e_pass_needs_its_script_and_a_passing_rerun_after_the_freeze(self):
         self.b1_report()
@@ -565,26 +599,69 @@ class Verify(unittest.TestCase):
         self.assertIn("tiers: e2e 10, unit 1, walk 1", self.run_verify("plan"))
         self.write("plan.md", plan(head, *self.e2e_checks(11), PERF_NA))
         out = self.run_verify("plan", ok=False)
-        self.assertIn("11 e2e checks (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11), more than 10. Keep the 10 most important, "
-                      "the riskiest and costliest-to-break behavior, and move the rest to the unit tier or drop them, or split the phase", out)
+        self.assertIn("11 e2e checks (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11), more than 10. E2E is the most expensive tier, "
+                      "so fewer is better: keep only core behavior no unit spec can see, and 10 is a ceiling, not a target. Move the "
+                      "rest to the unit tier or drop them, or split the phase", out)
         self.write("plan.md", plan(head, *self.e2e_checks(10), PERF_MAIN))
         self.assertIn("11 e2e checks", self.run_verify("plan", ok=False))
 
-    def test_every_e2e_check_names_the_path_globs_it_touches(self):
-        self.write("plan.md", plan(CHECKS.replace("    - Touches: `src/export/**`, `bin/export`\n", ""), PERF_NA))
-        self.assertIn(":9: B1 is an e2e check but has no '- Touches:'. List the repository paths its scenario runs through as "
-                      "globs in backticks, comma separated, like `packages/server/src/**`, so `verify.py affected` reruns it when "
-                      "a later change touches one", self.run_verify("plan", ok=False))
-        self.write("plan.md", plan(CHECKS.replace("`src/export/**`, `bin/export`", ""), PERF_NA))
-        self.assertIn(":17: B1's Touches is empty; list the path globs its scenario runs through", self.run_verify("plan", ok=False))
-        self.write("plan.md", plan(CHECKS.replace("`src/export/**`, `bin/export`", "`src/export/**`, bin/export"), PERF_NA))
-        self.assertIn(":17: B1's Touches must list path globs in backticks, comma separated, like `packages/agent-host/**`, "
-                      "`packages/server/src/**`", self.run_verify("plan", ok=False))
-        self.write("plan.md", plan(CHECKS.replace("`src/export/**`, `bin/export`", "`<path glob>`"), PERF_NA))
-        self.assertIn(":17: Touches still holds a template placeholder", self.run_verify("plan", ok=False))
-        self.write("plan.md", plan(CHECKS, PERF_MAIN.replace("    - Touches: `src/export/**`\n", "")))
-        self.assertIn("P1 is an e2e check but has no '- Touches:'", self.run_verify("plan", ok=False))
-        self.write("plan.md", plan(CHECKS, UNIT, WALK, PERF_MAIN))
+    def test_a_check_outside_the_checks_and_perf_sections_is_refused(self):
+        self.write("plan.md", plan(CHECKS, PERF_NA, self.WALK_CONTRACT, UNIT.replace("U1", "U2")))
+        self.assertIn("U2 sits under '## Drive contract', where no gate reads it; checks go under '## Checks' or '## Perf'",
+                      self.run_verify("plan", "--checks", ok=False))
+
+    def test_touches_is_no_longer_asked_for_and_is_ignored_when_present(self):
+        self.write("plan.md", plan(CHECKS, PERF_NA))
+        self.run_verify("plan")
+        self.write("plan.md", plan(CHECKS.replace("    - Tier: e2e\n", "    - Tier: e2e\n    - Touches: <path glob>\n"), PERF_NA))
+        self.run_verify("plan")
+
+    def test_plan_checks_checks_the_checks_part_before_any_drive_contract_exists(self):
+        bare = CHECKS.replace(CONTRACT, "\n")
+        self.write("plan.md", plan(bare, WALK, PERF_NA, "\n## Sensitive paths\n\n- <path or glob>: <why>\n"))
+        self.assertIn("checks ok, 2 checks, 0 oracle checks; tiers: e2e 1, unit 0, walk 1", self.run_verify("plan", "--checks"))
+        out = self.run_verify("plan", ok=False)
+        self.assertIn("no '## Drive contract'", out)
+        self.assertIn("Sensitive paths still holds a template placeholder", out)
+        self.write("plan.md", plan(bare, PERF_NA).replace("- Tier: e2e", "- Tier: smoke"))
+        self.assertIn("Tier must be e2e, unit, or walk", self.run_verify("plan", "--checks", ok=False))
+        self.write("plan.md", plan(bare.split("## Checks\n")[0], "## Checks\n", *self.e2e_checks(11)))
+        out = self.run_verify("plan", "--checks", ok=False)
+        self.assertIn("11 e2e checks", out)
+        self.assertIn("missing '## Perf' section", out)
+
+    NAMED = """
+    ### B2. Export over HTTP
+
+    - Scenario: `POST /api/projects/p1/export` with `--format json` on a project with 3 records, then `GET /api/exports?latest=1`
+    - Surface: the HTTP API
+    - Evidence: B2.rerun.log
+    - Pass: the response holds 3 records and `--dry-run` writes nothing; `/health` stays 200 and `exportJson()` is called once
+    - Oracle: n/a: the output format is checked, no value is computed
+    - Tier: e2e
+    """
+
+    def test_every_http_path_and_cli_flag_a_driven_check_names_is_in_the_drive_contract(self):
+        self.write("plan.md", plan(CHECKS, self.NAMED, PERF_NA))
+        out = self.run_verify("plan", ok=False)
+        self.assertIn(":20: B2's Scenario names `/api/projects/p1/export`, which the '## Drive contract' does not list. Settle "
+                      "every HTTP path a check drives there before code", out)
+        self.assertIn("B2's Scenario names `--format`, which the '## Drive contract' does not list. Settle every CLI flag", out)
+        self.assertIn("B2's Scenario names `/api/exports`", out)
+        self.assertIn(":23: B2's Pass names `--dry-run`", out)
+        self.assertIn("B2's Pass names `/health`", out)
+        self.assertNotIn("exportJson", out)
+        self.run_verify("plan", "--checks")
+        contract = CONTRACT + ("    - `POST /api/projects/:id/export`: starts an export; B2 drives it\n"
+                               "    - `GET /api/exports`, `/health`: read the latest export and the liveness probe\n"
+                               "    - flags `--format json` and `--dry-run` of the export command\n")
+        self.write("plan.md", plan(CHECKS.replace(CONTRACT, contract), self.NAMED, PERF_NA))
+        self.run_verify("plan")
+        self.write("plan.md", plan(CHECKS.replace(CONTRACT, contract.replace("/api/projects/:id/export", "/api/projects/:id")), self.NAMED, PERF_NA))
+        self.assertIn("names `/api/projects/p1/export`", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS.replace(CONTRACT, contract.replace("`--dry-run`", "`--dry`")), self.NAMED, PERF_NA))
+        self.assertIn("names `--dry-run`", self.run_verify("plan", ok=False))
+        self.write("plan.md", plan(CHECKS, self.NAMED.replace("Tier: e2e", "Tier: unit").replace("B2.rerun.log", "units.log"), PERF_NA))
         self.run_verify("plan")
 
     def test_sensitive_paths_cannot_keep_the_template_placeholder(self):
@@ -599,6 +676,7 @@ class Verify(unittest.TestCase):
         report = plan(REPORT).replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |\n", "").replace(
             "| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |", "| W1 | PASS | evidence/W1/ | Export right of Share |")
         self.write("report.md", report)
+        self.write("review.md", review_md())
         folder = self.dir / "evidence" / "W1"
         folder.mkdir(parents=True)
         (folder / "notes.txt").write_text("walked at 390 px\n")
@@ -609,49 +687,50 @@ class Verify(unittest.TestCase):
         (folder / "share-row.PNG").write_text("png")
         self.assertIn("report ok: 1 checks", self.run_verify("report"))
 
-    def test_the_report_needs_a_triaged_code_review_written_after_the_freeze(self):
+    def test_the_report_needs_a_triaged_review_and_fix_review_written_after_the_freeze(self):
         self.ready_report()
-        without = plan(REPORT).split("## Review")[0]
-        self.write("report.md", without)
-        self.assertIn("missing the code review: a '## Review' section in report.md or review.md", self.run_verify("report", ok=False))
-        self.write("report.md", without + "## Review\n\n- src/auth.ts:42 a revoked token still reads the old account's rows.\n")
-        self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
-        self.write("report.md", without)
+        (self.dir / "review.md").unlink()
+        self.assertIn("no review.md. The reviewer writes a '## Review' section", self.run_verify("report", ok=False))
         finding = "- src/auth.ts:42 a revoked token still reads the old account's rows."
-        self.write("review.md", f"# Code review\n\nHead: abc123\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\n{finding}\n")
+        self.write("review.md", review_md(findings=finding))
         self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
-        self.write("review.md", f"# Code review\n\n## Review\n\n{finding} Triage: new check, R1 proves revocation\n")
+        self.write("review.md", review_md(findings=f"{finding} Triage: new check, R1 proves revocation", fix_findings=finding))
+        self.assertIn("fix review finding has no 'Triage:", self.run_verify("report", ok=False))
+        self.write("review.md", review_md(findings=f"{finding} Triage: fixed in abc124",
+                                          fix_findings=f"{finding} Triage: dismissed, the token check runs first on line 30"))
         self.run_verify("report")
-        self.write("report.md", without + "## Review\n\nIn review.md.\n")
-        self.write("review.md", f"# Code review\n\n{finding}\n")
-        self.assertIn("review finding has no 'Triage:", self.run_verify("report", ok=False))
-        self.write("review.md", f"# Code review\n\n{finding} Triage: dismissed, the token check runs first on line 30\n")
-        self.run_verify("report")
+        self.write("review.md", review_md().split("## Fix review")[0])
+        self.assertIn("review.md has no '## Fix review' section", self.run_verify("report", ok=False))
+        self.write("review.md", "# Code review\n\nHead: abc123\n\n## Review\n\nnone found\n\n## Fix review\n\n\n")
+        out = self.run_verify("report", ok=False)
+        self.assertIn("the '## Review' section of review.md names no 'Head:' line", out)
+        self.assertIn("the '## Fix review' section of review.md is empty", out)
+        self.write("review.md", review_md())
         os.utime(self.dir / "review.md", (1, 1))
         self.assertIn("the review in review.md predates the frozen plan", self.run_verify("report", ok=False))
 
     FAIL_REPORT = "| Check | Verdict | Evidence | Observed |\n|---|---|---|---|\n| B2 | FAIL | B2.rerun.log | defect: 2 rows, expected 3 |\n"
 
-    def test_a_check_the_report_marks_fail_gets_two_failed_fix_attempts_then_rerun_only_refuses(self):
+    def test_a_check_the_report_marks_fail_gets_two_failed_fix_attempts_then_every_rerun_skips_it(self):
         self.check_script("B1.check.sh", "exit 0\n")
         self.check_script("B2.check.sh", "echo still 2 rows\nexit 1\n")
         self.assertNotIn("fix attempt", self.run_verify("rerun", "--only", "B2", ok=False))
         self.assertFalse((self.dir / "fix-attempts.json").exists())
         self.write("report.md", self.FAIL_REPORT)
         self.assertIn("fix attempt 1 of 2 for B2 failed\n", self.run_verify("rerun", "--only", "B2", ok=False))
-        self.assertIn("fix attempt 2 of 2 for B2 failed; that was the last one, so the next rerun --only refuses it",
+        self.assertIn("fix attempt 2 of 2 for B2 failed; that was the last one, so the next rerun skips it",
                       self.run_verify("rerun", "--only", "B2", ok=False))
-        out = self.run_verify("rerun", "--only", "B2", ok=False)
-        self.assertIn("B2 failed 2 fix attempts since report.md marked them FAIL, the whole fix budget", out)
+        out = self.run_verify("rerun", "--only", "B1", "B2")
+        self.assertIn("SKIP  B2  its fix budget is spent: 2 failed fix attempts since report.md marked it FAIL", out)
         self.assertIn("in an autonomous run put it in the project's backlog with the fix you recommend and leave it FAIL", out)
+        self.assertRegex(out, r"PASS\s+B1 ")
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL, 1 skipped past the fix budget", out)
         self.assertNotIn("still 2 rows", out)
         self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 2})
-        out = self.run_verify("rerun")
-        self.assertRegex(out, r"FAIL\s+B2 .*left FAIL: its fix budget is spent and report.md marks it FAIL; exit 1")
-        self.assertIn("rerun: 2 checks, 1 PASS, 1 FAIL (1 left FAIL after the fix budget)", out)
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL, 1 skipped past the fix budget", self.run_verify("rerun"))
         self.new_prove()
         self.check_script("B1.check.sh", "exit 1\n")
-        self.assertIn("rerun: 2 checks, 0 PASS, 2 FAIL (1 left FAIL after the fix budget)", self.run_verify("rerun", ok=False))
+        self.assertIn("rerun: 1 checks, 0 PASS, 1 FAIL, 1 skipped past the fix budget", self.run_verify("rerun", ok=False))
 
     def test_a_fix_that_passes_spends_nothing(self):
         self.check_script("B2.check.sh", "exit 1\n")
@@ -780,7 +859,7 @@ class Driver(unittest.TestCase):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
         (d / "report.md").write_text(report)
-        (d / "review.md").write_text(f"# Code review\n\nHead: {head}\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\nnone found\n")
+        (d / "review.md").write_text(review_md(head))
         self.assertEqual(run("report").returncode, 0, run("report").stdout)
         (self.repo / "app.py").write_text("print('later fix')\n")
         self.commit("Fix after verification")
@@ -802,7 +881,7 @@ class Driver(unittest.TestCase):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         report = plan(REPORT).replace("Head: abc123", f"Head: {head[:9]}").replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
         (d / "report.md").write_text(report)
-        (d / "review.md").write_text(f"# Code review\n\nHead: {head}\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\nnone found\n")
+        (d / "review.md").write_text(review_md(head))
         self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "Regroup commits")
         out = run("report")
         self.assertEqual(out.returncode, 0, out.stdout)
@@ -813,84 +892,87 @@ class Driver(unittest.TestCase):
         self.assertEqual(out.returncode, 1)
         self.assertIn("but HEAD is now", out.stdout)
 
-    def reviewed_report(self, sensitive=""):
+    def reviewed_report(self):
         d = pathlib.Path(self.tmp.name) / "verification"
         d.mkdir()
-        (d / "plan.md").write_text(plan(CHECKS, PERF_NA) + sensitive)
-        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        (d / "plan.md").write_text(plan(CHECKS, PERF_NA))
         def run(*a):
-            return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True, env=env)
+            return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True,
+                                  env={**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")})
         run("freeze")
         (d / "B1.check.sh").write_text("exit 0\n")
         run("rerun")
         (d / "B1-terminal.txt").write_text("[{...}]\n")
-        reviewed = self.head()
-        (d / "review.md").write_text(f"# Code review\n\nHead: {reviewed}\nReviewer: codex:gpt-5.6-sol\n\n## Review\n\nnone found\n")
+        (d / "review.md").write_text(review_md(self.head()))
         def report():
             (d / "report.md").write_text(plan(REPORT).replace("Head: abc123", f"Head: {self.head()}")
                                          .replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", ""))
             return run("report")
-        return d, report
+        return d, report, run
 
     def head(self):
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
 
-    def test_a_fix_diff_over_200_lines_after_the_review_needs_a_triaged_fix_review(self):
-        d, report = self.reviewed_report()
-        (self.repo / "app.py").write_text("".join(f"print({n})\n" for n in range(199)))
-        self.commit("Fix the empty search")
-        out = report()
-        self.assertEqual(out.returncode, 0, out.stdout)
-        (self.repo / "app.py").write_text("".join(f"print({n})\n" for n in range(200)))
-        self.commit("Fix paging")
-        out = report()
+    def test_the_review_gate_needs_a_fix_review_of_heads_product_tree(self):
+        d, report, run = self.reviewed_report()
+        reviewed = self.head()
+        self.assertEqual(run("review").stdout, "review ok: the review and the fix review name the Head they read and triage every finding\n")
+        (self.repo / "app.py").write_text("print('fixed')\n")
+        self.commit("Fix the review's finding")
+        out = run("review")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("the fixes since the reviewed Head", out.stdout)
-        self.assertIn("change 201 lines, over 200, so they need a fix review: the reviewer reviews that diff once into a "
-                      "'## Fix review' section of review.md", out.stdout)
-        review = (d / "review.md").read_text()
-        (d / "review.md").write_text(review + "\n## Fix review\n\n- app.py:3 paging skips the last row.\n")
-        self.assertIn("fix review finding has no 'Triage:", report().stdout)
-        (d / "review.md").write_text(review + "\n## Fix review\n\n- app.py:3 paging skips the last row. Triage: dismissed, row 200 is the sentinel\n")
-        out = report()
-        self.assertEqual(out.returncode, 0, out.stdout)
-        (self.repo / "app.py").write_text("".join(f"print({n})\n" for n in range(201)))
-        self.git("add", "-A")
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "Fix the fix review's finding"], cwd=self.repo,
-                       check=True, capture_output=True, env={**os.environ, "GIT_COMMITTER_DATE": "2099-01-01T00:00:00Z"})
-        out = report()
-        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn(f"the fix review read {reviewed[:12]}, but product files changed since: app.py. The fix review covers every "
+                      "review fix, so its Head is HEAD or a commit with HEAD's product tree", out.stdout)
+        fixed = self.head()
+        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings="- app.py:1 prints the wrong word."))
+        self.assertIn("fix review finding has no 'Triage:", run("review").stdout)
+        (d / "review.md").write_text(review_md(reviewed, fixed, fix_findings="- app.py:1 prints the wrong word. Triage: fixed in the next commit"))
+        self.assertEqual(run("review").returncode, 0)
+        (self.repo / "app.py").write_text("print('right')\n")
+        self.commit("Fix the fix review's finding")
+        self.assertEqual(run("review").returncode, 0, "fixes for the fix review's own findings follow it")
+        (d / "review.md").write_text(review_md(reviewed, fixed))
+        self.assertEqual(run("review").returncode, 1)
+        self.add_driver()
+        self.commit("Extend the driver")
+        (d / "review.md").write_text(review_md(reviewed, self.head(), fix_findings="none found"))
+        self.assertEqual(run("review").returncode, 0)
+        (d / "review.md").write_text(review_md("0123456789ab"))
+        self.assertIn("review.md reviewed Head 0123456789ab, which is not a commit in this repository", run("review").stdout)
 
-    def test_a_small_fix_on_a_sensitive_path_needs_no_fix_review(self):
-        d, report = self.reviewed_report("\n## Sensitive paths\n\n- `auth/`: sessions and tokens\n")
-        (self.repo / "auth").mkdir()
-        (self.repo / "auth" / "token.py").write_text("print('revoke')\n")
-        self.commit("Revoke the token on sign-out")
-        out = report()
-        self.assertEqual(out.returncode, 0, out.stdout)
-
-    def test_an_e2e_pass_needs_a_run_that_no_later_change_to_its_touches_made_stale(self):
-        d, report = self.reviewed_report()
-        self.assertEqual(report().returncode, 0)
+    def test_an_e2e_pass_needs_a_passing_run_with_no_later_product_change(self):
+        d, report, run = self.reviewed_report()
+        self.assertEqual(report().returncode, 0, report().stdout)
         ledger = json.loads((d / "rerun.ledger.json").read_text())["B1"]
+        self.add_driver()
+        self.commit("Add the driver")
+        out = report()
+        self.assertEqual(out.returncode, 0, out.stdout)
         (self.repo / "src" / "export").mkdir(parents=True)
         (self.repo / "src" / "export" / "json.py").write_text("print('json')\n")
         self.commit("Export JSON")
         out = report()
         self.assertEqual(out.returncode, 1)
-        self.assertIn(f"B1 is an e2e check marked PASS, but it is stale: src/export/json.py changed since its latest rerun at "
-                      f"{ledger['at']} on {ledger['head'][:12]}, matching its Touches; run `verify.py rerun --only $(verify.py affected)`",
-                      out.stdout)
-        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
-        subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--only", "B1", "--dir", str(d)], cwd=self.repo, check=True, capture_output=True, env=env)
+        self.assertIn(f"B1 is an e2e check marked PASS, but product files changed since its latest passing run at {ledger['at']} on "
+                      f"{ledger['head'][:12]}: src/export/json.py; rerun it once every fix has landed", out.stdout)
+        (self.repo / "app.py").write_text("print('uncommitted')\n")
+        self.assertIn("1 PASS", run("rerun", "--only", "B1").stdout)
+        self.assertEqual(json.loads((d / "rerun.ledger.json").read_text())["B1"]["product_dirty"], ["app.py"])
+        self.git("checkout", "--", "app.py")
+        out = report()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("graded uncommitted product changes (app.py); commit them, then rerun it", out.stdout)
+        run("rerun", "--only", "B1")
         out = report()
         self.assertEqual(out.returncode, 0, out.stdout)
 
-    def test_the_review_must_name_the_head_it_read(self):
-        d, report = self.reviewed_report()
-        (d / "review.md").write_text("# Code review\n\n## Review\n\nnone found\n")
-        self.assertIn("review.md names no 'Head:' line", report().stdout)
-        (d / "review.md").write_text("# Code review\n\nHead: 0123456789ab\n\n## Review\n\nnone found\n")
+    def test_the_report_needs_the_review_heads(self):
+        d, report, run = self.reviewed_report()
+        (d / "review.md").write_text("# Code review\n\n## Review\n\nnone found\n\n## Fix review\n\nnone found\n")
+        out = report().stdout
+        self.assertIn("the '## Review' section of review.md names no 'Head:' line", out)
+        self.assertIn("the '## Fix review' section of review.md names no 'Head:' line", out)
+        (d / "review.md").write_text(review_md("0123456789ab"))
         self.assertIn("review.md reviewed Head 0123456789ab, which is not a commit in this repository", report().stdout)
 
     def test_where_names_the_repo_and_branch(self):
@@ -1010,10 +1092,14 @@ class RerunStamp(unittest.TestCase):
         digest = hashlib.sha256((self.dir / "B1.check.sh").read_bytes()).hexdigest()
         self.assertEqual((lock["head"], lock["files"], lock["full_reruns"], lock["script_fixes"]), (head, {"B1.check.sh": digest}, [], []))
         (self.repo / "app.py").write_text("print('fixed')\n")
-        refusal = (f"verify rerun: the prove's full rerun already ran at {lock['at']}. Grade later changes with "
-                   "`verify.py rerun --only $(verify.py affected)`, which reruns only the checks a change can break. A full rerun "
-                   "needs --full-reason \"<why; agreed by whom>\", and the report lists it.\n")
+        refusal = (f"verify rerun: the prove's full rerun already ran at {lock['at']}. Grade later changes with nothing: every "
+                   "check's latest run passed on HEAD's product code. A full rerun needs --full-reason \"<why; agreed by whom>\", and "
+                   "the report lists it.\n")
         self.assertEqual(self.rerun(ok=False), refusal)
+        self.git("commit", "-qam", "Fix")
+        self.assertIn("Grade later changes with `verify.py rerun --only B1`, the checks whose latest run failed or predates a product "
+                      "change. A full rerun needs", self.rerun(ok=False))
+        self.git("reset", "-q", "--soft", "HEAD~1")
         self.assertEqual(self.rerun("--full-reason", "rebuilt", ok=False), refusal)
         self.assertIn("1 PASS", self.rerun("--only", "B1"))
         self.assertIn("1 PASS", self.rerun(*self.REASON))
@@ -1056,20 +1142,22 @@ class RerunStamp(unittest.TestCase):
         self.rerun()
         stamp = (self.dir / "rerun.stamp.json").read_text()
         out = self.rerun("--only", "B2", "--only", "B2")
-        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the ledger records these runs, and `verify.py affected` lists "
-                      "what is still stale)", out)
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL (--only: no stamp; the ledger records these runs)", out)
         self.assertNotIn("B1", out)
         self.assertEqual(self.runs(), 1)
         self.assertEqual(len((self.dir / "runs2.txt").read_text().split()), 2)
         self.assertEqual((self.dir / "rerun.stamp.json").read_text(), stamp)
         self.assertIn("nothing changed", self.rerun())
 
-    def test_a_check_left_fail_after_its_fix_budget_passes_the_full_rerun_and_shows_in_the_stamp(self):
+    def test_a_check_left_fail_after_its_fix_budget_is_skipped_by_the_full_rerun_and_shows_in_the_stamp(self):
         self.script("B2.check.sh", "exit 1\n")
         (self.dir / "report.md").write_text("| Check | Verdict | Evidence | Observed |\n|---|---|---|---|\n| B2 | FAIL | B2.rerun.log | defect: x |\n")
-        self.rerun("--only", "B2", ok=False)
-        self.rerun("--only", "B2", ok=False)
-        self.assertIn("rerun: 2 checks, 1 PASS, 1 FAIL (1 left FAIL after the fix budget)", self.rerun())
+        self.assertIn("fix attempt 1 of 2", self.rerun("--only", "B2", ok=False))
+        self.assertIn("B2 still fails with no product or script change since its previous failing run, so this run is not a fix attempt",
+                      self.rerun("--only", "B2", ok=False))
+        (self.repo / "app.py").write_text("print('fix 1')\n")
+        self.assertIn("fix attempt 2 of 2", self.rerun("--only", "B2", ok=False))
+        self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL, 1 skipped past the fix budget", self.rerun())
         out = self.rerun()
         self.assertRegex(out, r"^rerun: 2 checks passed at \S+ on this tree except B2, left FAIL after the fix budget; nothing changed since")
 
@@ -1089,7 +1177,6 @@ class Phases(unittest.TestCase):
     - Pass: the diff against skeleton.patch is empty, or each difference is in the design addendum with the user's agreement
     - Oracle: n/a: compares signatures, no value is computed
     - Tier: e2e
-    - Touches: `src/export.ts`
     - Skeleton: src/export.ts: exportJson, ExportOptions
     """
 
@@ -1133,10 +1220,9 @@ class Phases(unittest.TestCase):
         self.write_phase("01-json", plan(CHECKS))
         self.assertIn("missing '## Perf' section", self.phases(str(self.root), ok=False))
 
-    def test_refuses_a_phase_without_a_drive_contract_or_over_the_e2e_cap(self):
+    def test_a_phase_plan_holds_checks_only_and_stays_under_the_e2e_cap(self):
         self.write_phase("01-json", plan(CHECKS.replace(CONTRACT, "\n"), PERF_NA))
-        self.assertIn("01-json/plan.md:1: B1 is an e2e or walk check, but the plan has no '## Drive contract'",
-                      self.phases(str(self.root), ok=False))
+        self.assertIn("phases ok: 1 phases, 1 checks", self.phases(str(self.root)))
         head, body = CHECKS.split("## Checks\n")
         self.write_phase("01-json", plan(head, "## Checks\n", *(body.replace("B1", f"E{n}") for n in range(1, 12)), PERF_NA))
         self.assertIn("01-json/plan.md:1: 11 e2e checks", self.phases(ok=False))
@@ -1200,8 +1286,8 @@ class RepoFixture(unittest.TestCase):
             self.put(f"tests/{name}.py", text)
         self.commit("Add mul")
 
-    def verify(self, command, *args, ok=True):
-        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+    def verify(self, command, *args, ok=True, env=None):
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home"), **(env or {})}
         r = subprocess.run([sys.executable, "-I", str(VERIFY), command, *args], cwd=self.repo, capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
         return r.stdout
@@ -1257,20 +1343,321 @@ class Lock(RepoFixture):
         self.verify("freeze")
         self.assertIn("frozen after code existed", self.verify("lock", ok=False))
 
-    def test_adopt_starts_a_phase_from_its_own_base(self):
-        self.feature()
-        folder = self.repo / "docs" / "export" / "phases" / "02-csv"
-        folder.mkdir(parents=True)
-        (folder / "plan.md").write_text(plan(CHECKS, PERF_NA))
-        self.assertIn("adopted 02-csv: 1 checks", self.verify("adopt", str(folder)))
-        self.assertIn("plan locked before code", self.verify("lock"))
+    def phase(self, name="02-csv", text=None):
+        folder = self.repo / "docs" / "export" / "phases" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "plan.md").write_text(text or plan(CHECKS, PERF_NA))
+        return folder
 
-    def test_adopt_refuses_to_replace_a_different_plan(self):
+    def test_adopt_starts_a_phase_from_its_own_base_and_every_command_reads_the_plan_where_it_lives(self):
+        self.feature()
+        folder = self.phase()
+        self.assertIn(f"adopted 02-csv: 1 checks, base {self.rev()[:12]}; every command reads {folder.resolve() / 'plan.md'}",
+                      self.verify("adopt", str(folder)))
+        self.assertFalse(self.where().joinpath("plan.md").exists())
+        self.assertIn(f"{folder.resolve() / 'plan.md'}: plan ok", self.verify("plan"))
+        self.assertIn("plan locked before code", self.verify("lock"))
+        (folder / "plan.md").write_text(plan(CHECKS.replace("3 records", "4 records"), PERF_NA))
+        self.assertIn("plan changed after it was frozen", self.verify("lock", ok=False))
+
+    def test_adopt_needs_only_the_checks_part(self):
+        folder = self.phase(text=plan(CHECKS.replace(CONTRACT, "\n"), PERF_NA))
+        self.verify("adopt", str(folder))
+        self.verify("plan", "--checks")
+        self.assertIn("no '## Drive contract'", self.verify("plan", ok=False))
+
+    def test_adopt_refuses_to_replace_a_different_plan_and_removes_a_matching_copy(self):
         self.write_plan(plan(CHECKS.replace("B1", "Z9"), PERF_NA))
-        folder = pathlib.Path(self.tmp.name) / "plans" / "export" / "phases" / "01-json"
+        folder = self.phase("01-json")
+        self.assertIn("already holds a different plan", self.verify("adopt", str(folder), ok=False))
+        self.write_plan()
+        self.verify("adopt", str(folder))
+        self.assertFalse(self.where().joinpath("plan.md").exists())
+        self.verify("adopt", str(folder))
+        self.assertIn("this branch already adopted", self.verify("adopt", str(self.phase("02-csv")), ok=False))
+
+    def test_an_existing_plan_in_the_verification_directory_without_adopt_keeps_working(self):
+        self.write_plan()
+        self.assertIn(f"{self.where() / 'plan.md'}: plan ok", self.verify("plan"))
+        self.verify("lock")
+
+    B2 = """
+    ### B2. Export writes CSV
+
+    - Scenario: run export --csv on the sample project with 3 records
+    - Surface: a real terminal
+    - Evidence: B2.rerun.log
+    - Pass: stdout parses as CSV and holds 3 rows
+    - Oracle: n/a: the output format is checked, no value is computed
+    - Tier: e2e
+    """
+    CSV = "    - `export --csv`: the CLI command B2 runs\n"
+
+    def locked(self):
+        folder = self.phase()
+        self.verify("adopt", str(folder))
+        self.verify("lock")
+        return folder / "plan.md"
+
+    def revisions(self):
+        return json.loads(self.where().joinpath("plan.lock").read_text())["revisions"]
+
+    def test_added_checks_and_drive_contract_lines_record_themselves(self):
+        path = self.locked()
+        path.write_text(plan(CHECKS.replace(CONTRACT, CONTRACT + self.CSV), self.B2, PERF_NA))
+        self.assertIn("plan changed after it was frozen. Run `verify.py freeze`", self.verify("lock", ok=False))
+        self.assertEqual(self.verify("freeze"), "revision recorded automatically: additions: B2 (Export writes CSV); "
+                                                "Drive contract: `export --csv`\n")
+        self.verify("lock")
+        path.write_text(plan(CHECKS.replace(CONTRACT, CONTRACT + self.CSV).replace("a real terminal", "a terminal"), self.B2, PERF_NA))
+        self.assertIn("other edits: B1 Surface changed", self.verify("freeze"))
+        self.assertEqual([r.get("auto") for r in self.revisions()], [True, True])
+
+    def test_a_changed_predicate_or_a_removed_check_or_contract_line_needs_a_revision(self):
+        path = self.locked()
+        for changed, why in ((plan(CHECKS.replace("3 records", "4 records"), PERF_NA), "B1 Pass changed"),
+                             (plan(CHECKS.replace("Tier: e2e", "Tier: walk"), PERF_NA), "B1 Tier changed"),
+                             (plan(CHECKS.replace("`export --json`", "`export --format json`"), PERF_NA),
+                              "Drive contract line removed or changed: - `export --json`"),
+                             (plan("# Verification plan: none\n\n## Checks\n", UNIT, PERF_NA), "B1 was removed")):
+            path.write_text(changed)
+            out = self.verify("freeze", ok=False)
+            self.assertIn(f"the plan changed after it was frozen, beyond adding checks or Drive contract lines: {why}", out)
+            self.assertIn("--revision \"<what changed and why>\", plus --gate <id> of the autorun gate the user answered", out)
+        path.write_text(plan(CHECKS.replace("3 records", "4 records"), PERF_NA))
+        self.assertEqual(self.verify("freeze", "--revision", "export holds 4 records now; agreed by the user"),
+                         "revision recorded: export holds 4 records now; agreed by the user\n")
+        self.verify("lock")
+
+    def autonomous(self, gates):
+        home = pathlib.Path(self.tmp.name) / "autorun"
+        run = home / "runs" / "r-1"
+        (run / "gates").mkdir(parents=True)
+        (run / "run.json").write_text(json.dumps({"id": "r-1", "status": "active"}))
+        for gate_id, status in gates.items():
+            (run / "gates" / f"{gate_id}.json").write_text(json.dumps({"id": gate_id, "status": status, "kind": "irreversible",
+                                                                         "created": "2026-10-21T10:00:00+0800", "question": "q"}))
+        return {"AUTORUN_HOME": str(home), "AUTORUN_RUN": "r-1"}
+
+    def test_in_an_autonomous_run_a_revision_needs_a_gate_the_user_answered(self):
+        path = self.locked()
+        env = self.autonomous({"g-aaa": "answered", "g-bbb": "open"})
+        path.write_text(plan(CHECKS.replace("3 records", "4 records"), PERF_NA))
+        reason = ("--revision", "export holds 4 records now")
+        self.assertIn("this is autonomous run r-1, so a change to a check needs the user's answer",
+                      self.verify("freeze", *reason, env=env, ok=False))
+        self.assertIn("--gate g-zzz: no gate with that id in autonomous run r-1", self.verify("freeze", *reason, "--gate", "g-zzz", env=env, ok=False))
+        self.assertIn("gate g-bbb is not answered yet (open)", self.verify("freeze", *reason, "--gate", "g-bbb", env=env, ok=False))
+        self.assertIn("revision recorded: export holds 4 records now (gate g-aaa)", self.verify("freeze", *reason, "--gate", "g-aaa", env=env))
+        path.write_text(plan(CHECKS.replace("3 records", "5 records"), PERF_NA))
+        self.assertIn("gate g-aaa already backs the revision of", self.verify("freeze", *reason, "--gate", "g-aaa", env=env, ok=False))
+        path.write_text(plan(CHECKS.replace("3 records", "4 records").replace(CONTRACT, CONTRACT + self.CSV), self.B2, PERF_NA))
+        self.assertIn("revision recorded automatically: additions: B2", self.verify("freeze", env=env))
+        self.assertEqual(self.revisions()[0]["gate"], "g-aaa")
+
+
+class Premises(RepoFixture):
+    TABLE = ("| Check | Premise | Holds | Evidence | Resolution |\n|---|---|---|---|---|\n"
+             "| B1 | export already writes a record list | yes | calc.py:1 | |\n"
+             "| B1, P1 | the CLI \\| parses --json | no | bin/export:3 has no flag parser | {resolution} |\n")
+
+    def setUp(self):
+        super().setUp()
+        self.folder = (self.repo / "docs" / "export" / "phases" / "01-json").resolve()
+        self.folder.mkdir(parents=True)
+        (self.folder / "plan.md").write_text(plan(CHECKS, PERF_MAIN))
+        self.commit("Plan the export")
+        self.verify("adopt", str(self.folder))
+
+    def premises(self, *flags, ok=True):
+        return self.verify("premises", *flags, ok=ok)
+
+    def test_premises_and_grounding_sit_beside_the_plan_and_cover_every_check(self):
+        out = self.premises(ok=False)
+        self.assertIn(f"no premises.md beside the plan, in {self.folder}", out)
+        self.assertIn("no grounding.md beside the plan", out)
+        (self.folder / "grounding.md").write_text("# How export works\n")
+        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="").replace("| B1, P1 |", "| B1 |"))
+        self.assertIn("no premise row for P1; every check of the plan gets at least one row", self.premises(ok=False))
+        (self.folder / "premises.md").write_text(self.TABLE.format(resolution=""))
+        self.assertEqual(self.premises(), "premises ok: 2 premises cover 2 checks, 1 do not hold; resolve them in the design, "
+                                          "then pass `verify.py premises --resolved`\n")
+        self.assertIn(":4: the premise does not hold and has no Resolution", self.premises("--resolved", ok=False))
+        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="the design adds a --json flag to bin/export"))
+        self.assertEqual(self.premises("--resolved"), "premises ok: 2 premises cover 2 checks, 1 do not hold, each with its resolution\n")
+
+    def test_each_row_says_whether_it_holds_with_evidence_and_both_files_postdate_the_base(self):
+        (self.folder / "grounding.md").write_text("# How export works\n")
+        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="x").replace("| yes | calc.py:1 |", "| maybe |  |"))
+        out = self.premises(ok=False)
+        self.assertIn(":3: Holds must be yes or no, not 'maybe'", out)
+        self.assertIn(":3: Evidence is empty; cite the file:line on main", out)
+        (self.folder / "premises.md").write_text(self.TABLE.format(resolution="x"))
+        os.utime(self.folder / "grounding.md", (1, 1))
+        self.assertIn(f"{self.folder / 'grounding.md'} predates the base commit", self.premises(ok=False))
+        (self.folder / "premises.md").write_text("no table here\n")
+        (self.folder / "grounding.md").write_text("# How export works\n")
+        self.assertIn("holds no table with the columns Check | Premise | Holds | Evidence | Resolution", self.premises(ok=False))
+
+    def test_without_a_plan_folder_they_sit_in_the_verification_directory(self):
+        where = pathlib.Path(self.verify("where").strip())
+        (where / "base.json").unlink()
+        (where / "plan.md").write_text(plan(CHECKS, PERF_MAIN))
+        (where / "grounding.md").write_text("# How export works\n")
+        (where / "premises.md").write_text(self.TABLE.format(resolution=""))
+        self.assertIn("premises ok: 2 premises cover 2 checks", self.premises())
+
+
+class DryRun(RepoFixture):
+    SCRIPT = ('echo "verify: ready"\nif grep -q "def mul" calc.py; then echo "PASS B1: mul exists"; exit 0; fi\n'
+              'echo "  not ok: mul is missing"\necho "FAIL B1: 1 of 1 assertions failed"\nexit 1\n')
+
+    def setUp(self):
+        super().setUp()
+        self.where = pathlib.Path(self.verify("where").strip())
+        (self.where / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        self.verify("lock")
+        self.feature()
+        self.worktree = pathlib.Path(self.tmp.name) / "at-base"
+        self.git("worktree", "add", "-q", "--detach", str(self.worktree), self.base)
+        (self.where / "B1.check.sh").write_text(self.SCRIPT)
+
+    def dryrun(self, *flags, ok=True, base=None):
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        r = subprocess.run([sys.executable, "-I", str(VERIFY), "dryrun", "--dir", str(self.where), "--base", str(base or self.worktree), *flags],
+                           cwd=self.worktree, capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+        return r.stdout
+
+    def test_every_e2e_script_reaches_ready_and_fails_a_predicate_on_base(self):
+        self.assertIn("B1: no B1.base.log; dry-run the script on base with `verify.py dryrun --only B1 --base <worktree at the base>`",
+                      self.verify("scripts", ok=False))
+        out = self.dryrun()
+        self.assertRegex(out, r"FAIL\s+B1  \(\d+\.\ds\)  it reached its predicates and one failed\n")
+        self.assertIn(f"dryrun: 1 scripts on base {self.base[:12]}: 1 fail a predicate, 0 pass (behavior already on base), 0 crash", out)
+        log = (self.where / "B1.base.log").read_text()
+        self.assertTrue(log.startswith("  not ok: mul is missing\nFAIL B1: 1 of 1 assertions failed\n"), log)
+        self.assertNotIn("verify: ready\n", log)
+        self.assertTrue(log.endswith("dryrun: ready\ndryrun: exit 1\ndryrun: FAIL (it reached its predicates and one failed)\n"), log)
+        self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 1 failed a predicate there\n")
+        (self.where / "B1.check.sh").write_text(self.SCRIPT + "# edited\n")
+        self.assertIn("B1: B1.check.sh changed since its dry run", self.verify("scripts", ok=False))
+
+    def test_a_script_that_crashes_on_base_fails_the_gate(self):
+        for body, why in (('echo "verify: ready"\nexit 3\n', "exit 3, not the exit 1 of a failed predicate"),
+                          ('echo "FAIL B1: no instance"\nexit 1\n', 'it never printed "verify: ready", so it failed before its instance was up'),
+                          ('echo "verify: ready"\necho "TypeError: x is undefined"\nexit 1\n', "exit 1 with no FAIL line last on stdout, so no predicate reported the failure")):
+            (self.where / "B1.check.sh").write_text(body)
+            self.assertRegex(self.dryrun(ok=False), rf"CRASH B1  \(\d+\.\ds\)  {re.escape(why)}")
+            self.assertIn(f"B1: it crashed on base: ({why}). A script reaches \"verify: ready\" and fails on a predicate there",
+                          self.verify("scripts", ok=False))
+
+    def test_a_script_that_passes_on_base_is_accepted_with_a_note(self):
+        (self.where / "B1.check.sh").write_text('echo "verify: ready"\necho "PASS B1"\n')
+        self.assertIn("1 pass (behavior already on base)", self.dryrun())
+        self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 0 failed a predicate there\n"
+                                                 "note: B1 passes on base, so its behavior already exists there\n")
+
+    def test_the_base_worktree_must_hold_the_base_product_code(self):
+        self.assertIn(f"is not at the phase base {self.base[:12]}: its product files differ (calc.py). Check out the base there",
+                      self.dryrun(base=self.repo, ok=False))
+        self.assertIn("dryrun needs --base <path to a worktree at the phase base>", self.verify("dryrun", ok=False))
+
+
+class ReportWrite(RepoFixture):
+    def setUp(self):
+        super().setUp()
+        self.where = pathlib.Path(self.verify("where").strip())
+        walk_contract = CONTRACT + '    - button "Export": the button W1 looks at\n'
+        (self.where / "plan.md").write_text(plan(CHECKS.replace(CONTRACT, walk_contract), UNIT, WALK, PERF_NA))
+        self.verify("lock")
+        self.feature(test_mul=f"import unittest\n{self.NEW}\n\n\nclass T(unittest.TestCase):\n    def test_U1_mul(self):\n        {self.NEW_BODY}\n")
+        self.units()
+        (self.where / "B1.check.sh").write_text('echo "3 records"\n')
+        self.verify("rerun")
+        (self.where / "evidence" / "W1").mkdir(parents=True)
+        (self.where / "evidence" / "W1" / "row.png").write_text("png")
+        (self.where / "review.md").write_text(review_md(self.rev()))
+
+    def observe(self, **lines):
+        (self.where / "observations.md").write_text("".join(f"{k}: {v}\n" for k, v in lines.items()))
+
+    def write(self, *flags, ok=True):
+        return self.verify("report", "--write", *flags, ok=ok)
+
+    def report(self):
+        return (self.where / "report.md").read_text()
+
+    def test_builds_the_report_from_the_evidence_and_the_observations(self):
+        self.assertIn("report --write needs --author <agent:model that wrote the code> and --verifier", self.write(ok=False))
+        self.observe(B1="stdout parsed, 3 records", U1="mul(2, 3) is 6")
+        out = self.write("--author", "claude:claude-opus-5-5", "--verifier", "codex:gpt-5.6-sol", ok=False)
+        self.assertIn("wrote", out)
+        self.assertIn("W1 has no observation; the verifier writes 'W1: <what it saw>' in observations.md", out)
+        main = self.git("rev-parse", "main")
+        self.assertEqual(self.report(), textwrap.dedent(f"""\
+            # Verification report: json export
+
+            Head: {self.rev()}
+            Main: {main}
+            Author: claude:claude-opus-5-5
+            Verifier: codex:gpt-5.6-sol
+
+            | Check | Verdict | Evidence | Observed |
+            |---|---|---|---|
+            | B1 | PASS | B1.rerun.log | stdout parsed, 3 records |
+            | U1 | PASS | units.log | mul(2, 3) is 6 |
+            | W1 | PASS | evidence/W1/ | missing |
+            """))
+        self.observe(B1="stdout parsed, 3 records", U1="mul(2, 3) is 6", W1="Export sits right of Share")
+        self.assertIn("report ok: 3 checks have verdicts backed by evidence", self.write())
+        self.assertIn("Author: claude:claude-opus-5-5", self.report())
+
+    def test_a_fail_or_inconclusive_row_goes_under_not_ready_to_merge(self):
+        self.observe(B1="stdout parsed, 3 records", U1="mul(2, 3) is 6", W1="defect: Export wraps below Share | at 390 px")
+        out = self.write("--author", "a:x", "--verifier", "b:y")
+        self.assertIn("not ready to merge: W1 FAIL; the PR lists them at the top and carries the 'do not merge' label", out)
+        self.assertIn("## Not ready to merge\n\n- W1 FAIL: defect: Export wraps below Share | at 390 px\n\nHead:", self.report())
+        self.assertIn("| W1 | FAIL | evidence/W1/ | defect: Export wraps below Share \\| at 390 px |", self.report())
+        (self.where / "B1.check.sh").write_text('echo "2 records"\nexit 1\n')
+        self.verify("script-fix", "B1.check.sh", "--reason", "the fixture now holds 2 records; agreed by the user")
+        self.verify("rerun", "--only", "B1", ok=False)
+        out = self.write(ok=False)
+        self.assertIn("B1 is FAIL; start its Observed cell with 'defect:' and the repro", out)
+        self.assertIn("  B1 FAIL: rerun: FAIL (exit 1)", out)
+        self.observe(B1="blocker: the instance never came up", U1="mul(2, 3) is 6", W1="Export sits right of Share")
+        (self.where / "B1.rerun.log").unlink()
+        self.write()
+        self.assertIn("| B1 | INCONCLUSIVE | none | blocker: the instance never came up |", self.report())
+        self.assertIn("- B1 INCONCLUSIVE: blocker: the instance never came up", self.report())
+
+    def test_notes_go_in_their_own_section_and_survive_a_rewrite(self):
+        self.observe(B1="3 records", U1="6", W1="right of Share")
+        self.write("--author", "a:x", "--verifier", "b:y", "--note", "reviewer on claude: codex was limited until 14:00", "--note", "second")
+        self.assertIn("## Notes\n\n- reviewer on claude: codex was limited until 14:00\n- second\n", self.report())
+        self.write()
+        self.assertIn("## Notes\n\n- reviewer on claude: codex was limited until 14:00\n- second\n", self.report())
+        self.write("--note", "only this")
+        self.assertIn("## Notes\n\n- only this\n", self.report())
+
+
+class Spec(RepoFixture):
+    def test_the_spec_change_log_names_the_phase_and_the_later_phases_still_pass(self):
+        self.assertIn("spec: no plan folder adopted on this branch", self.verify("spec"))
+        root = (self.repo / "docs" / "export").resolve()
+        folder = root / "phases" / "01-json"
         folder.mkdir(parents=True)
         (folder / "plan.md").write_text(plan(CHECKS, PERF_NA))
-        self.assertIn("already holds a different plan", self.verify("adopt", str(folder), ok=False))
+        self.verify("adopt", str(folder))
+        self.assertIn(f"no spec.md in the plan folder (the plan-feature skill writes it) at {root / 'spec.md'}", self.verify("spec", ok=False))
+        (root / "spec.md").write_text("# Export\n\nThe design.\n")
+        self.assertIn("has no '## Change log' section; add it with a line for 01-json", self.verify("spec", ok=False))
+        (root / "spec.md").write_text("# Export\n\n## Change log\n\n- 01-json-old: renamed the flag\n\n## Later\n\n01-json\n")
+        self.assertIn("'## Change log' has no line for 01-json. Log what this phase changed in the design", self.verify("spec", ok=False))
+        (root / "spec.md").write_text("# Export\n\n## Change log\n\n- 01-json: no design change\n")
+        self.assertEqual(self.verify("spec"), "spec ok: spec.md's change log names 01-json; phases ok: 1 phases, 1 checks\n")
+        (root / "phases" / "02-csv").mkdir()
+        self.assertIn("02-csv/plan.md: missing", self.verify("spec", ok=False))
 
 
 class Units(RepoFixture):
@@ -1336,80 +1723,51 @@ class Units(RepoFixture):
         self.assertEqual(self.git("status", "--porcelain"), "")
 
 
-class Affected(RepoFixture):
+class FixAttempts(RepoFixture):
     def setUp(self):
         super().setUp()
         self.where = pathlib.Path(self.verify("where").strip())
-        body = CHECKS.split("## Checks\n")[1]
-        b2 = body.replace("B1", "B2").replace("`src/export/**`, `bin/export`", "`*.py`")
-        b3 = body.replace("B1", "B3")
-        (self.where / "plan.md").write_text(plan(CHECKS, b2, b3, UNIT, PERF_NA))
-        for check_id in ("B1", "B2"):
-            (self.where / f"{check_id}.check.sh").write_text(f'test ! -e "$(dirname "$0")/{check_id}.broken"\n')
-        (self.where / "U1.check.sh").write_text("exit 0\n")
+        (self.where / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        (self.where / "B1.check.sh").write_text('test ! -e "$(dirname "$0")/B1.broken"\n')
+        (self.where / "report.md").write_text(Verify.FAIL_REPORT.replace("B2", "B1"))
 
-    def affected(self):
-        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
-        r = subprocess.run([sys.executable, "-I", str(VERIFY), "affected", "--explain"], cwd=self.repo, capture_output=True, text=True, env=env)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        return r.stdout, r.stderr
+    def attempts(self):
+        path = self.where / "fix-attempts.json"
+        return json.loads(path.read_text()).get("B1", 0) if path.is_file() else 0
 
-    def ledger(self):
-        return json.loads((self.where / "rerun.ledger.json").read_text())
-
-    def test_lists_the_e2e_checks_whose_latest_run_no_longer_grades_the_working_tree(self):
-        self.assertEqual(self.affected(), ("B1 B2\n", "B1: no rerun of it is recorded\nB2: no rerun of it is recorded\n"))
-        self.verify("rerun")
-        head = self.rev()
-        self.assertEqual({i: (e["head"], e["dirty"], e["verdict"]) for i, e in self.ledger().items()},
-                         {"B1": (head, None, "PASS"), "B2": (head, None, "PASS"), "U1": (head, None, "PASS")})
-        self.assertEqual(self.affected(), ("", ""))
-        self.put("src/export/json.py", "print('json')\n")
-        at = self.ledger()["B1"]["at"]
-        self.assertEqual(self.affected(), ("B1\n", f"B1: src/export/json.py changed since its latest rerun at {at} on {head[:12]}, "
-                                                    "matching its Touches\n"))
-        self.commit("Export JSON")
-        self.assertEqual(self.affected()[0], "B1\n")
+    def test_a_failing_run_is_a_fix_attempt_only_when_a_product_file_or_its_script_changed(self):
+        (self.where / "B1.broken").write_text("x\n")
+        self.verify("rerun", "--only", "B1", ok=False)
+        self.assertEqual(self.attempts(), 1)
+        self.assertIn("not a fix attempt", self.verify("rerun", "--only", "B1", ok=False))
+        self.put("docs/notes.md", "a plan note\n")
+        self.verify("adopt", str(self.plan_folder()))
+        self.commit("Plan only")
+        self.assertIn("not a fix attempt", self.verify("rerun", "--only", "B1", ok=False))
         self.put("calc.py", "def add(a, b):\n    return b + a\n")
-        self.assertEqual(self.affected()[0], "B1 B2\n")
-        out = self.verify("rerun", "--only", *self.affected()[0].split())
-        self.assertIn("rerun: 2 checks, 2 PASS, 0 FAIL", out)
-        entry = self.ledger()["B2"]
-        self.assertEqual((entry["head"], len(entry["dirty"])), (self.rev(), 64))
-        self.assertEqual(self.affected()[0], "B2\n")
-        self.commit("Swap the operands")
-        self.verify("rerun", "--only", "B2")
-        self.assertEqual(self.affected(), ("", ""))
+        self.assertIn("fix attempt 2 of 2 for B1 failed", self.verify("rerun", "--only", "B1", ok=False))
+        self.assertIn("SKIP  B1  its fix budget is spent", self.verify("rerun", "--only", "B1"))
 
-    def test_a_failing_latest_run_stays_affected_until_it_passes(self):
-        self.verify("rerun")
-        (self.where / "B2.broken").write_text("x\n")
-        self.verify("rerun", "--only", "B2", ok=False)
-        at = self.ledger()["B2"]["at"]
-        self.assertEqual(self.affected(), ("B2\n", f"B2: its latest rerun, at {at}, failed\n"))
-        (self.where / "B2.broken").unlink()
-        self.verify("rerun", "--only", "B2")
-        self.assertEqual(self.affected(), ("", ""))
+    def plan_folder(self):
+        folder = self.repo / "docs" / "phases" / "01-mul"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        (self.where / "plan.md").unlink(missing_ok=True)
+        return folder
 
-    def test_a_check_left_fail_after_its_fix_budget_is_not_affected(self):
-        self.verify("rerun")
-        (self.where / "B2.broken").write_text("x\n")
-        (self.where / "report.md").write_text(Verify.FAIL_REPORT)
-        self.verify("rerun", "--only", "B2", ok=False)
-        self.assertEqual(self.affected()[0], "B2\n")
-        self.verify("rerun", "--only", "B2", ok=False)
-        self.assertEqual(self.affected(), ("", ""))
-
-    def test_rerun_only_takes_every_id_affected_prints_and_none(self):
-        self.assertEqual(self.verify("rerun", "--only"), "rerun --only: no check ids given, so nothing to rerun\n")
-        self.assertFalse((self.where / "rerun.ledger.json").exists())
-        self.assertRegex(self.verify("rerun", "--only", "B1", "B2"), r"PASS\s+B1 .*\nPASS\s+B2 ")
+    def test_the_ledger_records_the_script_and_the_uncommitted_product_changes_of_each_run(self):
+        self.put("calc.py", "def add(a, b):\n    return b + a\n")
+        self.verify("rerun", "--only", "B1")
+        entry = json.loads((self.where / "rerun.ledger.json").read_text())["B1"]
+        self.assertEqual((entry["head"], entry["product_dirty"], entry["verdict"]), (self.rev(), ["calc.py"], "PASS"))
+        self.assertEqual(entry["script"], hashlib.sha256((self.where / "B1.check.sh").read_bytes()).hexdigest())
+        self.assertEqual(len(entry["product_patch"]), 64)
 
 
 class UnitTier(RepoFixture):
     def report(self, ok=True):
         head = self.rev()
-        (self.where / "review.md").write_text(f"# Code review\n\nHead: {head}\n\n## Review\n\nnone found\n")
+        (self.where / "review.md").write_text(review_md(head))
         (self.where / "report.md").write_text(textwrap.dedent(f"""\
             # Verification report: mul
 
