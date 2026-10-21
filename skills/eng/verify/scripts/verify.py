@@ -66,11 +66,12 @@ directory.
               working directory, VERIFY_DRYRUN=1 in its environment, and write <id>.base.log with its output and verdict.
               Scripts start the way `rerun` starts them, as parallel as capacity allows. Exits 1 when a script crashed.
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match the comparison; the
-              report's Head is HEAD or a commit with HEAD's tree (a regrouped history). A PASS is backed by its tier's
+              report's Head is HEAD or a commit with HEAD's product code (a regrouped history, or later commits that touch
+              only the adopted plan folder or the project's verification skills). A PASS is backed by its tier's
               evidence: e2e by its <id>.check.<ext> script and an <id>.rerun.log from a passing run after the freeze whose
               recorded head has no product change before HEAD (any path outside the project's verification skills and
               the adopted plan folder, as `lock` counts them) and that graded no uncommitted product change; unit by the
-              last `units` result, after the freeze, passing, on HEAD's tree, with a spec that names the check id; walk
+              last `units` result, after the freeze, passing, on HEAD's product code, with a spec that names the check id; walk
               by a screenshot or video in evidence/<id>/ written after the freeze. Every row has an observation; a FAIL
               row's starts with 'defect:', an INCONCLUSIVE row's with 'blocker:', and an INCONCLUSIVE row needs no
               evidence. review.md passes the review rules. A passing report lists each plan revision, each full rerun
@@ -1110,7 +1111,14 @@ def last_line(path):
     return path.read_text(errors="replace").rstrip("\n").rpartition("\n")[2]
 
 
-def units_gap(check_id, frozen_ts, units):
+def same_product(rev, skip):
+    """Whether rev holds HEAD's product code: HEAD's tree, or a tree that differs only in the adopted plan folder or the driver."""
+    if not rev or not tree_of(rev):
+        return False
+    return tree_of(rev) == tree_of("HEAD") or product_diff(rev, "HEAD", skip) == []
+
+
+def units_gap(check_id, frozen_ts, units, skip):
     if not units:
         return "no `verify.py units` result is recorded; run it once the code lands"
     if units.get("at", 0) < frozen_ts:
@@ -1118,8 +1126,8 @@ def units_gap(check_id, frozen_ts, units):
     if not units.get("passed"):
         return "the last `verify.py units` run failed; fix what it reports and run it again"
     head_tree = tree_of("HEAD")
-    if head_tree and units.get("tree") != head_tree:
-        return "the last `verify.py units` ran on another tree than HEAD; run it again on the code that ships"
+    if head_tree and units.get("tree") != head_tree and not same_product(units.get("head"), skip):
+        return "the last `verify.py units` ran on other product code than HEAD's; run it again on the code that ships"
     if not any(check_id in spec["checks"] and spec["verdict"] in ("ok", "guard") for spec in units.get("specs", {}).values()):
         return (f"no spec in the last `verify.py units` run names {check_id}; put the check id in the title of the test that "
                 "proves it, then run units again")
@@ -1156,7 +1164,7 @@ def tier_gap(directory, check_id, tier, graded):
     """Why a PASS lacks the evidence its tier needs, or None."""
     frozen_ts = graded["frozen_ts"]
     if tier == "unit":
-        return units_gap(check_id, frozen_ts, graded["units"])
+        return units_gap(check_id, frozen_ts, graded["units"], graded["skip"])
     if tier == "e2e":
         log = directory / f"{check_id}.rerun.log"
         if check_id not in graded["scripts"]:
@@ -1218,6 +1226,8 @@ def report_gate(directory):
         reported_tree = tree_of(reported_head)
         if reported_tree and reported_tree == tree_of("HEAD"):
             same_tree = f"Head {reported_head} has the same tree as HEAD {current_head[:12]}"
+        elif same_product(reported_head, plan_skip(directory)):
+            same_tree = f"Head {reported_head} differs from HEAD {current_head[:12]} only in the plan folder or the driver"
         else:
             problems.append(f"the report covers Head {reported_head}, but HEAD is now {current_head[:12]}; regrade the code that ships "
                             "with `verify.py rerun` and `verify.py units`, walk again each walk check the later commits touch, "
@@ -1298,10 +1308,10 @@ def check_state(directory, check_id, tier, graded, oracles, lock):
             state = "missing" if why else "pass"
     elif tier == "unit":
         evidence = [UNITS_LOG] if (directory / UNITS_LOG).is_file() else []
-        why = units_gap(check_id, frozen_ts, graded["units"])
+        why = units_gap(check_id, frozen_ts, graded["units"], graded["skip"])
         units = graded["units"] or {}
         broken = [name for name, spec in units.get("specs", {}).items() if check_id in spec["checks"] and spec["verdict"] in ("broken", "vacuous")]
-        current = units.get("at", 0) >= frozen_ts and units.get("tree") == tree_of("HEAD")
+        current = units.get("at", 0) >= frozen_ts and (units.get("tree") == tree_of("HEAD") or same_product(units.get("head"), graded["skip"]))
         state = "pass" if not why else "fail" if broken and current else "missing"
         why = f"{', '.join(broken)} fails at head or passes on base" if state == "fail" else why
     else:

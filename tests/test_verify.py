@@ -1800,7 +1800,7 @@ class UnitTier(RepoFixture):
                       self.report(ok=False))
         self.put("tests/test_mul.py", self.named_spec(self.NEW_BODY))
         self.commit("Name the check the mul spec proves")
-        self.assertIn("the last `verify.py units` ran on another tree than HEAD", self.report(ok=False))
+        self.assertIn("the last `verify.py units` ran on other product code than HEAD's", self.report(ok=False))
         self.units()
         self.assertEqual(json.loads((self.where / "units.json").read_text())["specs"], {"tests/test_mul.py": {"verdict": "ok", "checks": ["U1"]}})
         self.assertIn("report ok: 1 checks", self.report())
@@ -1809,6 +1809,24 @@ class UnitTier(RepoFixture):
         self.units(ok=False)
         self.assertIn("FAILS AT HEAD  tests/test_mul.py", (self.where / "units.log").read_text())
         self.assertIn("the last `verify.py units` run failed", self.report(ok=False))
+
+    def test_a_later_commit_outside_the_product_keeps_the_units_run_and_the_report_current(self):
+        self.where = pathlib.Path(self.verify("where").strip())
+        (self.where / "plan.md").write_text(plan("# Verification plan: mul\n\n## Checks\n", UNIT, PERF_NA))
+        self.verify("lock")
+        self.feature(test_mul=self.named_spec(self.NEW_BODY))
+        self.units()
+        reported = self.rev()
+        self.assertIn("report ok: 1 checks", self.report())
+        self.put(".claude/skills/verify-calc/SKILL.md", "# Drive calc\n")
+        self.commit("Extend the driver")
+        out = self.verify("report")
+        self.assertIn("report ok: 1 checks", out)
+        self.assertIn(f"Head {reported[:12]} differs from HEAD {self.rev()[:12]} only in the plan folder or the driver", out)
+        self.put("README.md", "calc multiplies\n")
+        self.commit("Document mul")
+        out = self.verify("report", ok=False)
+        self.assertIn("ran on other product code than HEAD's", out)
 
 
 def alive(pid):
