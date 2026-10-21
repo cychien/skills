@@ -266,6 +266,7 @@ RERUN_TIMEOUT = 300
 RERUN_STAMP = "rerun.stamp.json"
 SCRIPTS_LOCK = "scripts.lock.json"
 RERUN_LEDGER = "rerun.ledger.json"
+FAILURE_STATE = ("head", "script", "product_patch")
 STATE_LOCK = ".rerun-state.lock"
 TMP_SUFFIX = ".verify-tmp"
 RERUN_PASS = "rerun: PASS"
@@ -1641,14 +1642,49 @@ def load_ledger(directory):
     return load_json(path) if path.is_file() else {}
 
 
+def last_failure(entry):
+    """The state of the latest failing run a ledger entry knows: the entry itself when it failed, else the one it carries."""
+    if not entry:
+        return None
+    if entry.get("verdict") == "FAIL":
+        return {key: entry.get(key) for key in FAILURE_STATE}
+    return entry.get("last_failure")
+
+
 def record_run(directory, path, verdict, state):
-    """Record a check's run as its latest in the ledger; the caller holds rerun_state, with the run's log just written."""
+    """Record a check's run as its latest in the ledger, and spend its fix budget when the run is a fix attempt; return that
+    budget line, or None. The caller holds rerun_state, with the run's log just written, so a run is weighed against the
+    failing run the ledger holds at this moment, one that finished beside it included."""
+    check_id = script_id(path)
     head, dirty, product_dirty, product_patch = state
+    script = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
     ledger = load_ledger(directory)
-    ledger[script_id(path)] = {"head": head, "dirty": dirty, "product_dirty": product_dirty, "product_patch": product_patch,
-                               "script": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
-                               "verdict": verdict, "at": now_iso()}
+    previous = last_failure(ledger.get(check_id))
+    entry = {"head": head, "dirty": dirty, "product_dirty": product_dirty, "product_patch": product_patch, "script": script,
+             "verdict": verdict, "at": now_iso()}
+    if verdict != "FAIL" and previous:
+        entry["last_failure"] = previous
+    ledger[check_id] = entry
     write_json(directory / RERUN_LEDGER, dict(sorted(ledger.items())))
+    return spend_fix_budget(directory, check_id, previous, state, script) if verdict == "FAIL" else None
+
+
+def spend_fix_budget(directory, check_id, previous, state, script):
+    """The budget line for a failing run, counting it in the fix ledger when report.md marks the check FAIL and the run is a
+    fix attempt; None for a check the report does not mark FAIL."""
+    if check_id not in reported_failures(directory):
+        return None
+    if not fix_attempt(previous, state, script, plan_skip(directory)):
+        return (f"{check_id} still fails with no product or script change since its previous failing run, so this run is not a "
+                "fix attempt")
+    attempts = fix_attempts(directory)
+    spent = attempts.get(check_id, 0)
+    if spent >= FIX_ATTEMPTS:
+        return f"{check_id} still fails, and a run beside this one spent its fix budget, so the next rerun skips it"
+    attempts[check_id] = spent + 1
+    write_json(directory / FIX_LEDGER, attempts)
+    return (f"fix attempt {spent + 1} of {FIX_ATTEMPTS} for {check_id} failed"
+            + ("; that was the last one, so the next rerun skips it" if spent + 1 >= FIX_ATTEMPTS else ""))
 
 
 def stale_checks(directory):
@@ -1742,10 +1778,10 @@ def run_script(path, args, env, hooks):
     return "FAIL", f"exit {r.returncode}{tail}", output
 
 
-def run_check(directory, path, args, env, concurrent=set, run=None, state=None):
-    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log, and with state, the run goes to
-    the ledger in the same step, a script verify could not start included. concurrent() names the checks that ran beside it.
-    run, when given, learns the script's pid and readiness, and a run the watchdog evicted is REQUEUED."""
+def run_check(directory, path, args, env, concurrent=set, run=None, record=None):
+    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log, and record(path, verdict) runs in
+    the same locked step, a script verify could not start included. concurrent() names the checks that ran beside it. run,
+    when given, learns the script's pid and readiness, and a run the watchdog evicted is REQUEUED."""
     check_id = script_id(path)
     before = file_sizes(directory)
     hooks = {"on_start": lambda pid: run.update(pid=pid), "on_ready": run["ready"]} if run else {}
@@ -1765,8 +1801,8 @@ def run_check(directory, path, args, env, concurrent=set, run=None, state=None):
     reason = detail.partition("\n")[0]
     with rerun_state(directory):
         (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}" + (f" ({reason})" if reason else "") + "\n")
-        if state is not None:
-            record_run(directory, path, verdict, state)
+        if record:
+            record(path, verdict)
     return verdict, detail
 
 
@@ -1885,15 +1921,15 @@ def spent_line(check_id):
             f"another attempt, by deleting its entry from {FIX_LEDGER}")
 
 
-def fix_attempt(before, state, script_sha, skip):
-    """Whether a failing run of a FAIL-marked check is a fix attempt: a product file or its script changed since its previous
-    failing run. Outside a git repository every failing run is one."""
+def fix_attempt(previous, state, script_sha, skip):
+    """Whether a failing run of a FAIL-marked check is a fix attempt: a product file or its script changed since previous, the
+    state of its previous failing run. Outside a git repository every failing run is one."""
     head, _, _, patch = state
-    if head is None or not before or before.get("verdict") != "FAIL" or not before.get("head"):
+    if head is None or not previous or not previous.get("head"):
         return True
-    if before.get("script") != script_sha or before.get("product_patch") != patch:
+    if previous.get("script") != script_sha or previous.get("product_patch") != patch:
         return True
-    changed = product_diff(before["head"], head, skip)
+    changed = product_diff(previous["head"], head, skip)
     return changed is None or bool(changed)
 
 
@@ -1926,12 +1962,15 @@ def cmd_rerun(directory, args):
         if not args.only:
             claim_full_rerun(directory, lock, check_scripts(directory), args)
             stamp_path.unlink(missing_ok=True)
-        before = load_ledger(directory)
     runnable = [p for p in scripts if script_id(p) not in left]
     env = {**os.environ, "VERIFY_DIR": str(directory)}
-    state = working_state(directory)
+    state, budget = working_state(directory), {}
+
+    def record(path, verdict):
+        if line := record_run(directory, path, verdict, state):
+            budget[script_id(path)] = line
     results, requeued = run_checks(directory, runnable, args,
-                                   lambda path, beside, run: run_check(directory, path, args, env, beside, run, state))
+                                   lambda path, beside, run: run_check(directory, path, args, env, beside, run, record))
     lines, failed = [*requeued, *map(spent_line, skipped)], []
     not_run = [i for i, (verdict, _, _) in results.items() if verdict == "NOT RUN"]
     errored = [i for i, (verdict, _, _) in results.items() if verdict == "ERROR"]
@@ -1948,20 +1987,8 @@ def cmd_rerun(directory, args):
     summary += f", {len(errored)} errored before verify recorded the run" if errored else ""
     summary += f", {len(requeued)} requeued" if requeued else ""
     lines.append(summary + (" (--only: no stamp; the ledger records these runs)" if args.only else ""))
+    lines += [budget[i] for i in failed if i in budget]
     with rerun_state(directory):
-        attempts, counted = fix_attempts(directory), False
-        for check_id in (i for i in failed if i in failing):
-            script = next(p for p in runnable if script_id(p) == check_id)
-            if not fix_attempt(before.get(check_id), state, hashlib.sha256(script.read_bytes()).hexdigest(), plan_skip(directory)):
-                lines.append(f"{check_id} still fails with no product or script change since its previous failing run, so this run "
-                             "is not a fix attempt")
-                continue
-            counted = True
-            attempts[check_id] = attempts.get(check_id, 0) + 1
-            lines.append(f"fix attempt {attempts[check_id]} of {FIX_ATTEMPTS} for {check_id} failed"
-                         + ("; that was the last one, so the next rerun skips it" if attempts[check_id] >= FIX_ATTEMPTS else ""))
-        if counted:
-            write_json(directory / FIX_LEDGER, attempts)
         if failed or not_run or errored:
             raise Failed("\n" + "\n".join(lines))
         if inputs:

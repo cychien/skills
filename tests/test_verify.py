@@ -814,6 +814,16 @@ class Verify(unittest.TestCase):
         self.assertRegex(out, r"ERROR B1  \(\d+\.\ds\)  verify could not run it: OSError: No space left on device")
         self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 errored before verify recorded the run", out)
 
+    def test_a_run_that_fails_after_a_run_beside_it_spent_the_budget_counts_no_further(self):
+        self.check_script("B2.check.sh", "exit 1\n")
+        self.write("report.md", self.FAIL_REPORT)
+        self.write("fix-attempts.json", '{"B2": 2}')
+        with verify.rerun_state(self.dir):
+            line = verify.record_run(self.dir, self.dir / "B2.check.sh", "FAIL", (None, None, [], None))
+        self.assertEqual(line, "B2 still fails, and a run beside this one spent its fix budget, so the next rerun skips it")
+        self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 2})
+        self.assertEqual(verify.load_ledger(self.dir)["B2"]["verdict"], "FAIL")
+
     def test_a_fix_that_passes_spends_nothing(self):
         self.check_script("B2.check.sh", "exit 1\n")
         self.write("report.md", self.FAIL_REPORT)
@@ -1948,6 +1958,48 @@ class FixAttempts(RepoFixture):
         self.assertEqual((entry["head"], entry["product_dirty"], entry["verdict"]), (self.rev(), ["calc.py"], "PASS"))
         self.assertEqual(entry["script"], hashlib.sha256((self.where / "B1.check.sh").read_bytes()).hexdigest())
         self.assertEqual(len(entry["product_patch"]), 64)
+
+    def side_by_side_reruns(self):
+        """Two `rerun --only B1` processes whose scripts each wait until both have started, so both read the ledger before
+        either records its run."""
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home"), "VERIFY_MAX_LOAD_RATIO": "1000"}
+        procs = [subprocess.Popen([sys.executable, "-I", str(VERIFY), "rerun", "--only", "B1"], cwd=self.repo, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for _ in range(2)]
+        outs = [proc.communicate(timeout=60)[0] for proc in procs]
+        self.assertEqual(len(list(self.where.glob("B1.started.*"))), 2, outs)
+        for started in self.where.glob("B1.started.*"):
+            started.unlink()
+        return outs
+
+    def test_two_reruns_side_by_side_on_one_product_state_spend_one_fix_attempt(self):
+        (self.where / "report.md").unlink()
+        (self.where / "B1.broken").write_text("x\n")
+        self.verify("rerun", "--only", "B1", ok=False)
+        (self.where / "report.md").write_text(Verify.FAIL_REPORT.replace("B2", "B1"))
+        (self.where / "B1.check.sh").write_text('d="$(dirname "$0")"; touch "$d/B1.started.$$"; n=0\n'
+                                                 'while [ "$(ls "$d" | grep -c "^B1.started")" -lt 2 ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n + 1)); done\n'
+                                                 'test ! -e "$d/B1.broken"\n')
+        outs = self.side_by_side_reruns()
+        self.assertEqual(self.attempts(), 1, outs)
+        self.assertEqual(sorted("fix attempt 1 of 2 for B1 failed" in o for o in outs), [False, True], outs)
+        self.assertEqual(sum("B1 still fails with no product or script change since its previous failing run" in o for o in outs), 1, outs)
+        self.put("calc.py", "def add(a, b):\n    return b + a\n")
+        outs = self.side_by_side_reruns()
+        self.assertEqual(self.attempts(), 2, outs)
+        self.assertEqual(sum("fix attempt 2 of 2 for B1 failed; that was the last one" in o for o in outs), 1, outs)
+        self.assertIn("SKIP  B1  its fix budget is spent", self.verify("rerun", "--only", "B1"))
+
+    def test_a_failing_run_is_weighed_against_the_previous_failing_run_through_a_pass_between(self):
+        (self.where / "B1.broken").write_text("x\n")
+        self.verify("rerun", "--only", "B1", ok=False)
+        (self.where / "B1.broken").unlink()
+        self.put("calc.py", "def add(a, b):\n    return b + a\n")
+        self.verify("rerun", "--only", "B1")
+        self.assertEqual(json.loads((self.where / "rerun.ledger.json").read_text())["B1"]["last_failure"]["head"], self.rev())
+        self.git("checkout", "--", "calc.py")
+        (self.where / "B1.broken").write_text("x\n")
+        self.assertIn("not a fix attempt", self.verify("rerun", "--only", "B1", ok=False))
+        self.assertEqual(self.attempts(), 1)
 
     def test_a_run_verify_cannot_start_is_the_latest_run_and_fails_in_the_log_and_the_ledger(self):
         (self.where / "report.md").unlink()
