@@ -16,6 +16,8 @@ usage:
   guard.py lint <skill name or SKILL.md path> | --all    report what keeps guard from reading a skill's steps
   guard.py quota status                                  the usage limits in force
   guard.py quota pick --role <planner|executor> [--avoid AGENT[:MODEL] ...] [--relax]
+  guard.py delegates [--session AGENT:ID]                the subagents guard tracks, and whether each still runs
+  guard.py delegates end <id> --reason TEXT [--session AGENT:ID]  the lead ends one it confirmed gone
 
 A subagent adds --agent ID (its agent id, which guard names when it asks) to every todo command, so its list stays its own.
 An item copied from a skill closes only with the token `todo show` prints for it, and only once the items it waits on resolve.
@@ -247,6 +249,27 @@ def run_quota(args):
         print(f"relaxed: {relaxed}. Report it in the PR's Verification section and in report.md.")
 
 
+def run_delegates(args):
+    agent, sid = session(args.session)
+    if args.action == "end":
+        with state.update(agent, sid) as data:
+            delegate = data.get("delegates", {}).get(args.id)
+            if not delegate:
+                sys.exit(f"guard: no delegate {args.id!r} in this session.")
+            delegate.update(running=False, ended_by_lead=args.reason)
+        print(f"Ended {args.id}: {args.reason}")
+        return
+    data = state.load(agent, sid)
+    delegates = data.get("delegates", {})
+    if not delegates:
+        print("No delegates tracked.")
+    now = time.time()
+    for agent_id, delegate in sorted(delegates.items(), key=lambda pair: pair[1]["since"]):
+        status = state.delegate_status(data, delegate, now)
+        last = delegate.get("last", delegate["since"])
+        print(f"{agent_id}  {status}  since {quota.clock(delegate['since'])}  last tool call {int(now - last)}s ago")
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -288,8 +311,15 @@ def main():
     p.add_argument("--role", required=True, choices=quota.ROLES)
     p.add_argument("--avoid", action="append", default=[], metavar="AGENT[:MODEL]")
     p.add_argument("--relax", action="store_true")
+    d = sub.add_parser("delegates")
+    d.add_argument("action", nargs="?", choices=["end"])
+    d.add_argument("id", nargs="?")
+    d.add_argument("--reason")
+    d.add_argument("--session")
     args = parser.parse_args()
-    {"todo": run_todo, "lint": run_lint, "quota": run_quota}[args.cmd](args)
+    if args.cmd == "delegates" and args.action == "end" and not (args.id and args.reason):
+        parser.error("delegates end takes an id and --reason")
+    {"todo": run_todo, "lint": run_lint, "quota": run_quota, "delegates": run_delegates}[args.cmd](args)
 
 
 if __name__ == "__main__":

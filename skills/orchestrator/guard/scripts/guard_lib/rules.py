@@ -54,7 +54,11 @@ HANDBACK_TOOLS = {"subagenthandback"}
 EXIT_CODE = re.compile(r"^\s*(?:Error:\s*)?Exit code:?\s*(\d+)\b")
 EXIT_KEYS = ("exit_code", "exitCode", "returncode", "exit_status")
 OPEN_PR = "../open-pr/SKILL.md"
-RERUN_DENIED = "A fix group is still working; rerun once every group has handed back, so one run grades every fix."
+DELEGATES_END_DENIED = ("Only the lead ends a delegate: report the delegates that hold you to the lead, which checks them and "
+                        "ends the ones it confirmed gone.")
+RERUN_DENIED = ("A fix group is still working; rerun once every group has handed back, so one run grades every fix. Still running: {ids}. "
+                "A delegate that is denied this stops and reports it to the lead instead of retrying; the lead checks them with "
+                "`guard.py delegates` and ends one it confirmed gone with `guard.py delegates end <id> --reason`.")
 OWN_LIST = ("You are a subagent, and guard keeps your todo list apart from your lead's, so your items never land in its list and "
             "only your own list holds your turn. Add `--agent {agent_id}` to every guard todo command, after `--session`:\n"
             "   {cmd} todo from <skill> {sess}")
@@ -102,6 +106,9 @@ def handle(event):
         return PASS
     if event.kind == "prompt":
         return on_prompt(event)
+    if event.kind == "subagent_start" and event.agent_id:
+        delegate_starts(event)
+        return PASS
     if event.kind == "pre_tool":
         if event.agent_id:
             delegate_acts(event)
@@ -130,12 +137,28 @@ def active_hold(event):
     return state.held(state.own_list(state.load(event.agent, event.session), event.agent_id))
 
 
+def delegate_starts(event):
+    """A SubagentStart: this agent is a delegate, and from now on only started agents are."""
+    with state.update(event.agent, event.session) as data:
+        data["starts_seen"] = True
+        now = time.time()
+        data.setdefault("delegates", {})[event.agent_id] = {"since": now, "last": now, "running": True, "via": "start"}
+
+
 def delegate_acts(event):
-    """Mark a subagent running from its first tool call; one whose stop went through but that acts again keeps its start."""
-    if state.exists(event.agent, event.session) and state.load(event.agent, event.session).get("delegates", {}).get(event.agent_id, {}).get("running"):
+    """Note a delegate's latest tool call; one whose stop went through but that acts again was resumed and runs again.
+    Without SubagentStart in the session, the first tool call is the start."""
+    now = time.time()
+    data = state.load(event.agent, event.session) if state.exists(event.agent, event.session) else {}
+    known = data.get("delegates", {}).get(event.agent_id)
+    if data.get("starts_seen") and not (known and known.get("via") == "start"):
+        return
+    if known and known.get("running") and now - known.get("last", known["since"]) < 60:
         return
     with state.update(event.agent, event.session) as data:
-        data.setdefault("delegates", {}).setdefault(event.agent_id, {"since": time.time()})["running"] = True
+        delegate = data.setdefault("delegates", {}).setdefault(event.agent_id, {"since": now})
+        delegate["running"] = True
+        delegate["last"] = now
 
 
 def delegates_end(event, ids=None):
@@ -159,7 +182,7 @@ def running_since(event):
     """When the earliest subagent still running, other than the caller, began; its processes may be any started since."""
     if not state.exists(event.agent, event.session):
         return None
-    starts = [d["since"] for i, d in state.load(event.agent, event.session).get("delegates", {}).items() if d.get("running") and i != event.agent_id]
+    starts = [d["since"] for i, d in state.live_delegates(state.load(event.agent, event.session)).items() if i != event.agent_id]
     return min(starts) if starts else None
 
 
@@ -355,6 +378,8 @@ def on_pre_tool(event):
     if event.agent_id and runs_todo(command) and not re.search(rf"--agent[ =]['\"]?{re.escape(event.agent_id)}(?![\w-])", command):
         cmd, sess = cli(event)
         return "deny", OWN_LIST.format(agent_id=event.agent_id, cmd=cmd, sess=sess)
+    if event.agent_id and any(rest[:2] == ["delegates", "end"] for rest in shell.invocations(command, "guard.py")):
+        return "deny", DELEGATES_END_DENIED
     if (event.tool or "").lower() in HANDBACK_TOOLS and isinstance(event.tool_input, dict):
         long = oversized_handback(event, event.tool_input.get("message"))
         if long:
@@ -404,8 +429,9 @@ def order_problem(event, command):
     if not (rerun or create) or not state.exists(event.agent, event.session):
         return None
     data = state.load(event.agent, event.session)
-    if rerun and any(d.get("running") and i != event.agent_id for i, d in data.get("delegates", {}).items()):
-        return RERUN_DENIED
+    working = sorted(i for i in state.live_delegates(data) if i != event.agent_id)
+    if rerun and working:
+        return RERUN_DENIED.format(ids=", ".join(working))
     if create:
         for closing in (i for i in data["todo"] if i["source"] and OPEN_PR in i["text"]):
             early = [i for i in state.unresolved(data) if i["source"] == closing["source"] and i["n"] < closing["n"]]

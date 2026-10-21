@@ -7,13 +7,13 @@ import shutil
 import time
 
 HOME = pathlib.Path.home()
-PROMPT, PRE, POST, FAILED, STOP, SUB, PERM, DENIED = "prompt", "pre", "post", "failed", "stop", "sub", "perm", "denied"
+PROMPT, PRE, POST, FAILED, STOP, START, SUB, PERM, DENIED = "prompt", "pre", "post", "failed", "stop", "start", "sub", "perm", "denied"
 TIMEOUTS = {PERM: 300, DENIED: 300}
 
 AGENTS = {
     "claude": {"config": HOME / ".claude" / "settings.json", "binary": "claude", "style": "claude",
                "events": {PROMPT: "UserPromptSubmit", PRE: "PreToolUse", POST: "PostToolUse", FAILED: "PostToolUseFailure", STOP: "Stop",
-                          SUB: "SubagentStop", PERM: "PermissionRequest", DENIED: "PermissionDenied"}},
+                          START: "SubagentStart", SUB: "SubagentStop", PERM: "PermissionRequest", DENIED: "PermissionDenied"}},
     "codex": {"config": HOME / ".codex" / "hooks.json", "binary": "codex", "style": "claude",
               "events": {PROMPT: "UserPromptSubmit", PRE: "PreToolUse", POST: "PostToolUse", STOP: "Stop", SUB: "SubagentStop", PERM: "PermissionRequest"}},
     "cursor": {"config": HOME / ".cursor" / "hooks.json", "binary": "cursor-agent", "style": "cursor",

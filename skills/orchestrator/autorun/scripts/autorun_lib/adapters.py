@@ -5,7 +5,8 @@ from .hooks import Event
 
 EVENTS = {
     "claude": {"UserPromptSubmit": "prompt", "PreToolUse": "pre_tool", "PostToolUse": "post_tool", "PostToolUseFailure": "post_tool_failure",
-               "Stop": "stop", "SubagentStop": "subagent_stop", "PermissionRequest": "permission", "PermissionDenied": "permission_denied"},
+               "Stop": "stop", "SubagentStart": "subagent_start", "SubagentStop": "subagent_stop", "PermissionRequest": "permission",
+               "PermissionDenied": "permission_denied"},
     "codex": {"UserPromptSubmit": "prompt", "PreToolUse": "pre_tool", "PostToolUse": "post_tool", "Stop": "stop",
               "SubagentStop": "subagent_stop", "PermissionRequest": "permission"},
     "cursor": {"beforeSubmitPrompt": "prompt", "preToolUse": "pre_tool", "postToolUse": "post_tool", "stop": "stop",

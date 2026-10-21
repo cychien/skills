@@ -104,3 +104,30 @@ def held(data, now=None):
     """The list's timed wait while it lasts, else None."""
     hold = data.get("hold")
     return hold if hold and hold.get("until", 0) > (now or time.time()) else None
+
+
+# A live delegate calls a tool at least every Bash timeout (10 min); one silent for twice that ended without a recorded stop.
+DELEGATE_SILENT_S = 1200
+
+
+def counts_as_delegate(data, delegate):
+    """Once a SubagentStart reached this session, only agents it started count: a forked helper (Claude Code's memory
+    extraction) calls tools under its own agent id but never starts, writes a transcript, or stops. Before that (an install
+    without the SubagentStart hook, or an agent that has none), every agent seen calling a tool counts."""
+    return not data.get("starts_seen") or delegate.get("via") == "start"
+
+
+def delegate_status(data, delegate, now=None):
+    """running, ended (its stop went through or the lead ended it), silent (no tool call for DELEGATE_SILENT_S), or ignored
+    (an agent no SubagentStart announced)."""
+    now = time.time() if now is None else now
+    if not counts_as_delegate(data, delegate):
+        return "ignored"
+    if not delegate.get("running"):
+        return "ended"
+    return "running" if now - delegate.get("last", delegate["since"]) < DELEGATE_SILENT_S else "silent"
+
+
+def live_delegates(data, now=None):
+    """The delegates a rerun waits on and whose processes a sweep spares."""
+    return {i: d for i, d in data.get("delegates", {}).items() if delegate_status(data, d, now) == "running"}

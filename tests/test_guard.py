@@ -942,6 +942,75 @@ class Guard(unittest.TestCase):
         self.hook("SubagentStop", {"agent_id": "fix-1", "last_assistant_message": "Fixed T1."})
         self.assertIsNone(self.hook("PreToolUse", rerun))
 
+    def age_delegate(self, agent_id, since=None, last=None):
+        path = pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json")
+        data = self.state()
+        data["delegates"][agent_id].update({k: time.time() - v for k, v in (("since", since), ("last", last)) if v is not None})
+        path.write_text(json.dumps(data))
+
+    def rerun_reason(self, agent_id="verifier"):
+        out = self.hook("PreToolUse", {"agent_id": agent_id, "tool_name": "Bash", "tool_input": {"command": "python3 ../verify/scripts/verify.py rerun"}})
+        return out and out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_once_subagents_announce_their_start_a_forked_helper_calling_tools_is_no_delegate(self):
+        calls = self.fake_verify("in use")
+        self.hook("SubagentStart", {"agent_id": "verifier", "agent_type": "general-purpose"})
+        self.hook("PreToolUse", {"agent_id": "memory-fork", "tool_name": "Read", "tool_input": {"file_path": "/m/MEMORY.md"}})
+        self.assertIsNone(self.rerun_reason())
+        self.assertNotIn("memory-fork", self.state()["delegates"])
+        self.hook("SubagentStart", {"agent_id": "fix-2", "agent_type": "general-purpose"})
+        reason = self.rerun_reason()
+        self.assertIn("Still running: fix-2.", reason)
+        self.assertIn("stops and reports it to the lead instead of retrying", reason)
+        self.assertIn("guard.py delegates end <id> --reason", reason)
+        before = time.time()
+        self.assertEqual(self.spawn(), "allow")
+        self.assertLess(float(self.last_sweep(calls)[2]), before)
+        self.hook("SubagentStop", {"agent_id": "fix-2", "last_assistant_message": "Fixed T2."})
+        self.assertIsNone(self.rerun_reason())
+
+    def test_a_delegate_resumed_after_its_stop_runs_again(self):
+        self.hook("SubagentStart", {"agent_id": "fix-2", "agent_type": "general-purpose"})
+        self.hook("SubagentStop", {"agent_id": "fix-2", "last_assistant_message": "Fixed T2."})
+        self.assertIsNone(self.rerun_reason())
+        self.hook("PreToolUse", {"agent_id": "fix-2", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIn("Still running: fix-2.", self.rerun_reason())
+
+    def test_without_subagent_starts_the_first_tool_call_starts_a_delegate(self):
+        self.hook("PreToolUse", {"agent_id": "fix-2", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertIn("Still running: fix-2.", self.rerun_reason())
+        self.hook("SubagentStart", {"agent_id": "verifier", "agent_type": "general-purpose"})
+        self.assertIsNone(self.rerun_reason(), "a start in the session proves fix-2 was no started agent")
+
+    def test_a_delegate_silent_past_the_bash_timeout_no_longer_holds_a_rerun_or_its_processes(self):
+        calls = self.fake_verify("in use")
+        for agent_id in ("gone", "fix-2"):
+            self.hook("SubagentStart", {"agent_id": agent_id, "agent_type": "general-purpose"})
+        self.age_delegate("gone", since=1500, last=1300)
+        self.assertIn("Still running: fix-2.", self.rerun_reason())
+        self.assertEqual(self.spawn(), "allow")
+        self.assertGreater(float(self.last_sweep(calls)[2]), time.time() - 60)
+
+    def test_the_lead_lists_delegates_and_ends_one_it_confirmed_gone(self):
+        self.hook("SubagentStart", {"agent_id": "gone", "agent_type": "general-purpose"})
+        run = lambda *args: subprocess.run([sys.executable, str(GUARD), "delegates", *args, "--session", "claude:s1"],
+                                           capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
+        self.assertRegex(run().stdout, r"gone  running  since \S+")
+        self.assertNotEqual(run("end", "gone").returncode, 0)
+        self.assertNotEqual(run("end", "nobody", "--reason", "x").returncode, 0)
+        self.assertIn("Ended gone: no such agent in ListAgents", run("end", "gone", "--reason", "no such agent in ListAgents").stdout)
+        self.assertRegex(run().stdout, r"gone  ended")
+        self.assertIsNone(self.rerun_reason())
+
+    def test_only_the_lead_ends_a_delegate(self):
+        end = "python3 /x/guard.py delegates end gone --reason gone --session claude:s1"
+        out = self.hook("PreToolUse", {"agent_id": "verifier", "tool_name": "Bash", "tool_input": {"command": end}})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("Only the lead ends a delegate", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(self.hook("PreToolUse", {"agent_id": "verifier", "tool_name": "Bash",
+                                                    "tool_input": {"command": "python3 /x/guard.py delegates --session claude:s1"}}))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": end}}))
+
     def test_a_pr_waits_for_every_step_before_the_close_step(self):
         self.write_skill("flow", "---\nname: flow\ndescription: x\n---\n\n1. Build.\n2. Prove.\n3. Close, then open the PR with the open-pr skill (`../open-pr/SKILL.md`).\n")
         self.todo("from", "flow")
