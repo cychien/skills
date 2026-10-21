@@ -805,6 +805,15 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", "exit 1\n")
         self.assertIn("rerun: 1 checks, 0 PASS, 1 FAIL, 1 skipped past the fix budget", self.run_verify("rerun", ok=False))
 
+    def test_a_run_whose_bookkeeping_breaks_errors_the_rerun_instead_of_passing_it(self):
+        self.check_script("B1.check.sh", "exit 0\n")
+        args = mock.Mock(only=["B1"], rest=[], jobs=None, timeout=30, force=False, full_reason=None)
+        with mock.patch.object(verify, "record_run", side_effect=OSError("No space left on device")), self.assertRaises(verify.Failed) as raised:
+            verify.cmd_rerun(self.dir, args)
+        out = str(raised.exception)
+        self.assertRegex(out, r"ERROR B1  \(\d+\.\ds\)  verify could not run it: OSError: No space left on device")
+        self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 errored before verify recorded the run", out)
+
     def test_a_fix_that_passes_spends_nothing(self):
         self.check_script("B2.check.sh", "exit 1\n")
         self.write("report.md", self.FAIL_REPORT)
@@ -1381,6 +1390,14 @@ class RepoFixture(unittest.TestCase):
     def units(self, *args, ok=True):
         return self.verify("units", *args, ok=ok)
 
+    def git_only_path(self):
+        """A PATH that finds git and no script interpreter, so verify cannot start a check script."""
+        folder = pathlib.Path(self.tmp.name) / "git-only"
+        folder.mkdir(exist_ok=True)
+        (folder / "git").unlink(missing_ok=True)
+        (folder / "git").symlink_to(shutil.which("git"))
+        return str(folder)
+
     NEW = "from calc import mul"
     NEW_BODY = "self.assertEqual(mul(2, 3), 6)"
 
@@ -1635,8 +1652,8 @@ class DryRun(RepoFixture):
         self.git("worktree", "add", "-q", "--detach", str(self.worktree), self.base)
         (self.where / "B1.check.sh").write_text(self.SCRIPT)
 
-    def dryrun(self, *flags, ok=True, base=None):
-        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+    def dryrun(self, *flags, ok=True, base=None, env=None):
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home"), **(env or {})}
         r = subprocess.run([sys.executable, "-I", str(VERIFY), "dryrun", "--dir", str(self.where), "--base", str(base or self.worktree), *flags],
                            cwd=self.worktree, capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
@@ -1664,6 +1681,14 @@ class DryRun(RepoFixture):
             self.assertRegex(self.dryrun(ok=False), rf"CRASH B1  \(\d+\.\ds\)  {re.escape(why)}")
             self.assertIn(f"B1: it crashed on base: ({why}). A script reaches \"verify: ready\" and fails on a predicate there",
                           self.verify("scripts", ok=False))
+
+    def test_a_script_verify_cannot_start_on_base_crashes_and_its_log_says_why(self):
+        out = self.dryrun(ok=False, env={"PATH": self.git_only_path()})
+        self.assertRegex(out, r"CRASH B1  \(\d+\.\ds\)  verify could not run it: FileNotFoundError: ")
+        self.assertIn("0 fail a predicate, 0 pass (behavior already on base), 1 crash", out)
+        self.assertRegex(last := (self.where / "B1.base.log").read_text().splitlines()[-1],
+                         r"^dryrun: CRASH \(verify could not run it: FileNotFoundError: .*'bash'\)$")
+        self.assertIn(f"B1: it crashed on base: ({last.removeprefix('dryrun: CRASH (')}", self.verify("scripts", ok=False))
 
     def test_a_script_that_passes_on_base_is_accepted_with_a_note(self):
         (self.where / "B1.check.sh").write_text('echo "verify: ready"\necho "PASS B1"\n')
@@ -1905,6 +1930,17 @@ class FixAttempts(RepoFixture):
         self.assertEqual((entry["head"], entry["product_dirty"], entry["verdict"]), (self.rev(), ["calc.py"], "PASS"))
         self.assertEqual(entry["script"], hashlib.sha256((self.where / "B1.check.sh").read_bytes()).hexdigest())
         self.assertEqual(len(entry["product_patch"]), 64)
+
+    def test_a_run_verify_cannot_start_is_the_latest_run_and_fails_in_the_log_and_the_ledger(self):
+        (self.where / "report.md").unlink()
+        self.verify("rerun", "--only", "B1")
+        self.assertEqual(json.loads((self.where / "rerun.ledger.json").read_text())["B1"]["verdict"], "PASS")
+        out = self.verify("rerun", "--only", "B1", ok=False, env={"PATH": self.git_only_path()})
+        self.assertRegex(out, r"FAIL\s+B1  \(\d+\.\ds\)  verify could not run it: FileNotFoundError: ")
+        self.assertIn("rerun: 1 checks, 0 PASS, 1 FAIL", out)
+        self.assertRegex((self.where / "B1.rerun.log").read_text(), r"^rerun: FAIL \(verify could not run it: FileNotFoundError: .*'bash'\)\n$")
+        entry = json.loads((self.where / "rerun.ledger.json").read_text())["B1"]
+        self.assertEqual((entry["head"], entry["verdict"]), (self.rev(), "FAIL"))
 
 
 class UnitTier(RepoFixture):

@@ -1722,27 +1722,37 @@ def fix_attempts(directory):
         return {}
 
 
+def could_not_run(error):
+    return f"verify could not run it: {type(error).__name__}: {error}"
+
+
+def run_script(path, args, env, hooks):
+    """(verdict, detail, output) of one run of a check script."""
+    command = script_command(path)
+    if not command:
+        return "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}", ""
+    try:
+        r = run_in_group([*command, *args.rest], args.timeout, env=env, **hooks)
+    except subprocess.TimeoutExpired:
+        return "FAIL", f"timed out after {args.timeout}s", ""
+    output = (r.stdout + r.stderr).strip()
+    if r.returncode == 0:
+        return "PASS", "", output
+    tail = "".join(f"\n    {line}" for line in output.splitlines()[-5:])
+    return "FAIL", f"exit {r.returncode}{tail}", output
+
+
 def run_check(directory, path, args, env, concurrent=set, run=None, state=None):
     """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log, and with state, the run goes to
-    the ledger in the same step. concurrent() names the checks that ran beside it. run, when given, learns the script's pid
-    and readiness, and a run the watchdog evicted is REQUEUED."""
+    the ledger in the same step, a script verify could not start included. concurrent() names the checks that ran beside it.
+    run, when given, learns the script's pid and readiness, and a run the watchdog evicted is REQUEUED."""
     check_id = script_id(path)
-    command = script_command(path)
     before = file_sizes(directory)
-    output = ""
     hooks = {"on_start": lambda pid: run.update(pid=pid), "on_ready": run["ready"]} if run else {}
-    if not command:
-        verdict, detail = "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}"
-    else:
-        try:
-            r = run_in_group([*command, *args.rest], args.timeout, env=env, **hooks)
-            output = (r.stdout + r.stderr).strip()
-            verdict = "PASS" if r.returncode == 0 else "FAIL"
-            detail = "" if verdict == "PASS" else f"exit {r.returncode}"
-            if verdict == "FAIL" and output:
-                detail += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
-        except subprocess.TimeoutExpired:
-            verdict, detail = "FAIL", f"timed out after {args.timeout}s"
+    try:
+        verdict, detail, output = run_script(path, args, env, hooks)
+    except Exception as e:
+        verdict, detail, output = "FAIL", could_not_run(e), ""
     if run and run["evicted"]:
         return "REQUEUED", ""
     beside = sorted(concurrent())
@@ -1788,7 +1798,7 @@ def run_checks(directory, scripts, args, run_one):
         try:
             verdict, detail = run_one(run["path"], lambda: beside_of(check_id), run)
         except Exception as e:
-            verdict, detail = "FAIL", f"verify could not run it: {type(e).__name__}: {e}"
+            verdict, detail = "ERROR", could_not_run(e)
         with turn:
             running.pop(check_id, None)
             if verdict == "REQUEUED":
@@ -1924,6 +1934,7 @@ def cmd_rerun(directory, args):
                                    lambda path, beside, run: run_check(directory, path, args, env, beside, run, state))
     lines, failed = [*requeued, *map(spent_line, skipped)], []
     not_run = [i for i, (verdict, _, _) in results.items() if verdict == "NOT RUN"]
+    errored = [i for i, (verdict, _, _) in results.items() if verdict == "ERROR"]
     for path in runnable:
         check_id = script_id(path)
         verdict, detail, seconds = results[check_id]
@@ -1931,9 +1942,10 @@ def cmd_rerun(directory, args):
             failed.append(check_id)
         head, _, rest = detail.partition("\n")
         lines.append(f"{verdict:<5} {check_id}  ({seconds:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
-    summary = f"rerun: {len(runnable)} checks, {len(runnable) - len(failed) - len(not_run)} PASS, {len(failed)} FAIL"
+    summary = f"rerun: {len(runnable)} checks, {len(runnable) - len(failed) - len(not_run) - len(errored)} PASS, {len(failed)} FAIL"
     summary += f", {len(skipped)} skipped past the fix budget" if skipped else ""
     summary += f", {len(not_run)} not run for lack of capacity" if not_run else ""
+    summary += f", {len(errored)} errored before verify recorded the run" if errored else ""
     summary += f", {len(requeued)} requeued" if requeued else ""
     lines.append(summary + (" (--only: no stamp; the ledger records these runs)" if args.only else ""))
     with rerun_state(directory):
@@ -1950,7 +1962,7 @@ def cmd_rerun(directory, args):
                          + ("; that was the last one, so the next rerun skips it" if attempts[check_id] >= FIX_ATTEMPTS else ""))
         if counted:
             write_json(directory / FIX_LEDGER, attempts)
-        if failed or not_run:
+        if failed or not_run or errored:
             raise Failed("\n" + "\n".join(lines))
         if inputs:
             write_json(stamp_path, {**inputs, "at": now_iso(), "known": skipped})
@@ -1990,6 +2002,8 @@ def dry_check(directory, path, args, env, base, run):
                 verdict, why = "CRASH", f"exit {r.returncode}, not the exit 1 of a failed predicate"
         except subprocess.TimeoutExpired:
             verdict, why, ended = "CRASH", f"timed out after {args.timeout}s", f"timed out after {args.timeout}s"
+        except Exception as e:
+            verdict, why = "CRASH", could_not_run(e)
     if run and run["evicted"]:
         return "REQUEUED", ""
     trailer = [f"dryrun: base {base['path']} at {base['head']}", f"dryrun: script sha256 {hashlib.sha256(path.read_bytes()).hexdigest()}",
@@ -2032,8 +2046,9 @@ def cmd_dryrun(directory, args):
         lines.append(f"{verdict:<5} {script_id(path)}  ({seconds:.1f}s)  {head}" + (f"\n{rest}" if rest else ""))
     summary = (f"dryrun: {len(scripts)} scripts on base {where['head'][:12]}: {tally['FAIL']} fail a predicate, {tally['PASS']} pass "
                f"(behavior already on base), {tally['CRASH']} crash")
-    lines.append(summary + (f", {tally['NOT RUN']} not run for lack of capacity" if tally["NOT RUN"] else ""))
-    if tally["CRASH"] or tally["NOT RUN"]:
+    summary += f", {tally['NOT RUN']} not run for lack of capacity" if tally["NOT RUN"] else ""
+    lines.append(summary + (f", {tally['ERROR']} errored before verify recorded the run" if tally["ERROR"] else ""))
+    if tally["CRASH"] or tally["NOT RUN"] or tally["ERROR"]:
         raise Failed("\n" + "\n".join(lines))
     return "\n".join(lines)
 
