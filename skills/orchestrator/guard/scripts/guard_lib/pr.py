@@ -1,28 +1,20 @@
 """The open-pr skill's PR rules, checked on the gh command before it runs."""
 import pathlib
 import re
-import shlex
 
-GH_PR = re.compile(r"\bgh\s+pr\s+(create|edit)\b")
-TITLE = re.compile(r"^(feat|fix|docs|refactor|test|chore|perf|build|ci|style|revert)(\([^)\s]+\))?!?: \S.*[^.]$")
+from . import shell
+
+TITLE = re.compile(r"^(feat|fix|docs|refactor|test|chore|perf|build|ci|style|revert)(\([^)\s]+\))?!?: (?=\S).*[^.]$")
 SECTIONS = ["Not ready to merge", "Why", "What changed", "Scope", "Tradeoffs", "Blast Radius", "Verification"]
 HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\1\b", re.S)
 
 
-def _args(command):
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return None, []
-    for i in range(len(tokens) - 2):
-        if tokens[i] == "gh" and tokens[i + 1] == "pr" and tokens[i + 2] in ("create", "edit"):
-            rest = []
-            for t in tokens[i + 3:]:
-                if t in ("&&", "||", ";", "|"):
-                    break
-                rest.append(t)
-            return tokens[i + 2], rest
-    return None, []
+def _invocations(command):
+    """(create or edit, its arguments) for each gh pr create or gh pr edit the shell line runs."""
+    for tokens in shell.commands(command):
+        name, rest = shell.script(tokens)
+        if name == "gh" and rest[:1] == ["pr"] and rest[1:2] in (["create"], ["edit"]):
+            yield rest[1], rest[2:]
 
 
 def _value(args, *names):
@@ -38,8 +30,8 @@ def _value(args, *names):
 def _body(args, command, cwd):
     body = _value(args, "--body", "-b")
     if body is not None:
-        if "<<" in body:
-            m = HEREDOC.search(body) or HEREDOC.search(command)
+        if "$(" in body or "`" in body:
+            m = HEREDOC.search(command)
             return m.group(2) if m else None
         return body
     body_file = _value(args, "--body-file", "-F")
@@ -53,11 +45,13 @@ def _body(args, command, cwd):
 
 def problems(command, cwd=None):
     """Rule violations in a gh pr create/edit command, or [] when it complies or is not one."""
-    if not GH_PR.search(command):
-        return []
-    sub, args = _args(command)
-    if not sub:
-        return []
+    found = []
+    for sub, args in _invocations(command):
+        found += [p for p in _problems(sub, args, command, cwd) if p not in found]
+    return found
+
+
+def _problems(sub, args, command, cwd):
     found = []
     title = _value(args, "--title", "-t")
     if title is not None and not TITLE.match(title.strip()):

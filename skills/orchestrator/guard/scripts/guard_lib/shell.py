@@ -1,16 +1,18 @@
 """What a shell line runs: the argv of each simple command, split the way a shell splits it.
 
-Quotes and comments are respected, heredoc bodies are dropped, and the program a shell runs with -c, or eval runs,
-counts as commands too, so a wrapper such as `bash -lc '...'` hides nothing while quoted text passed to any other
-program stays an argument.
+Quotes and comments are respected, heredoc bodies are dropped, a reserved word such as `if` or `while` introduces the
+command after it, and command substitutions and the program a shell runs with -c, or eval runs, count as commands too,
+so a wrapper such as `bash -lc '...'` or `if ...; then` hides nothing while quoted text passed to any other program stays
+an argument.
 """
 import os
 import re
 import shlex
 
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\b", re.S)
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1([^\n]*)\n.*?\n\s*\2\b", re.S)
 SEPARATORS = set(";&|\n()")
-KEYWORDS = {"do", "then", "else", "elif", "!", "{", "}", "time"}
+KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "}", "coproc"}
+REDIRECT = re.compile(r"^(?:\d+|&)?(?:<<<|>>|>&|>\||<>|<&|>|<)(.*)$")
 PREFIXES = {"nohup", "exec", "command", "caffeinate", "sudo", "builtin"}
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 SHELL_VALUED = {"-o", "+o", "-O", "+O"}
@@ -18,13 +20,49 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DEPTH = 4
 
 
+def substitution(text, i):
+    """(its body, the index just past it) for the command substitution that opens at text[i], a backtick or the $ of $(;
+    an unclosed one runs to the end of the text."""
+    if text[i] == "`":
+        j = i + 1
+        while j < len(text) and text[j] != "`":
+            j += 2 if text[j] == "\\" else 1
+        return text[i + 1:j], min(j + 1, len(text))
+    depth, quote, j = 0, None, i + 1
+    while j < len(text):
+        c = text[j]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"':
+                j += 1
+        elif c == "\\":
+            j += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if not depth:
+                return text[i + 2:j], j + 1
+        j += 1
+    return text[i + 2:], len(text)
+
+
 def segments(line):
     """The text of each simple command in a shell line: split at ; & | newlines and parentheses outside quotes, with
-    comments and heredoc bodies dropped."""
-    text = HEREDOC.sub("", line or "")
+    comments and heredoc bodies dropped, and the commands of each backtick or double-quoted $( ) substitution added."""
+    text = HEREDOC.sub(lambda m: m.group(3), line or "")
     found, current, quote, i = [], [], None, 0
     while i < len(text):
         c = text[i]
+        if quote != "'" and (c == "`" or (quote == '"' and text.startswith("$(", i) and not text.startswith("$((", i))):
+            body, end = substitution(text, i)
+            found += segments(body)
+            current.append(text[i:end])
+            i = end
+            continue
         if quote:
             current.append(c)
             if c == quote:
@@ -55,8 +93,8 @@ def segments(line):
 
 
 def argv(segment):
-    """The argv a simple command runs, past keywords, assignments and wrappers such as env, nohup and timeout; [] when the
-    segment does not parse."""
+    """The argv a simple command runs, past reserved words, assignments, redirections and wrappers such as env, nohup, time
+    and timeout; [] when the segment does not parse."""
     try:
         tokens = shlex.split(segment)
     except ValueError:
@@ -69,6 +107,14 @@ def argv(segment):
             tokens = tokens[1:]
             while tokens and (tokens[0].startswith("-") or ASSIGNMENT.match(tokens[0])):
                 tokens = tokens[2:] if tokens[0] in ("-u", "-C", "-S") else tokens[1:]
+        elif first == "time":
+            tokens = tokens[1:]
+            while tokens and tokens[0].startswith("-"):
+                tokens = tokens[1:]
+        elif first == "function":
+            tokens = tokens[2:]
+        elif redirect := REDIRECT.match(first):
+            tokens = tokens[1:] if redirect.group(1) else tokens[2:]
         elif first == "timeout":
             tokens = tokens[1:]
             while tokens and tokens[0].startswith("-"):

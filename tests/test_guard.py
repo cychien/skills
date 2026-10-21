@@ -98,11 +98,15 @@ class Guard(unittest.TestCase):
         self.assertEqual(self.hook("PreToolUse", bash)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIsNone(self.hook("PreToolUse", {**bash, "agent_id": "a1"}))
         for text in ("make deploy; # guard.py todo", f"make deploy # python3 {GUARD} todo none", "echo 'guard.py todo none --reason x'",
-                     "git commit -m 'autorun.py start later'", f"grep -n 'guard.py todo' {self.skills}/demo/SKILL.md"):
+                     "git commit -m 'autorun.py start later'", f"grep -n 'guard.py todo' {self.skills}/demo/SKILL.md",
+                     f"if grep -q 'guard.py todo' {self.skills}/demo/SKILL.md; then make deploy; fi", f"echo if python3 {GUARD} todo none",
+                     f"echo 'if `python3 {GUARD} todo none`'"):
             out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": text}})
             self.assertEqual(out and out["hookSpecificOutput"]["permissionDecision"], "deny", text)
         for allowed in (f"python3 {GUARD} todo none --reason x; ls", f"python3 {HOOK} mode interactive --reason x", f"cat {self.skills}/demo/SKILL.md",
-                        f"bash -lc 'python3 {GUARD} todo none --reason x'"):
+                        f"bash -lc 'python3 {GUARD} todo none --reason x'", f"if python3 {GUARD} todo show 1; then :; fi",
+                        f"while ! python3 {GUARD} todo none --reason x; do sleep 1; done", f"{{ python3 {GUARD} todo show 1; }} 2>&1 | tail -3",
+                        f"time -p python3 {GUARD} todo show 1", f'shown="$(python3 {GUARD} todo show 1)"'):
             self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": allowed}}), allowed)
         self.todo("none", "--reason", "one-line change")
         self.assertIsNone(self.hook("PreToolUse", bash))
@@ -288,6 +292,11 @@ class Guard(unittest.TestCase):
         self.assertEqual(out["permissionDecision"], "deny")
         for fragment in ("Conventional Commits", "--draft", "## Scope"):
             self.assertIn(fragment, out["permissionDecisionReason"])
+        wrapped = {"tool_name": "Bash", "tool_input": {"command": "if gh pr create --title 'Add export.' --draft --body 'stuff'; then :; fi"}}
+        self.assertEqual(self.hook("PreToolUse", wrapped)["hookSpecificOutput"]["permissionDecisionReason"], out["permissionDecisionReason"])
+        for command in ("gh pr create --title 'feat: add export.'; echo opened", "gh pr create --title 'feat: add export' --body '## Scope\nx' && gh pr edit --title 'x'"):
+            self.assertIn("Conventional Commits", self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+                          ["hookSpecificOutput"]["permissionDecisionReason"], command)
         good = textwrap.dedent("""\
             gh pr create --title 'feat(cli): add export command' --body "$(cat <<'EOF'
             ## Why
@@ -301,6 +310,9 @@ class Guard(unittest.TestCase):
             EOF
             )\"""")
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": good}}))
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"if {good}; then :; fi"}}))
+        for command in ("gh pr create --title 'feat: x' --body \"$(cat body.md)\"", "gh pr create --title 'fix: y' --body '## Scope\nx'"):
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}}), command)
         not_ready = "gh pr create --title 'fix: refuse stale keys' --body '## Not ready to merge\n- T1 FAIL\n\n## Why\ny\n\n## Scope\nx'"
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": not_ready}}))
         late = "gh pr create --title 'fix: refuse stale keys' --body '## Why\ny\n\n## Not ready to merge\n- T1\n\n## Scope\nx'"
@@ -913,12 +925,19 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "grep -n 'verify.py rerun' notes.md"}}))
         for wrapped in ("bash -lc 'python3 ../verify/scripts/verify.py rerun'", "sh -c \"cd /repo && python3 '../verify/scripts/verify.py' rerun --only T1\"",
                         "env FOO=1 zsh -c 'python3 ../verify/scripts/verify.py rerun'", "eval 'python3 ../verify/scripts/verify.py rerun'",
-                        "bash -c \"bash -c 'python3 ../verify/scripts/verify.py rerun'\""):
+                        "bash -c \"bash -c 'python3 ../verify/scripts/verify.py rerun'\"",
+                        "if python3 ../verify/scripts/verify.py rerun --only T1; then :; fi", "until ! python3 ../verify/scripts/verify.py rerun; do :; done",
+                        "if true; then :; elif python3 ../verify/scripts/verify.py rerun; then :; else :; fi",
+                        "{ python3 ../verify/scripts/verify.py rerun --only T1; } 2>&1 | tee rerun.out", "time -p python3 ../verify/scripts/verify.py rerun",
+                        "2>&1 python3 ../verify/scripts/verify.py rerun", 'out="$(python3 ../verify/scripts/verify.py rerun --only T1)"',
+                        "echo `python3 ../verify/scripts/verify.py rerun`", "bash -lc 'if python3 ../verify/scripts/verify.py rerun; then :; fi'"):
             out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": wrapped}})
             self.assertEqual(out and out["hookSpecificOutput"]["permissionDecision"], "deny", wrapped)
         out = self.hook("PreToolUse", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "python3 ../verify/scripts/verify.py rerun"]}})
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        for text in ("echo \"bash -lc 'verify.py rerun'\" >> notes.md", "git commit -m 'run verify.py rerun after fixes'", "ls # verify.py rerun"):
+        for text in ("echo \"bash -lc 'verify.py rerun'\" >> notes.md", "git commit -m 'run verify.py rerun after fixes'", "ls # verify.py rerun",
+                     "if grep -q 'verify.py rerun' notes.md; then echo if; fi", "echo 'then `python3 verify.py rerun`' >> notes.md",
+                     "git commit -m \"$(cat <<'EOF'\nif python3 verify.py rerun; then :; fi\nEOF\n)\"", "echo \"run \\`verify.py rerun\\` next\""):
             self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": text}}), text)
         self.hook("SubagentStop", {"agent_id": "fix-1", "last_assistant_message": "Fixed T1."})
         self.assertIsNone(self.hook("PreToolUse", rerun))
@@ -931,10 +950,14 @@ class Guard(unittest.TestCase):
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn("The PR opens in item 3", out["permissionDecisionReason"])
         self.assertIn("1. Build., 2. Prove.", out["permissionDecisionReason"])
-        for wrapped in ("bash -lc \"gh pr create --title 'feat: x' --body x\"", "env GH_TOKEN=x gh pr create --title x", "eval 'gh pr create -t x'"):
+        for wrapped in ("bash -lc \"gh pr create --title 'feat: x' --body x\"", "env GH_TOKEN=x gh pr create --title x", "eval 'gh pr create -t x'",
+                        "if gh pr create --title 'feat: x' --body x; then :; fi", "while ! gh pr create -t x; do sleep 5; done",
+                        "if ! git push; then :; else gh pr create -t x; fi", "( cd /repo && gh pr create -t x )",
+                        "cat <<'EOF' | gh pr create --title 'feat: x' --body-file -\n## Scope\nx\nEOF", 'url="$(gh pr create -t x)"'):
             out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": wrapped}})
             self.assertEqual(out and out["hookSpecificOutput"]["permissionDecision"], "deny", wrapped)
-        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "echo 'gh pr create next' >> plan.md"}}))
+        for text in ("echo 'gh pr create next' >> plan.md", "if grep -q 'gh pr create' plan.md; then echo then; fi"):
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": text}}), text)
         self.close(1)
         self.todo("skip", "2", "--reason", "no checks")
         self.assertIsNone(self.hook("PreToolUse", create))
