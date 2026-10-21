@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
-"""The todo list guard holds an agent to. The agent decides what goes in it; guard makes every item resolve.
+"""The todo list guard holds an agent to. The agent decides what goes in it; guard makes every item resolve, in order.
 
 usage:
-  guard.py todo from <skill> [--session AGENT:ID]        copy a skill's steps in, verbatim
+  guard.py todo from <skill> [--session AGENT:ID]        copy a skill's steps in, verbatim, with their order
   guard.py todo add <text> [<text> ...] [--session AGENT:ID]
-  guard.py todo done <n> [<n> ...] [--note TEXT] [--not-run SKILL ... --reason TEXT] [--session AGENT:ID]
+  guard.py todo show <n> [--session AGENT:ID]            print an item with the principles it names, and its token
+  guard.py todo done <n> [<n> ...] [--token TOKEN ...] [--note TEXT] [--session AGENT:ID]
   guard.py todo skip <n> [<n> ...] --reason TEXT [--session AGENT:ID]
   guard.py todo wait <n> [<n> ...] --reason TEXT [--session AGENT:ID]  end the turn on a question only the user can answer
+  guard.py todo hold --until <HH:MM or ISO time> --reason TEXT [--session AGENT:ID]  end turns with open items until then
   guard.py todo none --reason TEXT [--session AGENT:ID]  this task needs no list
   guard.py todo list [--session AGENT:ID]
+  guard.py todo check [--session AGENT:ID]               exit 0 when no item is open or waiting, else 1 and the list
   guard.py todo clear --reason TEXT [--session AGENT:ID] the user stopped the work
+  guard.py lint <skill name or SKILL.md path> | --all    report what keeps guard from reading a skill's steps
+  guard.py quota status                                  the usage limits in force
+  guard.py quota pick --role <planner|executor> [--avoid AGENT[:MODEL] ...] [--relax]
 
-A subagent adds --agent ID (its agent id, which guard names when it asks) to every command, so its list stays its own.
+A subagent adds --agent ID (its agent id, which guard names when it asks) to every todo command, so its list stays its own.
+An item copied from a skill closes only with the token `todo show` prints for it, and only once the items it waits on resolve.
 """
 import argparse
+import datetime
 import os
+import shlex
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from guard_lib import autonomy, gates, skills, state  # noqa: E402
+from guard_lib import autonomy, gates, lint, order, proof, quota, skills, state  # noqa: E402
+
+MARKS = {"open": "[ ]", "waiting": "[?]", "done": "[x]", "skipped": "[-]"}
+NOT_RUN_DEPRECATED = ("guard: --not-run is deprecated and ignored: an item no longer needs the skills it names read first. "
+                      "Its --reason is kept as the note. The flag goes away in the next release.")
 
 
 def session(ref):
@@ -32,37 +46,51 @@ def session(ref):
     sys.exit("guard: pass --session AGENT:ID from the hook message.")
 
 
-def show(data):
+def command(agent, sid, agent_id):
+    flags = f"--session {shlex.quote(f'{agent}:{sid}')}" + (f" --agent {shlex.quote(agent_id)}" if agent_id else "")
+    return f"python3 {shlex.quote(os.path.abspath(__file__))}", flags
+
+
+def listing(data):
     if not data["todo"]:
         return "The todo list is empty."
-    marks = {"open": "[ ]", "waiting": "[?]", "done": "[x]", "skipped": "[-]"}
     lines = ["Todo:"]
     for i in data["todo"]:
         source = f" ({i['source']})" if i["source"] else ""
         note = f" - {'waiting on the user: ' if i['status'] == 'waiting' else ''}{i['note']}" if i["note"] else ""
-        lines.append(f"  {marks[i['status']]} {i['n']}. {i['title']}{source}{note}")
+        blocked = state.blocking(data, i) if i["status"] == "open" else []
+        after = f" [after {', '.join(str(b['n']) for b in blocked)}]" if blocked else ""
+        lines.append(f"  {MARKS[i['status']]} {i['n']}. {i['title']}{source}{after}{note}")
+    hold = state.held(data)
+    if hold:
+        lines.append(f"Held until {quota.clock(hold['until'])}: {hold['reason']}")
     return "\n".join(lines)
 
 
-def resolve(data, own, n, status, note, not_run=()):
+def item_of(own, n):
     item = next((i for i in own["todo"] if i["n"] == n), None)
     if not item:
         sys.exit(f"guard: the todo list has no item {n}.")
+    return item
+
+
+def resolve(own, n, status, note, tokens, cli):
+    item = item_of(own, n)
+    cmd, sess = cli
     if status == "skipped" and item["mandatory"]:
         sys.exit(f"guard: item {n} is mandatory and cannot be skipped.")
     if status == "waiting" and item["status"] in ("done", "skipped"):
         sys.exit(f"guard: item {n} is already {item['status']}, so it has nothing to wait on.")
     if status == "done":
-        unread = sorted(set(skills.SKILL_REF.findall(item["text"])) - set(data["skills"]) - set(not_run))
-        if unread:
-            sys.exit("guard: item {} names skills you have not read this session: {}. Read them first, or when the step did not run one "
-                     "(its condition did not hold), close the item with `todo done {} --not-run <skill> --reason \"<why>\"`.".format(
-                         n, ", ".join(f"../{u}/SKILL.md" for u in unread), n))
-        if "every principle file" in item["text"]:
-            missing = sorted(set(skills.principles(os.getcwd()).values()) - set(data["principles_read"]))
-            if missing:
-                sys.exit("guard: item {} needs every principle file read first; still unread: {}.".format(
-                    n, ", ".join(f"references/principles/{m}.md" for m in missing)))
+        blocked = state.blocking(own, item)
+        if blocked:
+            sys.exit("guard: item {} waits on {}, still {}. Resolve {} first, then mark item {} done.".format(
+                n, ", ".join(f"item {b['n']} ({b['title']})" for b in blocked), " or ".join(sorted({b["status"] for b in blocked})),
+                "it" if len(blocked) == 1 else "them", n))
+        if item["source"] and proof.token(item, os.getcwd()) not in tokens:
+            why = "The token does not match its current text" if tokens else f"It came from the {item['source']} skill, so closing it needs proof you read it"
+            sys.exit(f"guard: item {n} stays open. {why}: run `{cmd} todo show {n} {sess}`, read it, then "
+                     f"`{cmd} todo done {n} --token <token> {sess}` with the token it prints.")
         failed = gates.failures(item["text"])
         if failed:
             sys.exit(f"guard: item {n} stays open, because " + "\n".join(failed) + "\nFix what the gate reports, then mark the item done again.")
@@ -78,56 +106,77 @@ def resolve(data, own, n, status, note, not_run=()):
     return message
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    todo = sub.add_parser("todo").add_subparsers(dest="action", required=True)
-    p = todo.add_parser("from")
-    p.add_argument("skill")
-    p = todo.add_parser("add")
-    p.add_argument("text", nargs="+")
-    p = todo.add_parser("done")
-    p.add_argument("n", type=int, nargs="+")
-    p.add_argument("--note")
-    p.add_argument("--not-run", action="append", default=[], metavar="SKILL")
-    p.add_argument("--reason")
-    p = todo.add_parser("skip")
-    p.add_argument("n", type=int, nargs="+")
-    p.add_argument("--reason", required=True)
-    p = todo.add_parser("wait")
-    p.add_argument("n", type=int, nargs="+")
-    p.add_argument("--reason", required=True)
-    for name in ("none", "clear"):
-        todo.add_parser(name).add_argument("--reason", required=True)
-    todo.add_parser("list")
-    for p in todo.choices.values():
-        p.add_argument("--session")
-        p.add_argument("--agent")
-    args = parser.parse_args()
-    agent, sid = session(args.session)
+def until(text, now=None):
+    """Epoch seconds for --until: HH:MM is its next occurrence, an ISO time is taken as given (local when it has no zone)."""
+    now = now or time.time()
+    try:
+        clock = datetime.datetime.strptime(text, "%H:%M")
+    except ValueError:
+        clock = None
+    if clock:
+        moment = datetime.datetime.fromtimestamp(now).replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+        return (moment + datetime.timedelta(days=1) if moment.timestamp() <= now else moment).timestamp()
+    try:
+        moment = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        sys.exit(f"guard: --until takes HH:MM or an ISO time such as 2026-10-21T15:05, not {text!r}.")
+    if moment.timestamp() <= now:
+        sys.exit(f"guard: {text} has already passed; hold until a time still ahead.")
+    return moment.timestamp()
 
+
+def from_skill(own, data, name):
+    path = skills.find(name, os.getcwd())
+    steps = skills.steps(path) if path else []
+    if not steps:
+        sys.exit(f"guard: found no steps in the {name} skill. Add its steps with `todo add`, or run `todo none` if it has none.")
+    waits = order.dependencies(steps)
+    loop = order.cycle(waits)
+    if loop:
+        sys.exit(f"guard: the {name} skill's steps wait on each other in a cycle ({' -> '.join(map(str, loop))}), so its list could "
+                 f"never close. Run `guard.py lint {path}` and fix the step text, or add the steps with `todo add`.")
+    position = {n: i for i, (n, *_) in enumerate(steps)}
+    state.add_items(own, [t for _, _, t, _ in steps], source=name, source_path=path, titles=[t for _, t, _, _ in steps],
+                    mandatory=[m for _, _, _, m in steps], after=[[position[d] for d in waits[n]] for n, *_ in steps])
+    if name not in data["skills"]:
+        data["skills"].append(name)
+    return f"Copied {len(steps)} steps from {name}. Add task-specific items after them with `todo add`. Close each with the token `todo show <n>` prints."
+
+
+def run_todo(args):
+    agent, sid = session(args.session)
+    cli = command(agent, sid, args.agent)
     if args.action == "list":
-        print(show(state.own_list(state.load(agent, sid), args.agent)))
+        print(listing(state.own_list(state.load(agent, sid), args.agent)))
+        return
+    if args.action == "check":
+        own = state.own_list(state.load(agent, sid), args.agent)
+        if state.unresolved(own):
+            print(listing(own))
+            sys.exit(1)
+        print("Every item is resolved." if own["todo"] else "The todo list is empty.")
         return
     if args.action == "wait":
         run = autonomy.active_run(agent, sid)
         if run and not autonomy.waiting_on_user(run):
             sys.exit(f"guard: this session is in an autonomous run, where the user is not available. Route the question with `{autonomy.ask_command(run)} --kind <kind> --question \"...\" --pick \"...\" --why \"...\" --confidence <level>` and keep working. Once `ask` escalates it to the user, `todo wait` is allowed.")
+    if args.action == "done" and args.reason and not args.not_run:
+        sys.exit("guard: --reason on done only goes with the deprecated --not-run. Use --note to annotate.")
     with state.update(agent, sid) as data:
         own = state.own_list(data, args.agent)
         decided = own.get("todo_undecided")
         if decided and args.action in ("from", "add", "none"):
             data.setdefault("todo_decided", []).append(decided)
+        if args.action == "show":
+            item = item_of(own, args.n)
+            for _, content, stem in proof.attachments(item, os.getcwd()):
+                if stem and content and stem not in data["principles_read"]:
+                    data["principles_read"].append(stem)
+            own["activity"] = own.get("activity", 0) + 1
+            print(proof.render(item, os.getcwd()))
+            return
         if args.action == "from":
-            path = skills.find(args.skill, os.getcwd())
-            steps = skills.steps(path) if path else []
-            if not steps:
-                sys.exit(f"guard: found no steps in the {args.skill} skill. Add its steps with `todo add`, or run `todo none` if it has none.")
-            state.add_items(own, [t for _, _, t, _ in steps], source=args.skill, source_path=path,
-                            titles=[t for _, t, _, _ in steps], mandatory=[m for _, _, _, m in steps])
-            if args.skill not in data["skills"]:
-                data["skills"].append(args.skill)
-            message = f"Copied {len(steps)} steps from {args.skill}. Add task-specific items after them with `todo add`."
+            message = from_skill(own, data, args.skill)
         elif args.action == "add":
             flags = [t for t in args.text if t.startswith("-")]
             if flags:
@@ -139,31 +188,108 @@ def main():
             message = f"No todo list for this task: {args.reason}"
         elif args.action == "clear":
             own["archived"].append({"cleared": args.reason, "items": own["todo"]})
-            own["todo"], own["todo_undecided"] = [], None
+            own["todo"], own["todo_undecided"], own["hold"] = [], None, None
             message = f"Todo list cleared: {args.reason}. Say so in your final reply."
+        elif args.action == "hold":
+            at = until(args.until)
+            own["hold"] = {"until": at, "reason": args.reason}
+            message = (f"Held until {quota.clock(at)}: {args.reason}. Until then a turn may end with open items; "
+                       "the hold expires on its own.")
         else:
             status = {"done": "done", "skip": "skipped", "wait": "waiting"}[args.action]
-            note = args.note if args.action == "done" else args.reason
-            not_run = [skills.skill_name(s) for s in args.not_run] if args.action == "done" else []
-            if args.action == "done" and not_run:
-                if not args.reason:
-                    sys.exit("guard: --not-run needs --reason, the user reads why the skill did not run.")
-                named = {s for i in own["todo"] if i["n"] in args.n for s in skills.SKILL_REF.findall(i["text"])}
-                stray = sorted(set(not_run) - named)
-                if stray:
-                    sys.exit("guard: {} not named by the item(s) being closed.".format(", ".join(f"../{s}/SKILL.md" for s in stray)))
-                note = " - ".join(filter(None, [f"not run: {', '.join(not_run)}", args.reason, args.note]))
-            elif args.action == "done" and args.reason:
-                sys.exit("guard: --reason on done only goes with --not-run. Use --note to annotate.")
-            message = "\n".join(resolve(data, own, n, status, note, not_run) for n in args.n)
+            note = args.reason if args.action != "done" else " - ".join(filter(None, [args.reason, args.note])) or None
+            if args.action == "done" and args.not_run:
+                print(NOT_RUN_DEPRECATED)
+            tokens = set(args.token) if args.action == "done" else set()
+            message = "\n".join(resolve(own, n, status, note, tokens, cli) for n in args.n)
             if own["todo"] and not state.unresolved(own):
                 message += "\nEvery item is resolved; list them with their marks in your final reply."
             elif status == "waiting" and not state.open_items(own):
                 message += "\nEnd the turn now with your question in plain text. Waiting items reopen when the user replies."
         own["activity"] = own.get("activity", 0) + 1
-        report = show(own)
+        report = listing(own)
     print(message)
     print(report)
+
+
+def run_lint(args):
+    if args.all:
+        paths = lint.installed(os.getcwd())
+    elif args.target:
+        found = args.target if args.target.endswith(".md") else skills.find(args.target, os.getcwd())
+        if not found or not os.path.isfile(found):
+            sys.exit(f"guard: no skill {args.target!r} under the skill roots; pass its SKILL.md path.")
+        paths = [found]
+    else:
+        sys.exit("guard: lint takes a skill name, a SKILL.md path, or --all.")
+    failed = False
+    for path in paths:
+        errors, warnings = lint.lint(path)
+        failed = failed or bool(errors)
+        for kind, problems in (("error", errors), ("warning", warnings)):
+            for problem in problems:
+                print(f"{path}: {kind}: {problem}")
+    print(f"Linted {len(paths)} skill(s): {'errors found' if failed else 'no errors'}.")
+    sys.exit(1 if failed else 0)
+
+
+def run_quota(args):
+    if args.action == "status":
+        print(quota.status())
+        return
+    entry, relaxed, why = quota.pick(os.getcwd(), args.role, args.avoid, relax=args.relax)
+    if args.relax:
+        print("Fallback order:\n" + "\n".join(f"  {i}. {step}" for i, step in enumerate(quota.FALLBACK, 1)))
+    if not entry:
+        sys.exit(f"guard: {why}")
+    print(quota.spec(entry))
+    if relaxed:
+        print(f"relaxed: {relaxed}. Report it in the PR's Verification section and in report.md.")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    todo = sub.add_parser("todo").add_subparsers(dest="action", required=True)
+    p = todo.add_parser("from")
+    p.add_argument("skill")
+    p = todo.add_parser("add")
+    p.add_argument("text", nargs="+")
+    p = todo.add_parser("show")
+    p.add_argument("n", type=int)
+    p = todo.add_parser("done")
+    p.add_argument("n", type=int, nargs="+")
+    p.add_argument("--token", action="append", default=[])
+    p.add_argument("--note")
+    p.add_argument("--not-run", action="append", default=[], metavar="SKILL", help=argparse.SUPPRESS)
+    p.add_argument("--reason")
+    p = todo.add_parser("skip")
+    p.add_argument("n", type=int, nargs="+")
+    p.add_argument("--reason", required=True)
+    p = todo.add_parser("wait")
+    p.add_argument("n", type=int, nargs="+")
+    p.add_argument("--reason", required=True)
+    p = todo.add_parser("hold")
+    p.add_argument("--until", required=True)
+    p.add_argument("--reason", required=True)
+    for name in ("none", "clear"):
+        todo.add_parser(name).add_argument("--reason", required=True)
+    todo.add_parser("list")
+    todo.add_parser("check")
+    for p in todo.choices.values():
+        p.add_argument("--session")
+        p.add_argument("--agent")
+    p = sub.add_parser("lint")
+    p.add_argument("target", nargs="?")
+    p.add_argument("--all", action="store_true")
+    q = sub.add_parser("quota").add_subparsers(dest="action", required=True)
+    q.add_parser("status")
+    p = q.add_parser("pick")
+    p.add_argument("--role", required=True, choices=quota.ROLES)
+    p.add_argument("--avoid", action="append", default=[], metavar="AGENT[:MODEL]")
+    p.add_argument("--relax", action="store_true")
+    args = parser.parse_args()
+    {"todo": run_todo, "lint": run_lint, "quota": run_quota}[args.cmd](args)
 
 
 if __name__ == "__main__":

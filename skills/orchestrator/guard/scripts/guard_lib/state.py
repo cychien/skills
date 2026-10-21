@@ -73,8 +73,9 @@ def unresolved(data):
     return [i for i in data["todo"] if i["status"] in ("open", "waiting")]
 
 
-def add_items(data, texts, source=None, source_path=None, titles=None, mandatory=None):
-    """Append items; a list whose every item is resolved is archived first, so a new task starts a new list."""
+def add_items(data, texts, source=None, source_path=None, titles=None, mandatory=None, after=None):
+    """Append items; a list whose every item is resolved is archived first, so a new task starts a new list.
+    after[i] lists the positions in texts that item i waits on."""
     if data["todo"] and not unresolved(data):
         data["archived"].append({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "items": data["todo"]})
         data["todo"] = []
@@ -87,7 +88,19 @@ def add_items(data, texts, source=None, source_path=None, titles=None, mandatory
             "source": source,
             "source_path": str(source_path) if source_path else None,
             "mandatory": bool(mandatory[i]) if mandatory else "Mandatory" in text,
+            "after": [start + j for j in after[i]] if after else [],
             "status": "open",
             "note": None,
         })
     data["todo_undecided"] = None
+
+
+def blocking(data, item):
+    """The unresolved items this item waits on."""
+    return [i for i in data["todo"] if i["n"] in item.get("after", []) and i["status"] in ("open", "waiting")]
+
+
+def held(data, now=None):
+    """The list's timed wait while it lasts, else None."""
+    hold = data.get("hold")
+    return hold if hold and hold.get("until", 0) > (now or time.time()) else None
