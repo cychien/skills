@@ -383,7 +383,8 @@ def order_problem(event, command):
                 cmd, sess = cli(event)
                 return (f"The PR opens in item {closing['n']} ({closing['title']}), the close step, and earlier steps are unresolved: "
                         + ", ".join(f"{i['n']}. {i['title']}" for i in early)
-                        + f". Resolve them first (`{cmd} todo done <n> {sess}`), then open the PR.")
+                        + f". Resolve them first (`{cmd} todo show <n> {sess}`, then `todo done <n> --token <token>` with the token it prints, "
+                        "or `todo skip <n> --reason` for a step that allows it), then open the PR.")
     return None
 
 
