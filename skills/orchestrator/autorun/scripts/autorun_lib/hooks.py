@@ -1,6 +1,7 @@
 """Agent-neutral hook decisions. Each handler returns (action, message); adapters render it per agent."""
 import os
 import re
+import time
 import shlex
 import subprocess
 import sys
@@ -31,6 +32,7 @@ class Event:
     waiting_on_background: bool = False
     can_inject: bool = True
     stop_status: str = None
+    hold: dict = None
 
 
 def cli():
@@ -237,6 +239,9 @@ def on_post_tool(event, run, role):
 def on_stop(event, run, role):
     if event.waiting_on_background:
         return PASS
+    if event.hold:
+        until = time.strftime("%H:%M", time.localtime(event.hold["until"]))
+        return "note", f"autorun: run {run.id} paused on a timed hold until {until}: {event.hold.get('reason')}"
     if role != "root":
         if event.stop_hook_active or not policy.ends_with_question(event.last_message):
             return PASS

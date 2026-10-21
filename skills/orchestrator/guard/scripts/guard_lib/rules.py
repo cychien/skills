@@ -120,6 +120,13 @@ def handle(event):
     return PASS
 
 
+def active_hold(event):
+    """The stopping agent's own `todo hold` while it lasts, else None."""
+    if not event.session or not state.exists(event.agent, event.session):
+        return None
+    return state.held(state.own_list(state.load(event.agent, event.session), event.agent_id))
+
+
 def delegate_acts(event):
     """Mark a subagent running from its first tool call; one whose stop went through but that acts again keeps its start."""
     if state.exists(event.agent, event.session) and state.load(event.agent, event.session).get("delegates", {}).get(event.agent_id, {}).get("running"):

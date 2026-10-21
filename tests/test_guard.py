@@ -758,6 +758,36 @@ class Guard(unittest.TestCase):
         self.assertEqual(self.stop("Waiting for the codex limit.")["decision"], "block")
         self.assertNotIn("Held until", self.todo("list"))
 
+    def test_an_autonomous_run_lets_a_held_turn_end_without_counting_it_as_idle(self):
+        home = pathlib.Path(self.env["AUTORUN_HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.json").write_text(json.dumps({"review": False}))
+        self.hook("UserPromptSubmit", {"prompt": "going to bed, build it"})
+        run = next((home / "active").iterdir()).name
+        subprocess.run([sys.executable, str(HOOK), "start", "--run", run, "--session", "claude:s1", "--done", "shipped"], env=self.env, capture_output=True, text=True, cwd=self.tmp.name)
+        self.todo("add", "Run the codex check")
+        for _ in range(2):
+            self.assertEqual(self.stop("Waiting for the codex limit.")["decision"], "block")
+        later = (datetime.datetime.now() + datetime.timedelta(minutes=90)).strftime("%H:%M")
+        self.todo("hold", "--until", later, "--reason", "codex usage limit resets")
+        for _ in range(5):
+            out = self.stop("Waiting for the codex limit.")
+            self.assertNotIn("decision", out)
+            self.assertEqual(out["systemMessage"], f"autorun: run {run} paused on a timed hold until {later}: codex usage limit resets")
+        self.assertEqual(self.stop("Waiting \u2014 for the limit.")["decision"], "block")
+        self.assertEqual(self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": "Waiting?"})["decision"], "block")
+        self.todo("add", "Sub item", "--agent", "ex-1")
+        self.todo("hold", "--until", later, "--reason", "claude limit", "--agent", "ex-1")
+        self.assertIn("claude limit", self.hook("SubagentStop", {"agent_id": "ex-1", "last_assistant_message": "Waiting?"})["systemMessage"])
+        path = pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json")
+        data = self.state()
+        data["hold"]["until"] = time.time() - 1
+        path.write_text(json.dumps(data))
+        blocked = self.stop("Waiting for the codex limit.")
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("is not done", blocked["reason"])
+        self.assertFalse(any((home / "runs").glob("*/gates/*")) if (home / "runs").exists() else False)
+
     def test_todo_check_exits_zero_only_when_nothing_is_open_or_waiting(self):
         self.assertIn("empty", self.todo("check"))
         self.todo("add", "One")

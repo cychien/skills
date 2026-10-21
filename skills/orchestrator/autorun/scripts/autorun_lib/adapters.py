@@ -69,6 +69,8 @@ def render(agent, native_event, event, decision):
     action, message = decision
     if action == "pass" or not message and action not in ("allow", "retry"):
         return None, 0
+    if action == "note":
+        return ({"systemMessage": message}, 0) if agent in ("claude", "codex") else (None, 0)
     if agent in ("claude", "codex"):
         if action == "deny":
             return {"hookSpecificOutput": {"hookEventName": native_event, "permissionDecision": "deny", "permissionDecisionReason": message}}, 0
