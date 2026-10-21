@@ -1,6 +1,6 @@
 ---
 name: guard
-description: Hard rules that enforce skill conventions through hooks, so an agent cannot skip them - a todo list every item of which must resolve, one per agent, check-script gates on playbook steps, one verifier per check, foreground delegates from subagents, principle citations backed by reads, no em dash in replies, and the open-pr PR rules. Use when a guard message blocks you, to manage the todo list, or to add, change, or debug a guard rule.
+description: Hard rules that enforce skill conventions through hooks, so an agent cannot skip them - a todo list every item of which must resolve in its steps' order, one per agent, a read token per step, check-script gates on playbook steps, one verifier per check, foreground delegates from subagents, short hand-backs, a shared usage-limit registry that hands work to the next model, no em dash in replies, and the open-pr PR rules. Use when a guard message blocks you, to manage the todo list, or to add, change, or debug a guard rule.
 ---
 
 # Guard
@@ -9,11 +9,18 @@ An instruction in a skill fails silently when an agent skips it. Guard moves the
 
 ## Rules
 
-- **Todo list.** The agent decides what goes in the todo list, as in pstack: usually a skill's steps copied in verbatim, then task-specific items. Guard holds it to the list. Once a list exists, the turn cannot end while an item is open, except to ask the user a question or while background work is pending. To end the turn on a plain-text question (for example after the user declined a question tool and asked you to clarify), first mark the items that wait on the answer with `todo wait <n> --reason "<what the user must answer>"`: the turn may end once every open item is waiting, and waiting items reopen when the user's next prompt arrives. In an autonomous run `todo wait` is refused, because questions go through `autorun.py ask`, until `ask` escalates one to the user: while the run has a gate waiting on the user, `todo wait` works, so the turn ends on that question instead of looping the stop hook. In a non-interactive session (`claude -p`, `codex exec`), pending background work does not count, because ending the turn ends the process and kills that work. An item whose text says "Mandatory" cannot be skipped. An item that names other skills by path (`../<skill>/SKILL.md`) can be marked done only after those skills were read this session, unless the step ran none of them because its condition did not hold: close it with `todo done <n> --not-run <skill> [--not-run <skill> ...] --reason "<why>"`, and the reason shows in the list like a skip reason. Without `--not-run` an unread named skill still refuses. An item that reads "every principle file" only after each file in the **principles** skill was read. Skipping an item that would run another skill also skips that skill's items. After three stops in a row with no progress in between, guard lets the turn end, so a stuck run cannot loop forever, unless a Mandatory item is open: that one holds until it closes, and the only way out is a question to the user that names what blocks it.
+- **Todo list.** The agent decides what goes in the todo list, as in pstack: usually a skill's steps copied in verbatim, then task-specific items. Guard holds it to the list. Once a list exists, the turn cannot end while an item is open, except to ask the user a question or while background work is pending. To end the turn on a plain-text question (for example after the user declined a question tool and asked you to clarify), first mark the items that wait on the answer with `todo wait <n> --reason "<what the user must answer>"`: the turn may end once every open item is waiting, and waiting items reopen when the user's next prompt arrives. In an autonomous run `todo wait` is refused, because questions go through `autorun.py ask`, until `ask` escalates one to the user: while the run has a gate waiting on the user, `todo wait` works, so the turn ends on that question instead of looping the stop hook. In a non-interactive session (`claude -p`, `codex exec`), pending background work does not count, because ending the turn ends the process and kills that work. An item whose text says "Mandatory" cannot be skipped. Skipping an item that would run another skill also skips that skill's items. After three stops in a row with no progress in between, guard lets the turn end, so a stuck run cannot loop forever, unless a Mandatory item is open: that one holds until it closes, and the only way out is a question to the user that names what blocks it.
+- **Order.** `todo from` gives each item the steps it waits on: by default the step before it. A step that says "in parallel with step N", "beside step N", or "in the same message as step N" waits on what N waits on, so the two open together, and a step that says "Starts after step N" (or "steps N and M", "N, M and K") waits on exactly those. When a parallel pair is followed by a step with no such phrase, that step waits on both. `todo done` refuses an item while a step it waits on is open or waiting and names it; skipped and done steps count as resolved. Items from `todo add` wait on nothing and nothing waits on them. The list shows `[after <n>]` beside an item still waiting.
+- **Read before done.** `todo show <n>` prints an item's full text, then the principles it names: for `../principles/SKILL.md` the principles index, for each `../principles/references/principles/<x>.md` that file. Its last line is `token: <6 hex>`, a hash of the text and those attachments. An item copied from a skill closes only with `todo done <n> --token <token>`, so a wrong or stale token (the skill or a principle file changed) refuses with the command to show it again. Showing a principle file counts as reading it.
+- **Timed waits.** `todo hold --until <HH:MM or ISO time> --reason "..."` lets a turn end with open items until that time, for a usage limit that resets at a known time or a long external job; it expires on its own. A bare HH:MM means its next occurrence.
 - **Own lists.** Each subagent keeps its own todo list, apart from the lead's in the same session, so a delegate's `todo from` never adds its items to the lead's list. A subagent adds `--agent <its agent id>` to every todo command; guard denies a subagent's todo command without it and names the id. The lead's stop checks only the lead's list, and a subagent's stop holds only on its own.
-- **Gates.** An item whose text names a skill's check script in backticks, as in `` `../verify/scripts/verify.py plan` ``, can be marked done only when guard runs that script from the agent's working directory and it exits 0. A failing gate prints the script's output and keeps the item open, so a playbook step backed by a check cannot be closed on the agent's word.
+- **Gates.** An item whose text names a skill's check script in backticks, as in `` `../verify/scripts/verify.py plan` `` or `` `../verify/scripts/verify.py plan --checks` `` (argument words and valueless flags only), can be marked done only when guard runs that script from the agent's working directory and it exits 0. A failing gate prints the script's output and keeps the item open, so a playbook step backed by a check cannot be closed on the agent's word.
 - **Todo decision.** When the agent is about to follow a skill that has steps, whether the user invoked it by `/name` or a switchboard led the agent to it, tool calls stay held until the agent decides the list: copy the skill's steps, add its own items, or record that it needs none. A switchboard without steps asks nothing, so the decision falls on the playbook it leads to. Reading a `SKILL.md` counts as following that skill when the file sits under a skill root (`.agents/skills`, `.claude/skills`, and their home-directory counterparts) or outside the current git working tree; a skill's own source inside the working tree is being authored, so reading it asks nothing. A read that only satisfies an open item's citation asks nothing; a `/name` invocation or a Skill tool load still does.
-- **Principle citations.** Once a session uses the **principles** skill or reads a principle file, a reply that names a principle must come after reading that principle's file in `references/principles/` this session. Only real reads count (the read tool, or `cat`, `head`, `sed -n`, and similar on the file); editing or searching a file does not.
+- **Short hand-backs.** A subagent whose final message, or SubagentHandback message, is longer than 300 words (a CJK character counts as half a word) is sent back once: put the details in a file and hand back at most 200 words with the file path. The same message sent again with an unchanged length goes through, so an agent type that cannot write files is not looped.
+- **One rerun after every fix.** A shell command that runs `verify.py rerun` (with or without `--only`) is denied while the session tracks a running subagent other than the caller, because a fix group still working would make the run grade half its fixes.
+- **PR at the close step.** `gh pr create` is denied while the lead's list holds an item from a skill that names `../open-pr/SKILL.md` and an earlier item from that skill is still open or waiting.
+- **Usage limits.** Guard keeps a registry of limited subscriptions in `~/.agents/orchestrator/limits.json` (`ORCHESTRATOR_HOME` overrides the folder), one entry per agent (`claude`, `codex`) with `until`, `seen`, and `source`; an expired entry is ignored. It records a limit from the result of the Agent and SendMessage tools and of shell commands that run `codex`, `claude -p`, or `salvo.py`, never from other output, and salvo records the limits its runs hit. A shell command that starts a limited agent (`salvo.py run` with its entry, or `codex exec`) is denied with the next candidate for each role. A native Agent spawn is not checked, because it runs on the lead's own subscription.
+- **Reserved subscriptions.** When the branch's verification plan (`verify.py where`, then the plan it holds or the adopted phase plan) has a check with a `- Agent: real` line, the agents those checks drive, other than the lead's own, are reserved for them: `salvo.py run` or `codex exec` on one is denied with a `quota pick --avoid` alternative, except in a check script run (`verify.py rerun`). A check names the agents it drives in its own text, else the plan's preamble does; naming none reserves every agent. When the plan cannot be found, nothing is reserved.
 - **No em dash.** A reply with an em dash outside code is sent back for a rewrite. This holds in every session.
 - **Tracked salvo.** A shell command that runs `salvo.py run` detached with `nohup` or a trailing `&` is denied, because the harness then never notifies the agent when it ends. Run it in a background tool call instead. Text inside quotes or a heredoc does not count. This holds in every session.
 - **Filled templates.** A subagent prompt (the Agent tool's prompt, or the file a `salvo.py run` reads on stdin) that starts from a skill's `references/*-prompt.md` template is denied while it still holds one of that template's fills, any `<...>` containing a space. This holds in every session.
@@ -32,26 +39,47 @@ The hook messages give these commands with the session filled in. Define `g` onc
 g() { python3 scripts/guard.py "$@" --session <agent:id>; }
 g todo from <skill>
 g todo add "<item>" ["<item>" ...]
-g todo done <n> [<n> ...] [--note "..."]
-g todo done <n> --not-run <skill> [--not-run <skill> ...] --reason "..."
+g todo show <n>
+g todo done <n> [<n> ...] --token <token> [--token <token> ...] [--note "..."]
 g todo skip <n> [<n> ...] --reason "..."
 g todo wait <n> [<n> ...] --reason "..."
+g todo hold --until <HH:MM or ISO time> --reason "..."
 g todo none --reason "..."
 g todo list
+g todo check
 g todo clear --reason "..."
 ```
+
+`todo check` exits 0 when no item is open or waiting, else 1 with the list, so it works as an autorun `--check`. `--not-run` on `todo done` is deprecated and ignored for one release; its `--reason` is kept as the note.
 
 A subagent adds `--agent <its agent id>` after the session, from the message guard sends it, so its list is its own.
 
 Never pipe guard output through a filter such as grep, because a refusal prints its reason there and the filter hides it.
 
-`todo from` copies the numbered items of a `## Steps` section, step headings (`## 1.`, `## Step 1,`, `## Phase A:`, `## Pass 1:`), or a numbered list right after the title. For a skill written another way, add its steps with `todo add`. Skip an item only for a reason the user would accept, because the reason is what they read. Clear the list only when the user stops the work. When every item resolves, list them with their marks in the final reply.
+`todo from` copies, with their order, the numbered items of a `## Steps` section, step headings (`## 1.`, `## Step 1,`, `## Phase A:`, `## Pass 1:`), or a numbered list right after the title. For a skill written another way, add its steps with `todo add`. Skip an item only for a reason the user would accept, because the reason is what they read. Clear the list only when the user stops the work. When every item resolves, list them with their marks in the final reply.
+
+## Usage limits and fallback
+
+A usage limit never blocks delegate work: hand it to the next candidate instead of waiting. `python3 scripts/guard.py quota status` prints the registry. `python3 scripts/guard.py quota pick --role <planner|executor> [--avoid <agent[:model]> ...]` prints the first entry of that role in the orchestrator config (`<project>/.agents/orchestrator/models.json`, else `~/.agents/orchestrator/models.json`) whose agent is not limited and that no `--avoid` names, as `agent:model:effort`. It exits 1 when every candidate is limited, naming the earliest reset; then `todo hold` until that time. Only the lead's own limit, every candidate limited, or a check that tests one specific agent waiting for that agent's quota is a wait, and that wait is a hold, never a FAIL.
+
+When the first pick breaks a separation rule, walk the fallback order, which `quota pick --relax` prints and follows:
+
+1. a candidate that keeps every separation rule;
+2. one that relaxes "reviewer from a different family";
+3. one that relaxes "verifier on a different entry from the executor";
+4. a candidate from the other role.
+
+Pass the separation as `--avoid` (the executor's family for a reviewer, the executor's entry for a verifier); a relaxed pick prints which rule it relaxed. Report every relaxation in the PR's Verification section and in report.md.
+
+## Lint
+
+`python3 scripts/guard.py lint <skill name or SKILL.md path>`, or `--all` for every skill under the skill roots, reads a skill as `todo from` does. Errors (exit 1): no steps found in a skill that refers to its steps; an ordering phrase that names a step the skill does not have; a backticked gate whose script is not installed beside the skill; steps that wait on each other in a cycle. Warnings: a step that says "Close this step only when" without a backticked gate; a step both Mandatory and "Skip this step"; a step naming `../<x>/SKILL.md` for a skill not installed beside it. Lint a skill after editing its steps.
 
 ## Install and state
 
 Guard has no hooks of its own. It runs inside the hook runtime of the `autorun` skill, which loads guard's rules whenever guard is installed beside it, so install autorun's hooks once (`python3 <autorun>/scripts/autorun.py install`) and keep both skills installed.
 
-State lives in `~/.agents/guard/sessions/`, one file per agent session, with each subagent's list under its agent id in its session's file; sweeps that could not run are logged in `~/.agents/guard/errors.log`. Set `GUARD_SKILL_ROOTS` to a path list to override where guard looks for installed skills.
+The usage-limit registry lives in `~/.agents/orchestrator/limits.json`. State lives in `~/.agents/guard/sessions/`, one file per agent session, with each subagent's list under its agent id in its session's file; sweeps that could not run are logged in `~/.agents/guard/errors.log`. Set `GUARD_SKILL_ROOTS` to a path list to override where guard looks for installed skills.
 
 ## Adding a rule
 

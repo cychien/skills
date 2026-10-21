@@ -51,7 +51,7 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [update-orchestrator](./skills/orchestrator/update-orchestrator/) - move the model config onto newly released models, keeping subscriptions and role shape
 - [salvo](./skills/orchestrator/salvo/) - run one task on several models in parallel
 - [arena](./skills/orchestrator/arena/) - several candidates at one task, a cross-judge, then pick a base and graft
-- [guard](./skills/orchestrator/guard/) - hard rules that enforce skill conventions through hooks: playbook steps, principle citations, no em dash, PR rules
+- [guard](./skills/orchestrator/guard/) - hard rules that enforce skill conventions through hooks: ordered playbook steps with read tokens and gates, short hand-backs, usage-limit fallback, no em dash, PR rules
 - [autorun](./skills/orchestrator/autorun/) - autonomous mode: keep an agent working until the task is verifiably done, enforced by hooks
 
 **[skill-master](./skills/skill-master/)** - authoring and improving skills
