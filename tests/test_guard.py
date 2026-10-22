@@ -1285,13 +1285,20 @@ class Guard(unittest.TestCase):
         for command in ("while true; do if pgrep -f '[v]erify.py rerun' >/dev/null; then sleep 5; else break; fi; done",
                         "while :; do [ -s rerun.summary ] && break; sleep 5; done",
                         "while true; do [ -z \"$(pgrep -f '[v]erify.py dryrun')\" ] && exit 0; sleep 5; done",
-                        "while true; do if [ -s rerun.summary ]; then echo ready; break; fi; sleep 5; done"):
+                        "while true; do if [ -s rerun.summary ]; then echo ready; break; fi; sleep 5; done",
+                        "while true; do grep -q PASS rerun.summary && { echo ready; break; }; sleep 5; done",
+                        "while true; do [ -s rerun.summary ] && { echo ready; echo done; break; }; sleep 5; done",
+                        "while true; do { grep -q PASS rerun.summary; } && break; sleep 5; done",
+                        "while true; do (grep -q PASS rerun.summary; echo checked) && break; sleep 5; done"):
             self.assertIn("Do not poll for a verify.py rerun or dryrun", self.denial(command) or "", command)
         for command in ("while true; do echo rerun.log; sleep 5; done",
                         "while sleep 60; do cp rerun.summary backup/; tail -n 1 dryrun.log; done",
                         "for n in 1 2; do while ! curl -sf localhost:3000; do sleep 1; done; echo rerun.out; done",
                         "until python3 ../verify/scripts/verify.py rerun --only T1 > rerun.out; do sleep 30; done",
-                        "while true; do python3 ../verify/scripts/verify.py dryrun --only T1 > dryrun.out && break; sleep 30; done"):
+                        "while true; do python3 ../verify/scripts/verify.py dryrun --only T1 > dryrun.out && break; sleep 30; done",
+                        "while true; do { echo tick; grep -c PASS rerun.out; }; [ -f stop ] && { echo stopping; break; }; sleep 5; done",
+                        "while true; do [ -f stop ] && { grep -c PASS rerun.out; break; }; sleep 5; done",
+                        "while true; do (echo tick; grep -c PASS rerun.out); [ -f stop ] && break; sleep 5; done"):
             self.assertIsNone(self.denial(command), command)
 
 
