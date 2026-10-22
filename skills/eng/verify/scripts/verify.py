@@ -151,11 +151,10 @@ directory.
               when it is given, and while `capacity` passes, because the 1-minute load lags an instance start; a script
               that never prints the line runs alone. While capacity is
               short a script waits, checking every 15 seconds; after 10 minutes it is REQUEUED behind the rest, and
-              after a second such wait it is NOT-RUN, which fails the run. A watchdog samples the load every 3 seconds;
-              once it stays above 1.0 x cores for 15 seconds, it stops the most recently started script with its
-              process group and the detached processes it started, queues it again, prints it as REQUEUED with the load,
-              and lowers the jobs to the scripts still running, never below one. A requeued run is neither a FAIL nor a
-              fix attempt, and a script that finishes FAIL is never retried. The plan's perf checks always run alone
+              after a second such wait it is NOT-RUN, which fails the run. The load only decides when the next script
+              starts: a running script is never stopped for it, because the load may come from any program on the
+              machine. A requeued run is neither a FAIL nor a fix attempt, and a script that finishes FAIL is never
+              retried. The plan's perf checks always run alone
               after the rest, because concurrent instances skew every timing. A file owned by a check that ran at the
               same time is not held against the other, because that check may be rewriting its own evidence, and a loss
               seen while checks ran side by side FAILs each of them with the names of the others, so `--only` finds the
@@ -366,9 +365,6 @@ HELD_OUTPUT_NOTE = ("verify: a process the script left running still held its ou
 SUMMARY = ".summary"
 CAPACITY_POLL_S = 15.0
 CAPACITY_WAIT_S = 600.0
-OVERLOAD_RATIO = 1.0
-OVERLOAD_S = 15.0
-WATCH_POLL_S = 3.0
 # ps rounds elapsed time to the second, so a start can read up to a second early.
 ELAPSED_SLACK_S = 1.0
 ELAPSED = re.compile(r"^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$")
@@ -1869,11 +1865,15 @@ def rerun_inputs(directory, scripts, rest, left):
 
 
 def file_sizes(directory):
-    sizes = {}
+    """{path: size} of the files under the verification directory, leaving out verify's own running.json, which changes
+    while scripts run."""
+    sizes, running = {}, pathlib.Path(directory, RUNNING)
     for root, dirs, names in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in DEPENDENCY_DIRS]
         for name in (n for n in names if not n.endswith(TMP_SUFFIX)):
             path = pathlib.Path(root, name)
+            if path == running:
+                continue
             with contextlib.suppress(OSError):
                 sizes[path.relative_to(directory)] = path.stat().st_size
     return sizes
@@ -2017,13 +2017,10 @@ def write_summary(directory, kind, lines):
 def run_check(directory, path, args, env, concurrent=set, run=None, record=None):
     """(verdict, reason, step, overruns) for one check script; its output, overruns, and verdict go to <id>.rerun.log, and record(path, verdict)
     runs in the same locked step, a script verify could not start included. concurrent() names the checks that ran beside
-    it. run, when given, learns the script's pid and readiness; a run the watchdog evicted is REQUEUED, and an ENVIRONMENT
-    run with requeues left records nothing."""
+    it. run, when given, learns the script's pid and readiness; an ENVIRONMENT run with requeues left records nothing."""
     check_id = script_id(path)
     before = file_sizes(directory)
     outcome = supervised_run(path, args, env, run, directory=directory, kind="rerun")
-    if run and run["evicted"]:
-        return "REQUEUED", "", None, []
     verdict, reason = environment_retry(*rerun_verdict(outcome), run)
     if verdict == "ENVIRONMENT":
         return verdict, reason, outcome["step"], outcome["overruns"]
@@ -2047,15 +2044,14 @@ def run_check(directory, path, args, env, concurrent=set, run=None, record=None)
 def run_checks(directory, scripts, args, run_one):
     """({check id: (verdict, detail, seconds, step, overruns)}, [requeue lines]). A script starts while every running one has printed
     READY_LINE, the running count is under --jobs when given, and the machine has capacity; a script that waits
-    CAPACITY_WAIT_S for capacity is queued again behind the rest, and after a second such wait it is NOT-RUN. The watchdog
-    evicts the newest while the load stays overloaded. An ENVIRONMENT run is queued again, up to ENVIRONMENT_REQUEUES times.
-    Perf checks run alone at the end."""
+    CAPACITY_WAIT_S for capacity is queued again behind the rest, and after a second such wait it is NOT-RUN. The load only
+    gates a start: a running script is never stopped for it. An ENVIRONMENT run is queued again, up to ENVIRONMENT_REQUEUES
+    times. Perf checks run alone at the end."""
     perf = perf_ids(directory)
     batches = (([p for p in scripts if script_id(p) not in perf], args.jobs), ([p for p in scripts if script_id(p) in perf], 1))
     results, beside, running, requeued = {}, {}, {}, []
     queue = collections.deque()
     turn = threading.Condition()
-    jobs = args.jobs
     waits, environment = collections.Counter(), collections.Counter()
     load_ratio()
 
@@ -2076,9 +2072,7 @@ def run_checks(directory, scripts, args, run_one):
             verdict, detail, step, overruns = "ERROR", could_not_run(e), None, []
         with turn:
             running.pop(check_id, None)
-            if verdict == "REQUEUED":
-                queue.appendleft(run["path"])
-            elif verdict == "ENVIRONMENT":
+            if verdict == "ENVIRONMENT":
                 environment[check_id] += 1
                 queue.append(run["path"])
                 requeued.append(f"REQUEUED {check_id}  {detail}: the instance or machine could not support the run; queued again "
@@ -2088,29 +2082,15 @@ def run_checks(directory, scripts, args, run_one):
             turn.notify_all()
 
     def room(width):
-        ceiling = min((n for n in (width, jobs) if n is not None), default=None)
+        ceiling = min((n for n in (width, args.jobs) if n is not None), default=None)
         return not running or ((ceiling is None or len(running) < ceiling) and all(r["is_ready"] for r in running.values()))
 
-    over_since, sampled, refused_since, next_check = None, 0.0, None, 0.0
+    refused_since, next_check = None, 0.0
     with turn:
         for batch, width in batches:
             queue.extend(batch)
             while queue or running:
                 now = time.monotonic()
-                if (args.jobs is None or args.jobs > 1) and now - sampled >= WATCH_POLL_S:
-                    sampled = now
-                    load, cores = os.getloadavg()[0], os.cpu_count() or 1
-                    over_since = (over_since or now) if load > OVERLOAD_RATIO * cores else None
-                    if over_since is not None and now - over_since >= OVERLOAD_S and len(running) > 1:
-                        check_id, run = max(running.items(), key=lambda item: item[1]["started"])
-                        if run["pid"] and not run["evicted"]:
-                            run["evicted"] = True
-                            others = {r["pid"] for r in running.values() if r is not run}
-                            threading.Thread(target=evict, args=(directory, run, others), daemon=True).start()
-                            jobs = len(running) - 1
-                            over_since = now
-                            requeued.append(f"REQUEUED {check_id}  load {load:.1f} on {cores} cores for {OVERLOAD_S:.0f}s; "
-                                            f"stopped and queued again, --jobs now {jobs}")
                 if not (queue and room(width)):
                     refused_since = None
                 elif now >= next_check and has_capacity():
@@ -2119,7 +2099,7 @@ def run_checks(directory, scripts, args, run_one):
                     beside[check_id] = set(running)
                     for other in running:
                         beside[other].add(check_id)
-                    run = {"path": path, "started": time.time(), "pid": None, "is_ready": False, "evicted": False,
+                    run = {"path": path, "started": time.time(), "pid": None, "is_ready": False,
                            "last_chance": environment[check_id] >= ENVIRONMENT_REQUEUES}
                     run["ready"] = lambda run=run: ready(run)
                     running[check_id] = run
@@ -2144,14 +2124,8 @@ def run_checks(directory, scripts, args, run_one):
                                              0.0, None, [])
                     refused_since, next_check = None, 0.0
                     continue
-                turn.wait(min(ADMIT_POLL_S, WATCH_POLL_S))
+                turn.wait(ADMIT_POLL_S)
     return results, requeued
-
-
-def evict(directory, run, others):
-    """Stop an evicted script's process tree and the detached processes it started under this run's places."""
-    # Admission waits for every running script's ready line, so a detached process started after this one began is its own.
-    stop_tree(directory, run["pid"], run["started"], others)
 
 
 def descendants(table, pid):
@@ -2402,8 +2376,6 @@ def dry_check(directory, path, args, env, base, run):
     """(verdict, reason, step, overruns) for one check script run on base, graded by dry_verdict. The log goes to <id>.base.log."""
     check_id = script_id(path)
     outcome = supervised_run(path, args, env, run, cwd=base["path"], directory=directory, kind="dryrun")
-    if run and run["evicted"]:
-        return "REQUEUED", "", None, []
     verdict, why = environment_retry(*dry_verdict(outcome), run)
     if verdict == "ENVIRONMENT":
         return verdict, why, outcome["step"], outcome["overruns"]

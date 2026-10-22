@@ -433,7 +433,7 @@ class Verify(unittest.TestCase):
 
     def capacity_rerun(self, load, wait=1.0):
         args = mock.Mock(only=None, rest=[], jobs=None, timeout=30, force=False, full_reason=None)
-        with mock.patch.multiple(verify, CAPACITY_POLL_S=0.05, CAPACITY_WAIT_S=wait, ADMIT_POLL_S=0.05, WATCH_POLL_S=0.05), \
+        with mock.patch.multiple(verify, CAPACITY_POLL_S=0.05, CAPACITY_WAIT_S=wait, ADMIT_POLL_S=0.05), \
                 mock.patch.object(verify.os, "getloadavg", side_effect=lambda: (load(),) * 3), \
                 mock.patch.object(verify.os, "cpu_count", return_value=4), mock.patch.dict(os.environ):
             os.environ.pop("VERIFY_MAX_LOAD_RATIO", None)
@@ -533,33 +533,25 @@ class Verify(unittest.TestCase):
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.rerun.log" ] || { echo "started beside a script that never printed ready"; exit 1; }\n')
         self.assertRegex(self.run_verify("rerun", "--jobs", "2", "--force", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"B1 PASS .*\nB2 PASS ")
 
-    def test_rerun_jobs_requeues_the_newest_script_while_the_load_stays_over_the_cores_and_never_retries_a_fail(self):
-        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; echo "verify: ready"; sleep 1.5; touch "$d/B1.done"\n')
-        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; n=$(cat "$d/B2.count" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/B2.count"\n'
-                                         'echo "verify: ready"; [ "$n" = 0 ] && { sleep 5; echo "never stopped"; exit 1; }\n'
-                                         '[ -e "$d/B1.done" ] || { echo "ran beside B1 after the requeue"; exit 1; }; exit 0\n')
-        self.check_script("B3.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B3.runs"; echo "FAIL B3"; exit 1\n')
+    def test_a_load_that_stays_high_only_holds_the_next_start_and_never_stops_a_running_script(self):
+        self.check_script("B1.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B1.runs"; echo "verify: ready"; sleep 2; touch "$d/B1.done"\n')
+        self.check_script("B2.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B2.runs"; touch "$d/B2.started"; echo "verify: ready"; sleep 2\n'
+                                         'touch "$d/B2.done"\n')
+        self.check_script("B3.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.done" ] && [ -e "$d/B2.done" ] || { echo "FAIL B3: started under load"; exit 1; }\n')
 
         def load():
-            path = self.dir / "B2.count"
-            overloaded = path.exists() and path.read_text().strip() == "1" and not (self.dir / "B1.done").exists()
+            overloaded = (self.dir / "B2.started").exists() and not all((self.dir / f"{i}.done").exists() for i in ("B1", "B2"))
             return (100.0 if overloaded else 0.0,) * 3
 
         args = mock.Mock(only=None, rest=[], jobs=3, timeout=30, force=False)
-        with mock.patch.multiple(verify, WATCH_POLL_S=0.05, OVERLOAD_S=0.3, ADMIT_POLL_S=0.05, CAPACITY_POLL_S=0.05), \
-                mock.patch.object(verify, "default_roots", lambda d: [str(d)]), \
+        with mock.patch.multiple(verify, ADMIT_POLL_S=0.05, CAPACITY_POLL_S=0.05), \
                 mock.patch.object(verify.os, "getloadavg", side_effect=load), mock.patch.object(verify.os, "cpu_count", return_value=4), \
                 mock.patch.dict(os.environ):
             os.environ.pop("VERIFY_MAX_LOAD_RATIO", None)
-            with self.assertRaises(verify.Failed) as raised:
-                verify.cmd_rerun(self.dir, args)
-        out = str(raised.exception)
-        self.assertRegex(out, r"REQUEUED B2  load 100\.0 on 4 cores for 0s; stopped and queued again, --jobs now 1\n")
-        self.assertRegex(out, r"B1 PASS .*\nB2 PASS .*\nB3 FAIL ")
-        self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL, 1 requeued", out)
-        self.assertEqual((self.dir / "B2.count").read_text(), "2\n")
-        self.assertEqual((self.dir / "B3.runs").read_text(), "x\n")
-        self.assertFalse((self.dir / "fix-attempts.json").exists())
+            out = verify.cmd_rerun(self.dir, args)
+        self.assertRegex(out, r"^B1 PASS .*\nB2 PASS .*\nB3 PASS ")
+        self.assertNotIn("REQUEUED", out)
+        self.assertEqual([(self.dir / f"{i}.runs").read_text() for i in ("B1", "B2")], ["x\n", "x\n"])
 
     def test_rerun_jobs_never_blames_a_check_for_the_evidence_a_concurrent_check_is_rewriting(self):
         for name in ("evidence/B1/shot.png", "evidence/W1/walk.png"):
