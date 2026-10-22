@@ -1715,6 +1715,79 @@ class Watch(unittest.TestCase):
             self.assertIn("no agent process", state.load("claude", "w2")["watch_unavailable"]["why"])
 
 
+class WatchIdentity(unittest.TestCase):
+    """The watchdog with a faked process table: what it does when ps fails, and whom its pid file names."""
+
+    def setUp(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import procs, state, watch
+        self.procs, self.state, self.watch = procs, state, watch
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.enterContext(mock.patch.object(state, "SESSIONS", pathlib.Path(tmp.name)))
+        self.record = state.watch_path("claude", "w3")
+
+    def ps(self, *rows):
+        """A ps run that lists rows of (pid, ppid, seconds since start, command), this process included."""
+        out = "".join(f"{pid} {ppid} {age // 60:02d}:{age % 60:02d} 0:00.01 {command}\n" for pid, ppid, age, command in rows)
+        return subprocess.CompletedProcess(["ps"], 0, out, "")
+
+    def tree(self, other):
+        """An agent (100) with a shell (200) running this process as the watchdog, beside other."""
+        return self.ps((100, 1, 600, "/usr/local/bin/agent"), (200, 100, 300, "-zsh"),
+                       (os.getpid(), 200, 1, "python3 guard.py watch --session claude:w3"), other)
+
+    def write(self, **fields):
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        self.record.write_text(json.dumps({"pid": 300, "session": "claude:w3", "agent": 100, "since": 0, **fields}))
+
+    def test_a_failed_ps_is_unknown_never_no_processes(self):
+        for failure in (FileNotFoundError("ps"), subprocess.CompletedProcess(["ps"], 1, "", "ps: sysctl failed")):
+            with mock.patch.object(self.procs.subprocess, "run", side_effect=[failure]), self.assertRaises(self.procs.Unseen):
+                self.procs.table()
+
+    def test_a_ps_failure_during_the_claim_never_takes_over_a_live_watchdogs_pid_file(self):
+        self.write(started=time.time() - 50)
+        before = self.record.read_text()
+        other = (300, 200, 50, "python3 guard.py watch --session claude:w3")
+        with mock.patch.object(self.procs.subprocess, "run", side_effect=[self.tree(other), FileNotFoundError("ps")]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.watch.run("claude", "w3", interval=0), self.watch.UNSEEN)
+        self.assertIn("cannot tell whether another watchdog of this session runs; nothing started", out.getvalue())
+        self.assertEqual(self.record.read_text(), before)
+
+    def test_a_watchdog_that_cannot_see_processes_exits_with_an_error_instead_of_staying_forever(self):
+        other = (400, 1, 5, "sleep 5")
+        failures = [FileNotFoundError("ps")] * self.watch.UNSEEN_SAMPLES
+        with mock.patch.object(self.procs.subprocess, "run", side_effect=[self.tree(other), self.tree(other), *failures]), \
+                mock.patch.object(self.watch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.watch.run("claude", "w3", interval=0), self.watch.UNSEEN)
+        self.assertIn(f"cannot list processes: {self.watch.UNSEEN_SAMPLES} samples in a row failed", out.getvalue())
+        self.assertIn("cannot list processes", self.state.load("claude", "w3")["watch_unavailable"]["why"])
+        self.assertFalse(self.record.exists())
+
+    def test_the_pid_file_is_trusted_and_signaled_only_for_the_watchdog_that_wrote_it(self):
+        now = time.time()
+        rows = {300: self.procs.Process(300, 200, now - 50, 0.0, "python3 guard.py watch --session claude:other")}
+        cases = {"a pid reused by another session's watchdog": dict(started=now - 3600),
+                 "a record of another session": dict(started=now - 50, session="claude:other"),
+                 "a record that names no start": dict()}
+        for case, fields in cases.items():
+            self.write(**fields)
+            with mock.patch.object(self.procs, "table", return_value=rows), mock.patch.object(self.watch.os, "kill") as kill:
+                self.assertIsNone(self.watch.alive("claude", "w3"), case)
+                self.assertIsNone(self.watch.stop("claude", "w3"), case)
+                kill.assert_not_called()
+        self.write(started=now - 50)
+        with mock.patch.object(self.procs, "table", return_value=rows), mock.patch.object(self.watch.os, "kill") as kill:
+            self.assertEqual(self.watch.stop("claude", "w3"), 300)
+            kill.assert_called_once_with(300, signal.SIGTERM)
+        with mock.patch.object(self.procs, "table", side_effect=self.procs.Unseen("ps failed")), \
+                mock.patch.object(self.watch.os, "kill") as kill, self.assertRaises(self.procs.Unseen):
+            self.watch.stop("claude", "w3")
+        kill.assert_not_called()
+
 def wait_for(path, wait=10):
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:

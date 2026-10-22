@@ -24,19 +24,25 @@ def seconds(text):
     return int(days or 0) * 86400 + total
 
 
+class Unseen(Exception):
+    """ps could not list the processes, so which ones run is unknown, never "none"."""
+
+
 def table():
-    """{pid: Process}, or {} when ps cannot run."""
+    """{pid: Process}; raises Unseen when ps cannot run or lists nothing (it always lists itself)."""
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,time=,command="], capture_output=True, text=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,time=,command="], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Unseen(f"ps could not run: {e}")
     now, rows = time.time(), {}
-    for line in out.splitlines():
+    for line in done.stdout.splitlines():
         parts = line.split(None, 4)
         if len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit():
             elapsed = seconds(parts[2])
             rows[int(parts[0])] = Process(int(parts[0]), int(parts[1]), now - elapsed if elapsed is not None else None,
                                           seconds(parts[3]) or 0.0, parts[4])
+    if done.returncode or not rows:
+        raise Unseen(f"ps exited {done.returncode}: {done.stderr.strip() or 'it listed no process'}")
     return rows
 
 
@@ -75,3 +81,9 @@ def same(rows, process):
     now = rows.get(process.pid)
     return bool(now and now.command == process.command and
                 (now.started is None or process.started is None or abs(now.started - process.started) <= SAME_START_S))
+
+
+def born_at(rows, pid, started):
+    """Whether pid runs a process that started at started, so a pid reused since is never taken for it."""
+    now = rows.get(pid)
+    return bool(now and now.started is not None and started is not None and abs(now.started - started) <= SAME_START_S)

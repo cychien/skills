@@ -35,7 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from guard_lib import autonomy, gates, lint, order, proof, quota, skills, state, watch  # noqa: E402
+from guard_lib import autonomy, gates, lint, order, procs, proof, quota, skills, state, watch  # noqa: E402
 
 MARKS = {"open": "[ ]", "waiting": "[?]", "done": "[x]", "skipped": "[-]"}
 NOT_RUN_DEPRECATED = ("guard: --not-run is deprecated and ignored: an item no longer needs the skills it names read first. "
@@ -280,7 +280,10 @@ def run_watch(args):
         print(watch.ack(agent, sid, args.ack))
         return
     if args.stop:
-        stopped = watch.stop(agent, sid)
+        try:
+            stopped = watch.stop(agent, sid)
+        except procs.Unseen as e:
+            sys.exit(f"guard: cannot list processes ({e}), so the watchdog's identity cannot be checked and nothing was signaled.")
         print(f"Stopped the watchdog (pid {stopped})." if stopped else "No watchdog runs for this session.")
         return
     sys.exit(watch.run(agent, sid, interval=args.interval, initial=args.initial, multiple=args.multiple, events=args.events,

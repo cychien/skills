@@ -1,4 +1,5 @@
 """Guard's hard rules. Each hook event returns (action, message); the shared hook runtime renders it per agent."""
+import contextlib
 import glob
 import hashlib
 import os
@@ -98,7 +99,10 @@ def headless():
     """Whether this hook runs under a non-interactive agent, where ending the turn ends the process and its background work."""
     if os.environ.get("GUARD_HEADLESS"):
         return os.environ["GUARD_HEADLESS"] == "1"
-    rows = procs.table()
+    try:
+        rows = procs.table()
+    except procs.Unseen:
+        return False
     return any(HEADLESS.search(rows[pid].command) for pid in procs.ancestors(rows, os.getpid()))
 
 
@@ -678,9 +682,13 @@ def unwatched_work(event, data):
     watchdogs = [t for t in local if watch.runs_watchdog(t.get("command"))]
     if watchdogs:
         if len(watchdogs) == len(local) and headless():
-            watch.stop(event.agent, event.session)
+            with contextlib.suppress(procs.Unseen):
+                watch.stop(event.agent, event.session)
         return None
-    if watch.alive(event.agent, event.session):
+    try:
+        if watch.alive(event.agent, event.session):
+            return None
+    except procs.Unseen:
         return None
     with state.update(event.agent, event.session) as d:
         d["watch_blocks"] = blocks = d.get("watch_blocks", 0) + 1

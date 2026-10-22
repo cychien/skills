@@ -28,6 +28,8 @@ TAIL_BYTES = 8192
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 NO_AGENT = 2
 ALREADY = 3
+UNSEEN = 4
+UNSEEN_SAMPLES = 3
 
 
 class Job:
@@ -197,22 +199,30 @@ def record(agent, session):
 
 
 def alive(agent, session, rows=None):
-    """The watchdog record of this session while its process still runs as a watchdog, else None."""
+    """The watchdog record of this session while the process it names is that watchdog: the pid runs a watchdog that
+    started when the record says, and the record is this session's. Else None; raises procs.Unseen when ps cannot run."""
     found = record(agent, session)
-    if not found:
+    if not isinstance(found, dict) or found.get("session") != f"{agent}:{session}":
         return None
     rows = rows if rows is not None else procs.table()
     process = rows.get(found.get("pid"))
-    return found if process and runs_watchdog(process.command) else None
+    if process and procs.born_at(rows, process.pid, found.get("started")) and runs_watchdog(process.command):
+        return found
+    return None
 
 
 def claim(agent, session, agent_pid):
-    """Record this process as the session's watchdog; the record of one already running when another holds it."""
+    """Record this process as the session's watchdog; the record of one already running when another holds it. Raises
+    procs.Unseen when ps cannot run, because another watchdog may then be alive."""
     with state.lock(agent, session):
-        running = alive(agent, session)
+        rows = procs.table()
+        running = alive(agent, session, rows)
         if running and running["pid"] != os.getpid():
             return running
-        state.watch_path(agent, session).write_text(json.dumps({"pid": os.getpid(), "agent": agent_pid, "since": time.time()}) + "\n")
+        me = rows.get(os.getpid())
+        state.watch_path(agent, session).write_text(json.dumps({
+            "pid": os.getpid(), "started": me.started if me else None, "session": f"{agent}:{session}", "agent": agent_pid,
+            "since": time.time()}) + "\n")
         with state.update(agent, session, locked=True) as data:
             data.pop("watch_unavailable", None)
             data["watch_blocks"] = 0
@@ -222,12 +232,13 @@ def claim(agent, session, agent_pid):
 def release(agent, session):
     with state.lock(agent, session):
         found = record(agent, session)
-        if found and found.get("pid") == os.getpid():
+        if isinstance(found, dict) and found.get("pid") == os.getpid():
             state.watch_path(agent, session).unlink(missing_ok=True)
 
 
 def stop(agent, session):
-    """SIGTERM the session's watchdog; returns its pid, or None when none runs."""
+    """SIGTERM the session's watchdog once its pid file and the process agree on who it is; returns its pid, or None when
+    none runs. Raises procs.Unseen when ps cannot run, and then signals nothing."""
     running = alive(agent, session)
     if not running:
         return None
@@ -236,13 +247,21 @@ def stop(agent, session):
     return running["pid"]
 
 
+def unavailable(agent, session, why):
+    with state.update(agent, session) as data:
+        data["watch_unavailable"] = {"at": time.time(), "why": why}
+
+
 def acknowledged(agent, session):
     """The processes the lead acknowledged as intentionally idle in this session."""
     return state.load(agent, session).get("watch_acked", [])
 
 
 def ack(agent, session, pid):
-    rows = procs.table()
+    try:
+        rows = procs.table()
+    except procs.Unseen as e:
+        sys.exit(f"guard: cannot list processes ({e}), so {pid} cannot be acknowledged; try again.")
     process = rows.get(pid)
     if not process:
         sys.exit(f"guard: no process {pid} runs, so there is nothing to acknowledge.")
@@ -253,16 +272,22 @@ def ack(agent, session, pid):
 
 
 def run(agent, session, interval=INTERVAL_S, initial=INITIAL_S, multiple=MULTIPLE, events=EVENTS, cpu_floor=CPU_FLOOR):
-    """Watch until a job goes silent (print the report, exit 0), the agent process exits, or a signal stops it."""
-    rows = procs.table()
-    found, own = find_agent(rows)
+    """Watch until a job goes silent (print the report, exit 0), the agent process exits, or a signal stops it. When ps
+    fails, which processes run is unknown: it never starts over another watchdog it cannot rule out, and it exits with an
+    error after UNSEEN_SAMPLES failed samples in a row instead of watching blind."""
+    try:
+        rows = procs.table()
+        found, own = find_agent(rows)
+        running = claim(agent, session, found.pid) if found else None
+    except procs.Unseen as e:
+        why = f"cannot list processes ({e}), so it cannot tell whether another watchdog of this session runs"
+        print(f"guard watch: {why}; nothing started.")
+        return UNSEEN
     if not found:
         why = "found no agent process above this one (no ancestor of its parent shell that is not a shell)"
-        with state.update(agent, session) as data:
-            data["watch_unavailable"] = {"at": time.time(), "why": why}
+        unavailable(agent, session, why)
         print(f"guard watch: {why}, so it would watch nothing. Start it from your agent's own shell tool, as a background job.")
         return NO_AGENT
-    running = claim(agent, session, found.pid)
     if running:
         print(f"guard watch: a watchdog already watches this session (pid {running['pid']}); nothing to start.")
         return ALREADY
@@ -273,11 +298,12 @@ def run(agent, session, interval=INTERVAL_S, initial=INITIAL_S, multiple=MULTIPL
         if dog.outputs.blind:
             print("guard watch: lsof is not installed, so output growth is not watched; CPU time and new processes still count.",
                   flush=True)
+        unseen = 0
         while True:
             now = time.time()
-            if rows and (not procs.same(rows, found) or os.getppid() == 1):
+            if not procs.same(rows, found) or os.getppid() == 1:
                 return 0
-            silent = dog.sample(rows, now, acknowledged(agent, session)) if rows else []
+            silent = dog.sample(rows, now, acknowledged(agent, session))
             if silent:
                 print("\n".join([*(dog.report(job, rows, now) for job in silent),
                                  "guard watch: the jobs above went silent. Read each one's output and processes, then stop a stuck "
@@ -285,7 +311,19 @@ def run(agent, session, interval=INTERVAL_S, initial=INITIAL_S, multiple=MULTIPL
                                  f"to idle with `{cli(agent, session, '--ack', '<pid>')}`, and start the watchdog again in the "
                                  f"background: {cli(agent, session)}"]))
                 return 0
-            time.sleep(interval)
-            rows = procs.table()
+            while True:
+                time.sleep(interval)
+                try:
+                    rows = procs.table()
+                    break
+                except procs.Unseen as e:
+                    unseen += 1
+                    if unseen >= UNSEEN_SAMPLES:
+                        why = f"cannot list processes: {UNSEEN_SAMPLES} samples in a row failed ({e})"
+                        unavailable(agent, session, why)
+                        print(f"guard watch: {why}, so it cannot see the jobs or whether its agent still runs, and it stops "
+                              f"watching instead of watching blind. Start it again once ps works: {cli(agent, session)}")
+                        return UNSEEN
+            unseen = 0
     finally:
         release(agent, session)
