@@ -1,6 +1,6 @@
 ---
 name: guard
-description: Hard rules that enforce skill conventions through hooks, so an agent cannot skip them - a todo list every item of which must resolve in its steps' order, one per agent, a read token per step, check-script gates on playbook steps, one verifier per check, foreground delegates from subagents, short hand-backs, no waits that match themselves or poll a verify run, a shared usage-limit registry that hands work to the next model, no em dash in replies, and the open-pr PR rules. Use when a guard message blocks you, to manage the todo list, or to add, change, or debug a guard rule.
+description: Hard rules that enforce skill conventions through hooks, so an agent cannot skip them - a todo list every item of which must resolve in its steps' order, one per agent, a read token per step, check-script gates on playbook steps, one verifier per check, foreground delegates from subagents, short hand-backs, no waits that match themselves or poll a verify run, a watchdog that asks the lead about silent background jobs and never stops one, a shared usage-limit registry that hands work to the next model, no em dash in replies, and the open-pr PR rules. Use when a guard message blocks you, to manage the todo list, or to add, change, or debug a guard rule.
 ---
 
 # Guard
@@ -59,6 +59,22 @@ A subagent adds `--agent <its agent id>` after the session, from the message gua
 Never pipe guard output through a filter such as grep, because a refusal prints its reason there and the filter hides it.
 
 `todo from` copies, with their order, the numbered items of a `## Steps` section, step headings (`## 1.`, `## Step 1,`, `## Phase A:`, `## Pass 1:`), or a numbered list right after the title. For a skill written another way, add its steps with `todo add`. Skip an item only for a reason the user would accept, because the reason is what they read. Clear the list only when the user stops the work. When every item resolves, list them with their marks in the final reply.
+
+## The watchdog
+
+```
+python3 scripts/guard.py watch [--session <agent:id>]        # a background job of the lead's own
+python3 scripts/guard.py watch --ack <pid> [--session <agent:id>]
+python3 scripts/guard.py watch --stop [--session <agent:id>]
+```
+
+Time asks the lead a question; it never stops a job. Only a certain signal stops or blocks something: an event (a delegate handed back but its work still runs), a construct that cannot end (a self-matching `pgrep -f`, a poll loop on a verify run), or the lead's own decision.
+
+The watchdog finds the agent process that started it (the first ancestor of its parent shell that is not a shell) and watches every other shell under it, each with the processes below it, as one job. It never looks at another agent's processes, and it exits with an error when it finds no agent process, because watching nothing is not silence. A job progresses when a file its processes write as stdout or stderr grows (found with lsof, or /proc on Linux, wherever the harness put it), when its processes use more CPU than `--cpu-floor` of one core between samples (so idle timers and pollers do not count), or when a process with a command line the job has not run before starts (so a poll loop that runs the same commands is silence). Without lsof or /proc it counts CPU time and new processes only, and says so once.
+
+Each job's threshold adapts: once it has shown `--events` progress events (default 3), it is `--multiple` (default 3) times its own longest gap between them, and never less than `--initial` (default 300 s), which also holds until then. A wrong value costs one extra question, never a kill. The watchdog samples every `--interval` seconds (default 5) and sleeps in between, so it costs no tokens while every job progresses. When a job stays silent past its threshold, it prints one line per silent job (pid, what it runs, how long it is silent against its longest earlier gap, its last output line and output file) and exits 0, and the harness notifies the lead. The lead reads the job's output and processes, then stops a stuck job (its task-stop tool, or `verify.py stop <id>` for a verify script) or acknowledges an intentionally idle process with `watch --ack <pid>`, which the session's watchdogs never ask about again, and starts the watchdog again. A restarted watchdog learns each job's rhythm from scratch.
+
+One watchdog runs per agent session: its pid file sits in the session's state, and a second one refuses to start. It exits on its own when its agent process exits, so it never outlives the session; `watch --stop` ends it.
 
 ## Usage limits and fallback
 

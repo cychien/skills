@@ -1,8 +1,13 @@
+import contextlib
 import datetime
 import hashlib
+import io
 import json
 import os
 import pathlib
+import re
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1436,6 +1441,192 @@ class ShippedPlaybooks(unittest.TestCase):
     def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
         mandatory = self.gated_mandatory_steps("plan-feature")
         self.assertEqual(mandatory, {5: {"phases"}})
+
+FAKE_AGENT = """\
+import json, os, subprocess, sys, time
+spec = json.loads(sys.argv[1])
+d = spec["dir"]
+
+def publish(name, value):
+    with open(os.path.join(d, name + ".tmp"), "w") as f:
+        f.write(json.dumps(value))
+    os.replace(os.path.join(d, name + ".tmp"), os.path.join(d, name))
+
+jobs = {}
+for name, command in spec["jobs"].items():
+    out = open(os.path.join(d, name + ".out"), "w")
+    jobs[name] = subprocess.Popen(["/bin/sh", "-c", command + "\\nexit $?"], stdout=out, stderr=subprocess.STDOUT,
+                                  start_new_session=True).pid
+publish("jobs.json", jobs)
+while not os.path.exists(os.path.join(d, "go")):
+    time.sleep(0.05)
+for i, watch in enumerate(spec["watch"]):
+    dog = subprocess.Popen(["/bin/sh", "-c", watch + "\\nexit $?"], stdout=open(os.path.join(d, f"watch{i}.out"), "w"),
+                           stderr=subprocess.STDOUT)
+    publish(f"watch{i}.pid", dog.pid)
+    if i + 1 < len(spec["watch"]):
+        time.sleep(1)
+publish("exit.json", dog.wait())
+time.sleep(600)
+"""
+
+
+class Watch(unittest.TestCase):
+    """The watchdog on real processes: a fake agent (a process that is not a shell) runs each job in a shell of its own,
+    with its output in a file, the way an agent harness runs background jobs, then starts the watchdog the same way."""
+
+    SESSION = "claude:w1"
+
+    @classmethod
+    def scenario(cls, tmp, jobs, watch=None, ack=(), initial=1.5):
+        d = pathlib.Path(tmp)
+        env = {**os.environ, "GUARD_HOME": str(d / "guard")}
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} watch --session {cls.SESSION} --interval 0.2 --initial {initial}"
+        (d / "agent.py").write_text(FAKE_AGENT)
+        spec = {"dir": str(d), "jobs": jobs, "watch": watch or [command]}
+        agent = subprocess.Popen([sys.executable, str(d / "agent.py"), json.dumps(spec)], env=env, start_new_session=True)
+        pids = json.loads(wait_for(d / "jobs.json"))
+        for name in ack:
+            r = subprocess.run([sys.executable, str(GUARD), "watch", "--ack", str(pids[name]), "--session", cls.SESSION],
+                               capture_output=True, text=True, env=env)
+            assert r.returncode == 0, r.stdout + r.stderr
+        (d / "go").touch()
+        return agent, pids, env
+
+    @staticmethod
+    def end(agent, pids):
+        for pid in [*pids.values(), agent.pid]:
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+        agent.wait()
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        jobs = {"silent": "sleep 30", "printer": "while :; do echo tick $(date +%s); sleep 0.2; done",
+                "busy": f"{shlex.quote(sys.executable)} -c 'while True: pass'",
+                "children": "i=0; while :; do i=$((i+1)); sleep 0.3$i; done", "idle": "sleep 31"}
+        started = time.monotonic()
+        agent, cls.pids, _ = cls.scenario(cls.tmp.name, jobs, ack=["idle"])
+        try:
+            cls.exit = json.loads(wait_for(pathlib.Path(cls.tmp.name) / "exit.json", 20))
+            cls.elapsed = time.monotonic() - started
+            cls.report = (pathlib.Path(cls.tmp.name) / "watch0.out").read_text()
+        finally:
+            cls.end(agent, cls.pids)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def reported(self):
+        return {int(m) for m in re.findall(r"^pid (\d+) silent", self.report, re.M)}
+
+    def test_a_silent_sleep_job_is_reported_and_the_watchdog_exits_zero(self):
+        self.assertEqual(self.exit, 0, self.report)
+        self.assertIn(self.pids["silent"], self.reported(), self.report)
+        self.assertRegex(self.report, rf"(?m)^pid {self.pids['silent']} silent \d\.\ds \(asks after 1\.5s; no progress since the watchdog "
+                                      rf"started\): sleep 30; last output: \(none\) \[.*silent\.out\]$")
+        self.assertIn(f"acknowledge one meant to idle with `python3 {GUARD} watch --ack <pid> --session {self.SESSION}`", self.report)
+        self.assertLess(self.elapsed, 15)
+
+    def test_a_job_that_prints_steadily_is_not_reported(self):
+        self.assertNotIn(self.pids["printer"], self.reported(), self.report)
+
+    def test_a_silent_job_that_keeps_the_cpu_busy_is_not_reported(self):
+        self.assertNotIn(self.pids["busy"], self.reported(), self.report)
+
+    def test_a_job_whose_children_change_is_not_reported(self):
+        self.assertNotIn(self.pids["children"], self.reported(), self.report)
+
+    def test_an_acknowledged_process_is_not_reported(self):
+        self.assertNotIn(self.pids["idle"], self.reported(), self.report)
+        self.assertEqual(self.reported(), {self.pids["silent"]}, self.report)
+
+    def test_a_second_watchdog_of_the_session_refuses_to_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} watch --session {self.SESSION} --interval 0.2 --initial 60"
+            agent, pids, _ = self.scenario(tmp, {"silent": "sleep 30"}, watch=[first, first])
+            try:
+                self.assertEqual(json.loads(wait_for(pathlib.Path(tmp) / "exit.json", 20)), 3)
+                self.assertRegex((pathlib.Path(tmp) / "watch1.out").read_text(),
+                                 r"^guard watch: a watchdog already watches this session \(pid \d+\); nothing to start\.\n$")
+                first_dog = json.loads((pathlib.Path(tmp) / "guard" / "sessions" / "claude-w1.watch.pid").read_text())["pid"]
+                self.assertTrue(proc_alive(first_dog))
+            finally:
+                self.end(agent, pids)
+
+    def test_the_watchdog_exits_when_its_agent_process_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent, pids, _ = self.scenario(tmp, {"printer": "while :; do echo tick; sleep 0.2; done"}, initial=60)
+            record = pathlib.Path(tmp) / "guard" / "sessions" / "claude-w1.watch.pid"
+            try:
+                dog = json.loads(wait_for(record))["pid"]
+                self.assertTrue(proc_alive(dog))
+                os.kill(agent.pid, signal.SIGKILL)
+                agent.wait()
+                deadline = time.monotonic() + 10
+                while proc_alive(dog) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(proc_alive(dog))
+                self.assertFalse(record.exists())
+            finally:
+                self.end(agent, pids)
+
+    def test_the_threshold_grows_for_a_job_with_long_natural_gaps_and_never_drops_below_the_initial_value(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import procs, watch
+        root = procs.Process(10, 1, 0.0, 0.0, "sh -c job")
+
+        def job_with(beats):
+            job, cpu = watch.Job(root, 0.0), 0.0
+            for t in range(0, 200, 5):
+                cpu += 1.0 if t in beats else 0.001
+                job.observe({10: root._replace(cpu=cpu)}, [10], {}, float(t), watch.CPU_FLOOR)
+            return job
+        steady, slow = job_with(set(range(0, 200, 10))), job_with({0, 40, 80, 120})
+        self.assertEqual((steady.events, steady.longest), (19, 10.0))
+        self.assertEqual(steady.threshold(30, 3, 3), 30)
+        self.assertEqual((slow.events, slow.longest), (3, 40.0))
+        self.assertEqual(slow.threshold(30, 3, 3), 120)
+        self.assertEqual(slow.threshold(30, 3, 4), 30, "too few events yet: the initial value")
+        self.assertEqual(job_with(set()).events, 0, "CPU under the floor is no progress")
+
+    def test_with_no_agent_process_above_it_the_watchdog_says_so_and_watches_nothing(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import procs, state, watch
+        rows = {pid: procs.Process(pid, parent, 0.0, 0.0, command) for pid, parent, command in
+                ((1, 0, "/sbin/launchd"), (5, 1, "-zsh"), (6, 5, "bash -c x"), (7, 6, "python3 guard.py watch"))}
+        self.assertEqual(watch.find_agent(rows, me=7), (None, None))
+        rows[5] = rows[5]._replace(command="node agent.js")
+        self.assertEqual(watch.find_agent(rows, me=7), (rows[5], 6))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(state, "SESSIONS", pathlib.Path(tmp)), \
+                mock.patch.object(procs, "table", return_value={**rows, 5: rows[5]._replace(command="-zsh")}), \
+                mock.patch.object(os, "getpid", return_value=7), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(watch.run("claude", "w2"), watch.NO_AGENT)
+            self.assertIn("found no agent process above this one", out.getvalue())
+            self.assertIn("no agent process", state.load("claude", "w2")["watch_unavailable"]["why"])
+
+
+def wait_for(path, wait=10):
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError):
+            return path.read_text()
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never appeared")
+
+
+def proc_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return not subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip().startswith("Z")
+
 
 if __name__ == "__main__":
     unittest.main()

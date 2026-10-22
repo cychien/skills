@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from . import pr, quota, shell, skills, state, verifiers
+from . import pr, procs, quota, shell, skills, state, verifiers
 
 PASS = ("pass", None)
 SLASH = re.compile(r"^\s*/([a-z0-9][a-z0-9-]*)\b")
@@ -91,22 +91,8 @@ def headless():
     """Whether this hook runs under a non-interactive agent, where ending the turn ends the process and its background work."""
     if os.environ.get("GUARD_HEADLESS"):
         return os.environ["GUARD_HEADLESS"] == "1"
-    try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    table = {}
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            table[int(parts[0])] = (int(parts[1]), parts[2])
-    pid, seen = os.getppid(), set()
-    while pid in table and pid not in seen and pid > 1:
-        seen.add(pid)
-        if HEADLESS.search(table[pid][1]):
-            return True
-        pid = table[pid][0]
-    return False
+    rows = procs.table()
+    return any(HEADLESS.search(rows[pid].command) for pid in procs.ancestors(rows, os.getpid()))
 
 
 def cli(event):

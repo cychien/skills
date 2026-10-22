@@ -46,11 +46,24 @@ def load(agent, session):
         return fresh()
 
 
+def watch_path(agent, session):
+    """The pid file of the session's watchdog."""
+    return SESSIONS / f"{key(agent, session)}.watch.pid"
+
+
 @contextlib.contextmanager
-def update(agent, session):
+def lock(agent, session):
+    """The session's lock, held by every change to its state and its watchdog's pid file."""
     SESSIONS.mkdir(parents=True, exist_ok=True)
-    with open(SESSIONS / f".{key(agent, session)}.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(SESSIONS / f".{key(agent, session)}.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        yield
+
+
+@contextlib.contextmanager
+def update(agent, session, locked=False):
+    """The session's state to change; locked says the caller already holds the session's lock."""
+    with contextlib.nullcontext() if locked else lock(agent, session):
         data = load(agent, session)
         yield data
         tmp = path(agent, session).with_suffix(f".{os.getpid()}.tmp")
