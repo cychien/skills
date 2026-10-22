@@ -235,10 +235,12 @@ def guard_cli():
 
 
 def spawn_problem(command, cwd, lead):
-    """A deny message when a shell line starts an agent that is limited or reserved for this branch's real-agent checks."""
+    """A deny message when a shell line starts an agent that is limited or reserved for the real-agent checks of the branch
+    it runs on, read from the directory a leading cd moves it to."""
     started = launches(command)
     if not started:
         return None
+    cwd = shell.workdir(command, cwd)
     limited = limits()
     for agent, launched in started:
         if agent in limited:

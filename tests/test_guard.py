@@ -1201,6 +1201,37 @@ class Guard(unittest.TestCase):
         self.assertIn("(T3)", self.hook("PreToolUse", codex)["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertIsNone(self.hook("PreToolUse", {**codex, "tool_input": {"command": "codex exec -m gpt-5 -"}}, agent="codex"))
 
+    def plans_where_run(self, plans):
+        """A verify skill whose `where` answers per working directory, and each directory's plan."""
+        self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
+        scripts = self.skills / "verify" / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "verify.py").write_text("import os, sys\nif sys.argv[1:] == ['where']:\n    print(os.path.join(os.getcwd(), 'verification'))\n")
+        for directory, plan in plans.items():
+            (directory / "verification").mkdir(parents=True, exist_ok=True)
+            (directory / "verification" / "plan.md").write_text(plan)
+
+    def test_the_reserved_agent_is_read_from_the_plan_where_the_command_runs(self):
+        self.models()
+        here, worktree = pathlib.Path(self.tmp.name), pathlib.Path(self.tmp.name) / "worktrees" / "phase-2"
+        real = "# Plan\n\n### T1. A real turn\n\n- Agent: real: Codex must choose the command\n"
+        fake = "# Plan\n\n### T1. A fake turn\n\n- Agent: fake: wire logic\n"
+        launches = ["codex exec -m gpt-5 - < review.md", "python3 /x/salvo/scripts/salvo.py run --out /tmp/s codex:d:medium < review.md"]
+        self.plans_where_run({here: real, worktree: fake})
+        for launch in launches:
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launch}})
+            self.assertIn("codex is reserved", out["hookSpecificOutput"]["permissionDecisionReason"], launch)
+            for moved in (f"cd {worktree} && {launch}", f"cd worktrees/phase-2; {launch}", f"cd worktrees && cd phase-2 && {launch}"):
+                self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": moved}}), moved)
+        self.plans_where_run({here: fake, worktree: real})
+        for launch in launches:
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launch}}), launch)
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd '{worktree}' && {launch}"}})
+            self.assertIn("codex is reserved", out["hookSpecificOutput"]["permissionDecisionReason"], launch)
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"ls; cd {worktree} && {launches[0]}"}}),
+                          "only a leading cd moves the command")
+
+
 
 FEATURE_V2 = """\
 ---
