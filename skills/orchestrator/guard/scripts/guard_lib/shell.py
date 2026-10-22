@@ -19,6 +19,9 @@ SHELL_VALUED = {"-o", "+o", "-O", "+O"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DEPTH = 4
 OPENERS = {"do", "then", "else", "elif", "{", "!"}
+EXITS = {"break", "exit", "return"}
+BODY_WORDS = OPENERS | {"if", "fi", "done"}
+CHAINS = {"&&", "||", "|", "(", ")"}
 LEADING_CD = re.compile(r"\s*cd\s+((?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^\s;&|'\"\\])+)\s*(?:&&|;)")
 LEADING_CD_WORD = re.compile(r"\s*cd(?:\s|;|&|$)")
 UNKNOWN_TARGET = re.compile(r"[$`*?\[]")
@@ -58,13 +61,34 @@ def substitution(text, i):
 def segments(line):
     """The text of each simple command in a shell line: split at ; & | newlines and parentheses outside quotes, with
     comments and heredoc bodies dropped, and the commands of each backtick or double-quoted $( ) substitution added."""
+    found = []
+    for text, _, substitutions in pieces(line):
+        for body in substitutions:
+            found += segments(body)
+        found.append(text)
+    return [s for s in found if s.strip()]
+
+
+def pieces(line):
+    """(text, the operator after it, the substitution bodies inside it) for each simple command of a shell line, in order;
+    the operator is ;, &, &&, |, ||, a newline, a parenthesis, or '' at the end."""
     text = HEREDOC.sub(lambda m: m.group(3), line or "")
-    found, current, quote, i = [], [], None, 0
+    found, current, inner, quote, i = [], [], [], None, 0
+
+    def close(op):
+        nonlocal current, inner
+        piece = "".join(current)
+        if piece.strip() or inner:
+            found.append([piece, op, inner])
+        elif found and found[-1][1] in "()":
+            found[-1][1] = op
+        current, inner = [], []
+
     while i < len(text):
         c = text[i]
         if quote != "'" and (c == "`" or (quote == '"' and text.startswith("$(", i) and not text.startswith("$((", i))):
             body, end = substitution(text, i)
-            found += segments(body)
+            inner.append(body)
             current.append(text[i:end])
             i = end
             continue
@@ -88,13 +112,15 @@ def segments(line):
         elif c == "&" and ((current and current[-1] in "<>") or text[i + 1:i + 2] == ">"):
             current.append(c)
         elif c in SEPARATORS:
-            found.append("".join(current))
-            current = []
+            op = text[i:i + 2] if text[i:i + 2] in ("&&", "||") else c
+            close(op)
+            i += len(op)
+            continue
         else:
             current.append(c)
         i += 1
-    found.append("".join(current))
-    return [s for s in found if s.strip()]
+    close("")
+    return [tuple(piece) for piece in found]
 
 
 def argv(segment):
@@ -200,31 +226,84 @@ def workdir(line, cwd):
     return directory
 
 
+class Loop:
+    """A while or until loop of a shell line: the argv of each command in its condition and in its body, and of each body
+    command whose status decides whether the loop ends: one chained to a break or an exit, or the test of an if that
+    breaks."""
+
+    def __init__(self, keyword):
+        self.keyword, self.condition, self.body, self.exits = keyword, [], [], []
+        self.in_body, self.chain, self.ifs = False, [], []
+
+    def add(self, found, op):
+        """The commands of one piece of the line, and the operator after it."""
+        if not self.in_body:
+            self.condition += found
+            return
+        self.body += found
+        if self.ifs and self.ifs[-1]["testing"]:
+            self.ifs[-1]["test"] += found
+        if any(tokens[0] in EXITS for tokens in found):
+            self.exits += [tokens for tokens in self.chain + found if tokens[0] not in EXITS]
+            if self.ifs:
+                self.ifs[-1]["breaks"] = True
+        self.chain = self.chain + found if op in CHAINS else []
+
+    def reserved(self, word):
+        """Follow the if, then, elif and fi words of the body, so an if's test decides the exit when a branch breaks."""
+        if not self.in_body:
+            return
+        if word == "if":
+            self.ifs.append({"testing": True, "test": [], "breaks": False})
+        elif word == "elif" and self.ifs:
+            self.ifs[-1]["testing"] = True
+        elif word in ("then", "else") and self.ifs:
+            self.ifs[-1]["testing"] = False
+        elif word == "fi" and self.ifs:
+            closed = self.ifs.pop()
+            if closed["breaks"]:
+                self.exits += closed["test"]
+                if self.ifs:
+                    self.ifs[-1]["breaks"] = True
+        self.chain = []
+
+    def deciding(self):
+        """The commands whose status decides whether the loop ends."""
+        return self.condition + self.exits
+
+
 def loops(line, depth=0):
-    """The argv of every command inside each while or until loop a shell line runs, condition and body, nested shell
-    programs included."""
+    """Each while or until loop a shell line runs, nested loops and those in nested shell programs included."""
     found, open_loops = [], []
-    for segment in segments(line):
+    for text, op, substitutions in pieces(line):
         try:
-            words = shlex.split(segment)
+            words = shlex.split(text)
         except ValueError:
             words = []
-        while words[:1] and words[0] in OPENERS:
+        while words[:1] and words[0] in BODY_WORDS and open_loops:
+            if words[0] == "do":
+                open_loops[-1].in_body = True
+            elif words[0] == "done":
+                closed = open_loops.pop()
+                found += [closed] if closed.keyword in ("while", "until") else []
+            else:
+                open_loops[-1].reserved(words[0])
+            words = words[1:]
+        while words[:1] and words[0] in BODY_WORDS:
             words = words[1:]
         if words[:1] in (["while"], ["until"], ["for"], ["select"]):
-            open_loops.append((words[0], []))
-        tokens = argv(segment)
-        for _, body in open_loops:
-            if tokens and tokens[0] != "done":
-                body.append(tokens)
-        if words[:1] == ["done"] and open_loops:
-            keyword, body = open_loops.pop()
-            if keyword in ("while", "until"):
-                found.append(body)
-        nested = program(tokens)
+            if open_loops:
+                open_loops[-1].chain = []
+            open_loops.append(Loop(words[0]))
+        here = [t for t in [argv(text), *(c for body in substitutions for c in commands(body, depth + 1))] if t and t[0] not in BODY_WORDS]
+        for loop in open_loops[:-1]:
+            loop.body += here if loop.in_body else []
+        if open_loops and here:
+            open_loops[-1].add(here, op)
+        nested = program(argv(text))
         if nested and depth < DEPTH:
             found += loops(nested, depth + 1)
-    return found + [body for keyword, body in open_loops if keyword in ("while", "until")]
+    return found + [loop for loop in open_loops if loop.keyword in ("while", "until")]
 
 
 def line(words):

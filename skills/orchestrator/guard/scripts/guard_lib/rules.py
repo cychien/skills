@@ -474,17 +474,18 @@ def polls_for_subagent(command):
 
 
 def polls_verify_run(command):
-    """Whether a while or until loop with a sleep waits on a verify.py rerun or dryrun: its process, by text another
-    command matches, or its output file, by name or by the redirect that wrote it."""
+    """Whether a while or until loop with a sleep waits on a verify.py rerun or dryrun: a command that decides whether the
+    loop ends (its condition, or a body command chained to a break) names its process, by text another command matches, or
+    its output file, by name or by the redirect that wrote it. A body command that only mentions one decides nothing."""
     outputs = set()
     for tokens in shell.commands(command):
         name, rest = shell.script(tokens)
         if name == "verify.py" and rest[:1] in (["rerun"], ["dryrun"]):
             outputs |= set(redirect_targets(rest))
-    for body in shell.loops(command):
-        if not any(os.path.basename(tokens[0]) == "sleep" for tokens in body):
+    for loop in shell.loops(command):
+        if not any(os.path.basename(tokens[0]) == "sleep" for tokens in loop.condition + loop.body):
             continue
-        for tokens in body:
+        for tokens in loop.deciding():
             if shell.script(tokens)[0] == "verify.py":
                 continue
             args = tokens[1:]
