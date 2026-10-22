@@ -1335,6 +1335,10 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.stop("Waiting.", background_tasks=[*work, self.watch_shell()]))
         self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a1", "last_assistant_message": "done", "background_tasks": work}))
         dog, record = self.start_watchdog()
+        token = json.loads(record.read_text())["token"]
+        self.assertRegex(token, r"^[0-9a-f]{32}$")
+        live = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(dog.pid)], capture_output=True, text=True).stdout.strip()
+        self.assertTrue(live.endswith(f" watch --session claude:s1 --interval 0.2 --initial 60 --token {token}"), live)
         self.assertIsNone(self.stop("Waiting.", background_tasks=work))
         r = subprocess.run([sys.executable, str(GUARD), "watch", "--stop", "--session", "claude:s1"], capture_output=True, text=True, env=self.env)
         self.assertEqual(r.stdout, f"Stopped the watchdog (pid {dog.pid}).\n")
@@ -1712,7 +1716,7 @@ class Watch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(state, "SESSIONS", pathlib.Path(tmp)), \
                 mock.patch.object(procs, "table", return_value={**rows, 5: rows[5]._replace(command="-zsh")}), \
                 mock.patch.object(os, "getpid", return_value=7), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(watch.run("claude", "w2"), watch.NO_AGENT)
+            self.assertEqual(watch.run("claude", "w2", "t-me"), watch.NO_AGENT)
             self.assertIn("found no agent process above this one", out.getvalue())
             self.assertIn("no agent process", state.load("claude", "w2")["watch_unavailable"]["why"])
 
@@ -1750,12 +1754,12 @@ class WatchIdentity(unittest.TestCase):
                 self.procs.table()
 
     def test_a_ps_failure_during_the_claim_never_takes_over_a_live_watchdogs_pid_file(self):
-        self.write(started=time.time() - 50)
+        self.write(token="t-other")
         before = self.record.read_text()
-        other = (300, 200, 50, "python3 guard.py watch --session claude:w3")
+        other = (300, 200, 50, "python3 guard.py watch --session claude:w3 --token t-other")
         with mock.patch.object(self.procs.subprocess, "run", side_effect=[self.tree(other), FileNotFoundError("ps")]), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(self.watch.run("claude", "w3", interval=0), self.watch.UNSEEN)
+            self.assertEqual(self.watch.run("claude", "w3", "t-me", interval=0), self.watch.UNSEEN)
         self.assertIn("cannot tell whether another watchdog of this session runs; nothing started", out.getvalue())
         self.assertEqual(self.record.read_text(), before)
 
@@ -1764,31 +1768,63 @@ class WatchIdentity(unittest.TestCase):
         failures = [FileNotFoundError("ps")] * self.watch.UNSEEN_SAMPLES
         with mock.patch.object(self.procs.subprocess, "run", side_effect=[self.tree(other), self.tree(other), *failures]), \
                 mock.patch.object(self.watch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(self.watch.run("claude", "w3", interval=0), self.watch.UNSEEN)
+            self.assertEqual(self.watch.run("claude", "w3", "t-me", interval=0), self.watch.UNSEEN)
         self.assertIn(f"cannot list processes: {self.watch.UNSEEN_SAMPLES} samples in a row failed", out.getvalue())
         self.assertIn("cannot list processes", self.state.load("claude", "w3")["watch_unavailable"]["why"])
         self.assertFalse(self.record.exists())
 
-    def test_the_pid_file_is_trusted_and_signaled_only_for_the_watchdog_that_wrote_it(self):
-        now = time.time()
-        rows = {300: self.procs.Process(300, 200, now - 50, 0.0, "python3 guard.py watch --session claude:other")}
-        cases = {"a pid reused by another session's watchdog": dict(started=now - 3600),
-                 "a record of another session": dict(started=now - 50, session="claude:other"),
-                 "a record that names no start": dict()}
-        for case, fields in cases.items():
+    def test_the_pid_file_is_trusted_and_signaled_only_for_the_watchdog_whose_command_line_carries_its_token(self):
+        now, mine = time.time(), "python3 guard.py watch --session claude:w3 --token t-mine"
+
+        def table(command):
+            return mock.patch.object(self.procs, "table", return_value={300: self.procs.Process(300, 200, now - 50, 0.0, command)})
+
+        def ps(command):
+            listed = subprocess.CompletedProcess(["ps"], 0, f"{command}\n", "") if command else subprocess.CompletedProcess(["ps"], 1, "", "")
+            return mock.patch.object(self.procs.subprocess, "run", return_value=listed)
+
+        def no_pidfd():
+            return mock.patch.object(self.procs.os, "pidfd_open", side_effect=OSError(38, "Function not implemented"), create=True)
+        cases = {"a pid reused within seconds by another session's watchdog":
+                 (dict(started=now - 50, token="t-mine"), "python3 guard.py watch --session claude:other --token t-other"),
+                 "the same pid and start with another token": (dict(started=now - 50, token="t-mine"), mine.replace("t-mine", "t-old")),
+                 "a token that is only a prefix of the live one": (dict(started=now - 50, token="t-mi"), mine),
+                 "a record of another session": (dict(started=now - 50, token="t-mine", session="claude:other"), mine),
+                 "a record that names no token": (dict(started=now - 50), mine)}
+        for case, (fields, command) in cases.items():
             self.write(**fields)
-            with mock.patch.object(self.procs, "table", return_value=rows), mock.patch.object(self.watch.os, "kill") as kill:
+            with table(command), ps(command), no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill:
                 self.assertIsNone(self.watch.alive("claude", "w3"), case)
                 self.assertIsNone(self.watch.stop("claude", "w3"), case)
                 kill.assert_not_called()
-        self.write(started=now - 50)
-        with mock.patch.object(self.procs, "table", return_value=rows), mock.patch.object(self.watch.os, "kill") as kill:
+        self.write(started=now - 50, token="t-mine")
+        for case, then in {"the pid changed hands between the check and the signal": "sleep 60",
+                           "the watchdog ended between the check and the signal": None}.items():
+            with table(mine), ps(then), no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill:
+                self.assertIsNone(self.watch.stop("claude", "w3"), case)
+                kill.assert_not_called()
+        with table(mine), ps(mine), no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill:
+            self.assertEqual(self.watch.alive("claude", "w3")["pid"], 300)
             self.assertEqual(self.watch.stop("claude", "w3"), 300)
             kill.assert_called_once_with(300, signal.SIGTERM)
-        with mock.patch.object(self.procs, "table", side_effect=self.procs.Unseen("ps failed")), \
-                mock.patch.object(self.watch.os, "kill") as kill, self.assertRaises(self.procs.Unseen):
-            self.watch.stop("claude", "w3")
-        kill.assert_not_called()
+        for failing in (mock.patch.object(self.procs, "table", side_effect=self.procs.Unseen("ps failed")),
+                        mock.patch.object(self.procs.subprocess, "run", side_effect=FileNotFoundError("ps"))):
+            with table(mine), failing, no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill, self.assertRaises(self.procs.Unseen):
+                self.watch.stop("claude", "w3")
+            kill.assert_not_called()
+
+    def test_where_pidfds_exist_the_signal_goes_through_one_opened_before_the_command_line_is_read(self):
+        calls = mock.Mock()
+        calls.pidfd_open.side_effect = lambda _: os.open(os.devnull, os.O_RDONLY)
+        calls.command.return_value = "python3 guard.py watch --token t-mine"
+        with mock.patch.object(self.procs.os, "pidfd_open", calls.pidfd_open, create=True), \
+                mock.patch.object(self.procs.signal, "pidfd_send_signal", calls.send, create=True), \
+                mock.patch.object(self.procs, "command", calls.command), mock.patch.object(self.procs.os, "kill", calls.kill):
+            self.assertTrue(self.procs.signal_if(4242, lambda command: command.endswith("--token t-mine"), signal.SIGTERM))
+            self.assertFalse(self.procs.signal_if(4242, lambda command: command.endswith("--token t-other"), signal.SIGTERM))
+        self.assertEqual([name for name, *_ in calls.mock_calls], ["pidfd_open", "command", "send", "pidfd_open", "command"])
+        calls.kill.assert_not_called()
+
 
 def wait_for(path, wait=10):
     deadline = time.monotonic() + wait

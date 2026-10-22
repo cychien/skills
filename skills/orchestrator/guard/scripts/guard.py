@@ -286,7 +286,10 @@ def run_watch(args):
             sys.exit(f"guard: cannot list processes ({e}), so the watchdog's identity cannot be checked and nothing was signaled.")
         print(f"Stopped the watchdog (pid {stopped})." if stopped else "No watchdog runs for this session.")
         return
-    sys.exit(watch.run(agent, sid, interval=args.interval, initial=args.initial, multiple=args.multiple, events=args.events,
+    if args.token is None:
+        # Same pid, now with a token on its own command line that names this watchdog alone.
+        os.execv(sys.executable, [*getattr(sys, "orig_argv", [sys.executable, *sys.argv]), "--token", watch.new_token()])
+    sys.exit(watch.run(agent, sid, args.token, interval=args.interval, initial=args.initial, multiple=args.multiple, events=args.events,
                        cpu_floor=args.cpu_floor))
 
 
@@ -340,6 +343,7 @@ def main():
     w.add_argument("--session")
     w.add_argument("--ack", type=int, metavar="PID", help="acknowledge an intentionally idle process: never ask about it again")
     w.add_argument("--stop", action="store_true", help="end the session's watchdog")
+    w.add_argument("--token", help=argparse.SUPPRESS)
     w.add_argument("--interval", type=float, default=watch.INTERVAL_S, help="seconds between samples (default %(default)g)")
     w.add_argument("--initial", type=float, default=watch.INITIAL_S,
                    help="seconds of silence before a question while a job has too few progress events to judge its rhythm, "

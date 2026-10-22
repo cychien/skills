@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 from . import procs, shell, state
 
@@ -192,6 +193,27 @@ def runs_watchdog(command):
     return any(rest[:1] == ["watch"] and not ({"--ack", "--stop"} & set(rest)) for rest in shell.invocations(command or "", "guard.py"))
 
 
+def new_token():
+    return uuid.uuid4().hex
+
+
+def token_of(rest):
+    """The --token a guard.py command's arguments pass, the last one as argparse reads it, or None."""
+    found = None
+    for word, after in zip(rest, [*rest[1:], None]):
+        if word == "--token":
+            found = after
+        elif word.startswith("--token="):
+            found = word.removeprefix("--token=")
+    return found
+
+
+def carries(command, token):
+    """Whether a command line runs the watchdog that holds token: `guard.py watch ... --token <token>`, exactly."""
+    return bool(token) and any(rest[:1] == ["watch"] and token_of(rest) == token
+                               for rest in shell.invocations(command or "", "guard.py"))
+
+
 def record(agent, session):
     with contextlib.suppress(OSError, ValueError):
         return json.loads(state.watch_path(agent, session).read_text())
@@ -199,19 +221,18 @@ def record(agent, session):
 
 
 def alive(agent, session, rows=None):
-    """The watchdog record of this session while the process it names is that watchdog: the pid runs a watchdog that
-    started when the record says, and the record is this session's. Else None; raises procs.Unseen when ps cannot run."""
+    """The watchdog record of this session while the process it names is that watchdog: the record is this session's and
+    the pid's command line carries the record's token, which only that watchdog was started with. Else None; raises
+    procs.Unseen when ps cannot run."""
     found = record(agent, session)
-    if not isinstance(found, dict) or found.get("session") != f"{agent}:{session}":
+    if not isinstance(found, dict) or found.get("session") != f"{agent}:{session}" or not isinstance(found.get("token"), str):
         return None
     rows = rows if rows is not None else procs.table()
     process = rows.get(found.get("pid"))
-    if process and procs.born_at(rows, process.pid, found.get("started")) and runs_watchdog(process.command):
-        return found
-    return None
+    return found if process and carries(process.command, found["token"]) else None
 
 
-def claim(agent, session, agent_pid):
+def claim(agent, session, agent_pid, token):
     """Record this process as the session's watchdog; the record of one already running when another holds it. Raises
     procs.Unseen when ps cannot run, because another watchdog may then be alive."""
     with state.lock(agent, session):
@@ -219,9 +240,8 @@ def claim(agent, session, agent_pid):
         running = alive(agent, session, rows)
         if running and running["pid"] != os.getpid():
             return running
-        me = rows.get(os.getpid())
         state.watch_path(agent, session).write_text(json.dumps({
-            "pid": os.getpid(), "started": me.started if me else None, "session": f"{agent}:{session}", "agent": agent_pid,
+            "pid": os.getpid(), "token": token, "session": f"{agent}:{session}", "agent": agent_pid,
             "since": time.time()}) + "\n")
         with state.update(agent, session, locked=True) as data:
             data.pop("watch_unavailable", None)
@@ -237,13 +257,11 @@ def release(agent, session):
 
 
 def stop(agent, session):
-    """SIGTERM the session's watchdog once its pid file and the process agree on who it is; returns its pid, or None when
-    none runs. Raises procs.Unseen when ps cannot run, and then signals nothing."""
+    """SIGTERM the session's watchdog while its pid file and the process agree on who it is, checked again right before
+    the signal; returns its pid, or None when none runs. Raises procs.Unseen when ps cannot run, and then signals nothing."""
     running = alive(agent, session)
-    if not running:
+    if not running or not procs.signal_if(running["pid"], lambda command: carries(command, running["token"]), signal.SIGTERM):
         return None
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(running["pid"], signal.SIGTERM)
     return running["pid"]
 
 
@@ -271,14 +289,14 @@ def ack(agent, session, pid):
     return f"Acknowledged {pid} ({clip(' '.join(process.command.split()), COMMAND_CHARS)}): the watchdog never asks about it again in this session."
 
 
-def run(agent, session, interval=INTERVAL_S, initial=INITIAL_S, multiple=MULTIPLE, events=EVENTS, cpu_floor=CPU_FLOOR):
+def run(agent, session, token, interval=INTERVAL_S, initial=INITIAL_S, multiple=MULTIPLE, events=EVENTS, cpu_floor=CPU_FLOOR):
     """Watch until a job goes silent (print the report, exit 0), the agent process exits, or a signal stops it. When ps
     fails, which processes run is unknown: it never starts over another watchdog it cannot rule out, and it exits with an
     error after UNSEEN_SAMPLES failed samples in a row instead of watching blind."""
     try:
         rows = procs.table()
         found, own = find_agent(rows)
-        running = claim(agent, session, found.pid) if found else None
+        running = claim(agent, session, found.pid, token) if found else None
     except procs.Unseen as e:
         why = f"cannot list processes ({e}), so it cannot tell whether another watchdog of this session runs"
         print(f"guard watch: {why}; nothing started.")

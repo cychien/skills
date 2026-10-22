@@ -2,6 +2,7 @@
 import collections
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -31,7 +32,7 @@ class Unseen(Exception):
 def table():
     """{pid: Process}; raises Unseen when ps cannot run or lists nothing (it always lists itself)."""
     try:
-        done = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,time=,command="], capture_output=True, text=True, timeout=15)
+        done = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,etime=,time=,command="], capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise Unseen(f"ps could not run: {e}")
     now, rows = time.time(), {}
@@ -83,7 +84,39 @@ def same(rows, process):
                 (now.started is None or process.started is None or abs(now.started - process.started) <= SAME_START_S))
 
 
-def born_at(rows, pid, started):
-    """Whether pid runs a process that started at started, so a pid reused since is never taken for it."""
-    now = rows.get(pid)
-    return bool(now and now.started is not None and started is not None and abs(now.started - started) <= SAME_START_S)
+def command(pid):
+    """pid's command line as ps prints it now, or None when no process has that pid; raises Unseen when ps cannot run."""
+    try:
+        done = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Unseen(f"ps could not run: {e}")
+    line = (done.stdout.splitlines() or [""])[0].strip()
+    return line if not done.returncode and line else None
+
+
+def signal_if(pid, is_it, sig):
+    """Send sig to pid only while is_it(its command line, read right before the signal) holds; returns whether it was sent.
+    Where the system has pidfds the signal goes through one opened before the read, so it cannot reach a process that took
+    the pid after the check. Raises Unseen when ps cannot run, and then signals nothing."""
+    pidfd, open_pidfd = None, getattr(os, "pidfd_open", None)
+    if open_pidfd:
+        try:
+            pidfd = open_pidfd(pid)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+    try:
+        now = command(pid)
+        if now is None or not is_it(now):
+            return False
+        if pidfd is None:
+            os.kill(pid, sig)
+        else:
+            signal.pidfd_send_signal(pidfd, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
