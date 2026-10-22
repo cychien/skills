@@ -350,6 +350,7 @@ PROGRESS_POLL_S = 0.5
 EXIT_VERDICTS = {0: "PASS", 1: "FAIL", 2: "INCONCLUSIVE", 3: "ENVIRONMENT"}
 ENVIRONMENT_REQUEUES = 2
 HELD_OUTPUT_S = 2.0
+REMOTE_GIT_TIMEOUT_S = 60.0
 HELD_OUTPUT_NOTE = ("verify: a process the script left running still held its output {seconds:g}s after the script ended, "
                     "so verify closed the pipes without it\n")
 SUMMARY = ".summary"
@@ -375,6 +376,16 @@ class Failed(Exception):
 
 class CannotScan(Failed):
     code = 2
+
+
+def remote_git(*args, what):
+    """git run against the remote with no stdin, no credential prompt and no controlling terminal, killed with everything
+    it started after REMOTE_GIT_TIMEOUT_S; Failed names the timeout, as cannot-<what>."""
+    try:
+        return run_in_group(["git", *args], REMOTE_GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except subprocess.TimeoutExpired:
+        raise Failed(f"cannot {what}: git {args[0]} timed out after {REMOTE_GIT_TIMEOUT_S:g}s with no answer from origin")
 
 
 def git(*args, cwd=None):
@@ -913,7 +924,7 @@ def latest_base(branch):
     repository without an origin remote. Failed otherwise."""
     ref = branch
     if "origin" in git("remote").split():
-        fetched = subprocess.run(["git", "fetch", "-q", "origin", branch], capture_output=True, text=True)
+        fetched = remote_git("fetch", "-q", "origin", branch, what=f"fetch {branch} from origin")
         if fetched.returncode:
             raise Failed(f"cannot fetch {branch} from origin: {fetched.stderr.strip()}. Name the branch this phase is cut from, "
                          "pushed: `verify.py base <branch>`")
@@ -936,7 +947,7 @@ def default_base_branch():
         return default_branch().removeprefix("origin/")
     except Failed:
         if "origin" in git("remote").split():
-            listed = subprocess.run(["git", "ls-remote", "--symref", "origin", "HEAD"], capture_output=True, text=True)
+            listed = remote_git("ls-remote", "--symref", "origin", "HEAD", what="fetch the default branch from origin")
             if m := re.search(r"^ref: refs/heads/(\S+)\tHEAD$", listed.stdout, re.M):
                 return m.group(1)
         raise Failed("cannot find the branch this phase is cut from: no origin/HEAD, main or master ref here, and no origin "

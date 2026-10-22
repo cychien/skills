@@ -1765,6 +1765,54 @@ class BaseBranch(RepoFixture):
         self.git("remote", "remove", "origin")
         self.assertIn("cannot find the branch this phase is cut from", self.verify("base", ok=False))
 
+    def unanswering_origin(self):
+        """Point origin at a helper that never answers; the file it writes holds the pid of the process left waiting."""
+        helper = pathlib.Path(self.tmp.name) / "silent-origin.sh"
+        pid = pathlib.Path(self.tmp.name) / "silent-origin.pid"
+        helper.write_text(f"#!/bin/sh\necho $$ > {pid}\nexec sleep 60\n")
+        helper.chmod(0o755)
+        self.git("config", "protocol.ext.allow", "always")
+        self.git("remote", "set-url", "origin", f"ext::{helper}")
+        return pid
+
+    def verify_with_remote_timeout(self, seconds, *args):
+        load = ("import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('verify', {str(VERIFY)!r})\n"
+                "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n"
+                f"module.REMOTE_GIT_TIMEOUT_S = {seconds}\nsys.argv = ['verify.py', *sys.argv[1:]]\nmodule.main()\n")
+        env = {**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")}
+        started = time.monotonic()
+        r = subprocess.run([sys.executable, "-I", "-c", load, *args], cwd=self.repo, capture_output=True, text=True, env=env, timeout=40)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        return r.stdout + r.stderr
+
+    def test_an_origin_that_never_answers_a_fetch_is_a_refusal_that_names_the_timeout_and_leaves_no_process(self):
+        pid = self.unanswering_origin()
+        out = self.verify_with_remote_timeout(1, "base")
+        self.assertIn("cannot fetch main from origin: git fetch timed out after 1s", out)
+        self.assertTrue(gone(wait_for_file(pid)))
+
+    def test_an_origin_that_never_answers_for_its_default_branch_is_the_same_refusal(self):
+        self.git("checkout", "-q", "--detach")
+        self.git("branch", "-q", "-D", "main", "feature/mul")
+        for ref in self.git("for-each-ref", "--format=%(refname)", "refs/remotes").split():
+            self.git("update-ref", "--no-deref", "-d", ref)
+        pid = self.unanswering_origin()
+        out = self.verify_with_remote_timeout(1, "base")
+        self.assertIn("cannot fetch the default branch from origin: git ls-remote timed out after 1s", out)
+        self.assertTrue(gone(wait_for_file(pid)))
+
+    def test_the_remote_calls_forbid_a_credential_prompt(self):
+        record = pathlib.Path(self.tmp.name) / "seen"
+        helper = pathlib.Path(self.tmp.name) / "peek-origin.sh"
+        helper.write_text(f"#!/bin/sh\necho \"$GIT_TERMINAL_PROMPT\" > {record}\nexit 1\n")
+        helper.chmod(0o755)
+        self.git("config", "protocol.ext.allow", "always")
+        self.git("remote", "set-url", "origin", f"ext::{helper}")
+        self.verify("base", ok=False, env={"GIT_TERMINAL_PROMPT": "1"})
+        self.assertEqual(record.read_text().strip(), "0")
+
     def test_without_an_origin_remote_the_local_branch_is_the_latest(self):
         self.git("remote", "remove", "origin")
         self.assertIn("base ok: HEAD descends from main at", self.verify("base"))
