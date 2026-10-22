@@ -19,7 +19,7 @@ FEATURE = ROOT / "skills" / "eng" / "feature" / "SKILL.md"
 PHASE = "01-mul"
 
 AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
-GATES = {1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
+GATES = {1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
          7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
 MANDATORY = {1, 2, 3, 4, 5, 7, 8, 10}
 

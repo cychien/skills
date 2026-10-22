@@ -1275,7 +1275,7 @@ description: x
 
 # Feature
 
-1. Clarify the requirements and run the basic checks. Close this step only when `../verify/scripts/verify.py plan --checks` passes. Mandatory: no skip-with-reason escape.
+1. Clarify the requirements and run the basic checks. Close this step only when `../verify/scripts/verify.py base` and `../verify/scripts/verify.py plan --checks` pass. Mandatory: no skip-with-reason escape.
 2. Ground in the code with the how skill (`../how/SKILL.md`) and check every check's premises. Close this step only when `../verify/scripts/verify.py premises` passes.
 3. Design. Read the principles index (`../principles/SKILL.md`) and the principles you apply. Close this step only when `../verify/scripts/verify.py plan` and `../verify/scripts/verify.py premises --resolved` pass.
 4. Lock. Close this step only when `../verify/scripts/verify.py lock` passes. Mandatory: no skip-with-reason escape.
@@ -1287,7 +1287,7 @@ description: x
 10. Close, then open the PR with the open-pr skill (`../open-pr/SKILL.md`). Close this step only when `../verify/scripts/verify.py report`, `../verify/scripts/verify.py spec` and `../verify/scripts/verify.py leftovers` pass. Mandatory: no skip-with-reason escape.
 """
 FEATURE_V2_AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
-FEATURE_V2_GATES = {1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
+FEATURE_V2_GATES = {1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
                     7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
 REPO_FEATURE = ROOT / "skills" / "eng" / "feature" / "SKILL.md"
 
@@ -1372,7 +1372,7 @@ class ShippedPlaybooks(unittest.TestCase):
     def test_feature_tests_premises_locks_before_code_reviews_before_the_e2e_run_and_gates_the_pr(self):
         mandatory = self.gated_mandatory_steps("feature")
         self.assertEqual(mandatory, {
-            1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"},
+            1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"},
             5: {"units"}, 7: {"review"}, 8: {"oracles"}, 10: {"report", "spec", "leftovers"},
         })
 
