@@ -18,7 +18,7 @@ Other explorers are investigating different slices of the same subsystem in para
 
 {CHECKS_OR_NONE}
 
-When checks are listed above, test their premises: every fact each check depends on, whether it holds on current main, and the file and line or command output that shows it. Do not decide what to do about a false one.
+When checks are listed above, test their premises: every fact each check assumes already holds on current main, whether it holds, and the file and line or command output that shows it. Do not decide what to do about a false one.
 
 ## Output
 
@@ -40,7 +40,7 @@ Where this subsystem connects to other parts of the codebase. The inputs and out
 Anything surprising, historically motivated, or easy to get wrong. Things that look like they should work one way but work another.
 
 ### Premises
-One line per premise when checks were listed: check id, the premise, holds yes or no, and the evidence. Skip this section otherwise.
+One line per premise when checks were listed: check id, the premise, holds yes or no, and the evidence. For behavior the change itself builds, write one line per check with holds `new` instead of one `no` per missing piece. Skip this section otherwise.
 
 ### Open Questions
 Anything you couldn't fully trace or understand. Be honest about gaps.
