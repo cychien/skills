@@ -388,13 +388,11 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", "exit 0\n")
         self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL", self.run_verify("rerun"))
 
-    def test_rerun_fails_a_script_that_cannot_run_or_hangs(self):
+    def test_rerun_fails_a_script_that_cannot_run(self):
         self.check_script("B1.check.rb", "puts 1\n")
-        self.check_script("B2.check.sh", "sleep 30\n")
-        out = self.run_verify("rerun", "--timeout", "1", ok=False)
+        out = self.run_verify("rerun", ok=False)
         self.assertRegex(out, r"B1 CRASH \d+\.\ds B1.check.rb is not executable and has no interpreter for .rb\n")
-        self.assertRegex(out, r"B2 CRASH \d+\.\ds timed out after 1s, the --timeout safety net\n")
-        self.assertIn("rerun: 2 checks, 0 PASS, 0 FAIL, 2 CRASH", out)
+        self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 CRASH", out)
 
     def test_rerun_passes_flags_after_a_double_dash(self):
         self.check_script("B1.check.sh", "test \"$1\" = --instance && test \"$2\" = a\n")
@@ -1894,8 +1892,8 @@ class DryRun(RepoFixture):
 
     def test_a_script_with_no_step_line_on_stdout_before_ready_is_refused_by_name(self):
         refusal = ("verify scripts: B1: B1.base.log shows no 'verify: step <name> within <seconds>' line on stdout before \"verify: "
-                   "ready\", so B1.check.sh runs its setup with no step deadline and a stall there waits for the --timeout safety "
-                   "net. Print one to stdout, flushed, on entering each step, setup first, then run `verify.py dryrun --only B1 "
+                   "ready\", so B1.check.sh runs its setup with no step deadline and a stall there shows no overrun of its own. "
+                   "Print one to stdout, flushed, on entering each step, setup first, then run `verify.py dryrun --only B1 "
                    "--base <worktree at the base>`\n")
         after_ready = 'echo "verify: ready"\necho "verify: step export within 10"\n'
         on_stderr = 'echo "verify: step launch within 30" >&2\necho "verify: ready"\necho "verify: step export within 10" >&2\n'
@@ -1916,15 +1914,38 @@ class DryRun(RepoFixture):
         self.assertRegex((self.where / "dryrun.summary").read_text(),
                          r"^B1 INCONCLUSIVE \d+\.\ds step export exit 2: blocker: the export needs a license key\n$")
         self.assertIn("B1: it was inconclusive on base: (exit 2: blocker: the export needs a license key)", self.verify("scripts", ok=False))
+        args = mock.Mock(base=str(self.worktree), only=None, rest=[], jobs=None)
+        (self.where / "B1.check.sh").write_text(self.SCRIPT.replace('echo "verify: step export within 10"\n',
+                                                                    'echo "verify: step export within 0.5"\nsleep 1.2\n'))
+        with contextlib.chdir(self.repo), mock.patch.multiple(verify, STEP_MARGIN_S=0.3, PROGRESS_POLL_S=0.05):
+            out = verify.cmd_dryrun(self.where, args)
+        overran = r"overran step export by \d+\.\ds past its 0\.8s deadline \(last line: verify: step export within 0\.5\)"
+        self.assertRegex(out, rf"^B1 FAIL \d+\.\ds step export it reached its predicates and one failed; {overran}\n")
+        self.assertIn("1 fail a predicate, 0 pass (behavior already on base), 0 crash, 1 overran a step deadline", out)
+        self.assertRegex((self.where / "B1.base.log").read_text(), rf"\ndryrun: last step export\ndryrun: {overran}\ndryrun: FAIL ")
+        self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 1 failed a predicate there\n")
+
         (self.where / "B1.check.sh").write_text('echo "verify: step launch within 0.5"\necho "verify: ready"\n'
                                                  'echo "verify: step seed within 0.5"\necho "seeding"\nsleep 30\n')
-        args = mock.Mock(base=str(self.worktree), only=None, rest=[], jobs=None, timeout=60)
-        with contextlib.chdir(self.repo), mock.patch.multiple(verify, STEP_MARGIN_S=0.3, PROGRESS_POLL_S=0.05), \
-                self.assertRaises(verify.Failed) as raised:
-            verify.cmd_dryrun(self.where, args)
-        self.assertRegex(str(raised.exception), r"\nB1 STALLED \d+\.\ds step seed passed its 0\.8s deadline; last line: seeding\n")
+        failed = {}
+
+        def dryrun():
+            try:
+                verify.cmd_dryrun(self.where, args)
+            except verify.Failed as e:
+                failed["out"] = str(e)
+        with contextlib.chdir(self.repo):
+            runner = threading.Thread(target=dryrun)
+            runner.start()
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and verify.live_scripts(self.where).get("B1", {}).get("step") != "seed":
+                time.sleep(0.05)
+            self.assertIn("the dryrun records it STALLED with its step and last line in B1.base.log",
+                          verify.cmd_stop(self.where, mock.Mock(rest=["B1"])))
+            runner.join(30)
+        self.assertRegex(failed["out"], r"\nB1 STALLED \d+\.\ds step seed stopped by `verify.py stop`; last line: seeding\n")
         self.assertIn("dryrun: last step seed\ndryrun: STALLED", (self.where / "B1.base.log").read_text())
-        self.assertIn("B1: it stalled on base: (passed its 0.8s deadline; last line: seeding)", self.verify("scripts", ok=False))
+        self.assertIn("B1: it stalled on base: (stopped by `verify.py stop`; last line: seeding)", self.verify("scripts", ok=False))
 
     def test_the_base_worktree_must_hold_the_base_product_code(self):
         self.assertIn(f"is not at the phase base {self.base[:12]}: its product files differ (calc.py). Check out the base there",
@@ -2313,9 +2334,16 @@ def gone(pid, wait=5):
     return not alive(pid)
 
 
+def kill_recorded(path):
+    with contextlib.suppress(OSError, ValueError):
+        os.kill(int(path.read_text()), signal.SIGKILL)
+
+
 def wait_for_file(path, wait=10):
     deadline = time.time() + wait
-    while not path.exists() and time.time() < deadline:
+    while time.time() < deadline:
+        with contextlib.suppress(OSError, ValueError):
+            return int(path.read_text())
         time.sleep(0.05)
     return int(path.read_text())
 
@@ -2609,14 +2637,19 @@ class RerunTimeout(unittest.TestCase):
             directory = pathlib.Path(tmp)
             (directory / "B1.check.sh").write_text("exit 0\n")
             done = subprocess.CompletedProcess([], 0, "", "")
+            stderr = io.StringIO()
             with mock.patch.object(verify, "run_in_group", return_value=done) as run, \
-                    mock.patch.object(sys, "argv", ["verify.py", "rerun", "--dir", tmp, *extra]), contextlib.redirect_stdout(io.StringIO()):
+                    mock.patch.object(sys, "argv", ["verify.py", "rerun", "--dir", tmp, *extra]), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
                 verify.main()
-            return run.call_args.args[1]
+            return run.call_args.args[1], stderr.getvalue()
 
-    def test_defaults_to_a_7200_second_safety_net_and_timeout_changes_it(self):
-        self.assertEqual(self.rerun_timeout(), 7200)
-        self.assertEqual(self.rerun_timeout("--timeout", "600"), 600)
+    def test_a_rerun_has_no_total_timeout_and_the_deprecated_flag_is_ignored_with_a_warning(self):
+        self.assertEqual(self.rerun_timeout(), (None, ""))
+        timeout, warning = self.rerun_timeout("--timeout", "600")
+        self.assertIsNone(timeout)
+        self.assertEqual(warning, "verify rerun: --timeout is deprecated and ignored: a script is never killed on time. A step past "
+                                  "its deadline is recorded as an overrun, and `verify.py stop <id>` ends a script you judge dead.\n")
 
 
 class Supervision(unittest.TestCase):
@@ -2642,25 +2675,25 @@ class Supervision(unittest.TestCase):
             except verify.Failed as e:
                 return str(e)
 
-    def test_a_script_that_stops_progressing_is_killed_at_its_step_deadline_with_its_process_group(self):
-        pid = shlex.quote(str(self.dir / "pid"))
-        self.script("B1.check.sh", 'echo "verify: step seed within 0.5"\necho "seeding 3 tasks"\n'
-                                   f'sleep 30 & echo $! > {pid}; wait\n')
-        self.script("B2.check.sh", "".join(f'echo "verify: step s{i} within 0.5"\nsleep 0.4\n' for i in range(4)) + 'echo "PASS B2"\n')
-        started = time.monotonic()
+    def test_a_step_past_its_deadline_is_recorded_as_an_overrun_and_the_script_keeps_running(self):
+        self.script("B1.check.sh", 'echo "verify: step seed within 0.5"\necho "seeding 3 tasks"\nsleep 1.5\n'
+                                   'echo "verify: step export within 5"\necho "PASS B1"\n')
+        self.script("B2.check.sh", "".join(f'echo "verify: step s{i} within 0.5"\nsleep 0.2\n' for i in range(3)) + 'echo "PASS B2"\n')
         out = self.rerun("B1", "B2")
-        self.assertLess(time.monotonic() - started, 10, out)
-        self.assertRegex(out, r"\nB1 STALLED \d+\.\ds step seed passed its 0\.8s deadline; last line: seeding 3 tasks\nB2 PASS ")
-        self.assertIn("rerun: 2 checks, 1 PASS, 0 FAIL, 1 STALLED", out)
-        self.assertTrue(gone(int((self.dir / "pid").read_text())))
-        self.assertEqual((self.dir / "B1.rerun.log").read_text().splitlines()[-1],
-                         "rerun: STALLED (step seed passed its 0.8s deadline; last line: seeding 3 tasks)")
-        self.assertEqual(verify.load_ledger(self.dir)["B1"]["verdict"], "STALLED")
+        overran = r"overran step seed by \d+\.\ds past its 0\.8s deadline \(last line: seeding 3 tasks\)"
+        self.assertRegex(out, rf"^B1 PASS (\d+\.\d)s {overran}\nB2 PASS \d+\.\ds\n")
+        self.assertGreaterEqual(float(re.match(r"B1 PASS (\d+\.\d)s", out).group(1)), 1.5)
+        self.assertIn("rerun: 2 checks, 2 PASS, 0 FAIL, 1 overran a step deadline", out)
+        self.assertRegex((self.dir / "rerun.summary").read_text(), rf"^B1 PASS \d+\.\ds {overran}\nB2 PASS \d+\.\ds\n$")
+        log = (self.dir / "B1.rerun.log").read_text()
+        self.assertRegex(log, rf"\nPASS B1\nrerun: {overran}\nrerun: PASS\n$")
+        self.assertEqual(verify.load_ledger(self.dir)["B1"]["verdict"], "PASS")
 
-    def test_a_script_that_prints_no_step_line_stalls_after_the_first_window(self):
-        self.script("B1.check.sh", 'echo "starting the instance"\nsleep 30\n')
-        self.assertRegex(self.rerun("B1"), r"\nB1 STALLED \d+\.\ds no 'verify: step <name> within <seconds>' line within 1s; "
-                                           r"last line: starting the instance\n")
+    def test_a_script_with_no_step_line_past_the_first_window_is_recorded_and_keeps_running(self):
+        self.script("B1.check.sh", 'echo "starting the instance"\nsleep 1.5\necho "verify: step export within 5"\n'
+                                   'echo "FAIL B1: 0 of 1 rows"\nexit 1\n')
+        self.assertRegex(self.rerun("B1"), r"^\nB1 FAIL \d+\.\ds step export exit 1: FAIL B1: 0 of 1 rows; overran its first 1s "
+                                           r"with no step line by \d+\.\ds \(last line: starting the instance\)\n")
 
     def test_the_exit_code_is_the_verdict_and_only_a_fail_spends_a_fix_attempt(self):
         self.script("B1.check.sh", 'echo "verify: step seed within 5"\necho "blocker: the seed needs a license key"\nexit 2\n')
@@ -2713,10 +2746,6 @@ class Supervision(unittest.TestCase):
         self.assertEqual({i: e["verdict"] for i, e in verify.load_ledger(self.dir).items()}, {"B1": "PASS", "B2": "INCONCLUSIVE"})
         self.assertFalse((self.dir / "fix-attempts.json").exists())
 
-    def test_the_timeout_is_a_total_safety_net_recorded_as_a_crash(self):
-        self.script("B1.check.sh", "".join(f'echo "verify: step s{i} within 0.5"\nsleep 0.3\n' for i in range(10)))
-        self.assertRegex(self.rerun("B1", timeout=1), r"\nB1 CRASH \d+\.\ds step s\d timed out after 1s, the --timeout safety net\n")
-
 
 class RunGroup(unittest.TestCase):
     def setUp(self):
@@ -2732,17 +2761,47 @@ class RunGroup(unittest.TestCase):
         self.assertEqual((ok, detail), (False, "timed out after 1s"))
         self.assertTrue(gone(int((self.base / "pid").read_text())))
 
-    def test_rerun_timeouts_kill_the_script_tree(self):
+    def test_stop_ends_a_script_with_its_detached_descendants_records_it_stalled_and_the_run_goes_on(self):
         directory = self.base / "verification"
         directory.mkdir()
-        script = directory / "B1.check.sh"
-        script.write_text(f"#!/bin/sh\n{self.grandchild_command()}\n")
-        script.chmod(0o755)
+        pids = {name: self.base / f"{name}.pid" for name in ("child", "own-session", "orphan")}
+        for path in pids.values():
+            self.addCleanup(kill_recorded, path)
+        detach = (f"{shlex.quote(sys.executable)} -c 'import subprocess, sys; p = subprocess.Popen([\"sleep\", \"60\"], "
+                  "start_new_session=True); open(sys.argv[1], \"w\").write(str(p.pid)); sys.argv[2] == \"wait\" and p.wait()'")
+        (directory / "B1.check.sh").write_text(
+            'echo "verify: step seed within 0.5"\necho "seeding 3 tasks"\n'
+            f'{detach} {shlex.quote(str(pids["own-session"]))} wait &\n'
+            f'(cd "$VERIFY_DIR" && {detach} {shlex.quote(str(pids["orphan"]))} exit)\n'
+            f'sleep 60 & echo $! > {shlex.quote(str(pids["child"]))}; wait\n')
+        (directory / "B2.check.sh").write_text('echo "verify: step export within 5"\necho "PASS B2"\n')
         env = {**os.environ, "VERIFY_HOME": str(self.base / "home")}
-        r = subprocess.run([sys.executable, "-I", str(VERIFY), "rerun", "--dir", str(directory), "--timeout", "1"], capture_output=True, text=True, env=env, cwd=self.base)
-        self.assertEqual(r.returncode, 1, r.stdout)
-        self.assertIn("timed out after 1s", r.stdout)
-        self.assertTrue(gone(int((self.base / "pid").read_text())))
+
+        def verify_cli(*args):
+            return subprocess.run([sys.executable, "-I", str(VERIFY), *args, "--dir", str(directory)], capture_output=True,
+                                  text=True, env=env, cwd=self.base, timeout=60)
+        self.assertEqual(verify_cli("stop").stdout, f"stop: no script of a rerun or dryrun runs from {directory}\n")
+        rerun = subprocess.Popen([sys.executable, "-I", str(VERIFY), "rerun", "--dir", str(directory)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, env=env, cwd=self.base)
+        self.addCleanup(lambda: rerun.poll() is None and rerun.kill())
+        started = [wait_for_file(path) for path in pids.values()]
+        listing = verify_cli("stop").stdout
+        self.assertRegex(listing, r"^B1 rerun running \d+s, step seed, \d+s left of its 15\.5s deadline\n"
+                                  r"Stop one only once you judge it dead: verify.py stop <id>\n$")
+        self.assertIn("no running script B9", verify_cli("stop", "B9").stdout)
+        stopped = verify_cli("stop", "B1")
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertRegex(stopped.stdout, r"^stopped B1 \(\d+ processes\), rerun running \d+s, step seed, .*; the rerun records it "
+                                         r"STALLED with its step and last line in B1\.rerun\.log\n$")
+        out = rerun.communicate(timeout=30)[0]
+        self.assertEqual(rerun.returncode, 1, out)
+        self.assertRegex(out, r"\nB1 STALLED \d+\.\ds step seed stopped by `verify.py stop`; last line: seeding 3 tasks\nB2 PASS ")
+        self.assertIn("rerun: 2 checks, 1 PASS, 0 FAIL, 1 STALLED", out)
+        self.assertTrue(all(gone(pid) for pid in started), started)
+        self.assertEqual((directory / "B1.rerun.log").read_text().splitlines()[-1],
+                         "rerun: STALLED (step seed stopped by `verify.py stop`; last line: seeding 3 tasks)")
+        self.assertEqual(verify.load_ledger(directory)["B1"]["verdict"], "STALLED")
+        self.assertFalse((directory / "running.json").exists())
 
     def detached_holder(self, name):
         """A shell line that starts a process in its own session, holding the script's stdout and stderr where killing the
@@ -2758,13 +2817,13 @@ class RunGroup(unittest.TestCase):
                 f"{shlex.quote(str(pid))}")
 
     def test_a_detached_process_holding_the_output_never_holds_the_run_past_a_short_bound(self):
-        stalls = f'{self.detached_holder("a")}; echo "verify: step seed within 0.1"; echo "seeding"; sleep 60'
+        hangs = f'{self.detached_holder("a")}; echo "verify: step seed within 0.1"; echo "seeding"; sleep 60'
         started = time.monotonic()
-        with mock.patch.multiple(verify, STEP_MARGIN_S=0.1, PROGRESS_POLL_S=0.05), self.assertRaises(verify.Stalled) as stalled:
-            verify.run_in_group(["sh", "-c", stalls], 60, progress={})
+        with mock.patch.multiple(verify, PROGRESS_POLL_S=0.05), self.assertRaises(subprocess.TimeoutExpired) as killed:
+            verify.run_in_group(["sh", "-c", hangs], 1, progress={})
         self.assertLess(time.monotonic() - started, verify.HELD_OUTPUT_S + 5)
-        self.assertEqual(stalled.exception.output, "verify: step seed within 0.1\nseeding\n")
-        self.assertIn("still held its output", stalled.exception.stderr)
+        self.assertEqual(killed.exception.output, "verify: step seed within 0.1\nseeding\n")
+        self.assertIn("still held its output", killed.exception.stderr)
 
         started = time.monotonic()
         r = verify.run_in_group(["sh", "-c", f'{self.detached_holder("b")}; echo "PASS B1"'], 60, progress={})

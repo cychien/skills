@@ -8,8 +8,9 @@ usage: verify.py <command> [--dir DIR]
        verify.py premises [--resolved]
        verify.py freeze [--revision "<what changed and why>" [--gate <autorun gate id>]]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
-       verify.py dryrun --base <worktree at the base> [--only ID ...] [--jobs N] [--timeout SECONDS] [-- ARGS ...]
-       verify.py rerun [--only ID ...] [--jobs N] [--timeout SECONDS] [--force] [--full-reason "<why; agreed by whom>"] [-- ARGS ...]
+       verify.py dryrun --base <worktree at the base> [--only ID ...] [--jobs N] [-- ARGS ...]
+       verify.py rerun [--only ID ...] [--jobs N] [--force] [--full-reason "<why; agreed by whom>"] [-- ARGS ...]
+       verify.py stop [<id> ...]
        verify.py report [--write --author <agent:model> --verifier <agent:model> [--note "<text>" ...]]
        verify.py script-fix <file> --reason "<why it crashed before its predicate>"
        verify.py phases [<plan folder>]
@@ -87,6 +88,12 @@ directory.
               working directory, VERIFY_DRYRUN=1 in its environment, and write <id>.base.log with its output and verdict.
               Scripts start, are supervised, and are requeued on exit 3 the way `rerun` does it, and the compact lines go
               to dryrun.summary. Exits 1 when a script crashed, stalled, or was inconclusive.
+  stop        end a running script of the current rerun or dryrun the lead judged dead: <id> names it, and verify
+              stops its whole process tree, detached descendants included, records it STALLED with the step it was in
+              and its last output line, and lets the run go on with the rest. Without an id it lists the running
+              scripts, each with its step, how long it has run, and whether it is past its step deadline (by how much,
+              and its last output line then), and stops nothing. The running scripts are kept in running.json in the
+              verification directory while a run lasts.
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match the comparison; the
               report's Head is HEAD or a commit with HEAD's product code (a regrouped history, or later commits that touch
               only the adopted plan folder or the project's verification skills). A PASS is backed by its tier's
@@ -130,11 +137,12 @@ directory.
               failed, with the FAIL line last on stdout; an exit 1 without it is CRASH), 2 INCONCLUSIVE (a premise or
               blocker named on the last line), 3 ENVIRONMENT (the instance or machine could not support the run: a load
               refusal, an instance that died, a usage limit); any other exit, or a kill, is CRASH. Runs are supervised
-              by progress: each step line opens a deadline of its seconds plus the larger of 15 s and a quarter of them,
-              and until the first one a 120 s window applies; when the open deadline passes, verify kills the script's
-              process group and records STALLED with the step and the last output line, however long the run has taken
-              before, so a slow run that progresses is never killed.
-              --timeout is only a total safety net, 7200 seconds by default, recorded as CRASH. An ENVIRONMENT run is
+              by progress, never killed on time: each step line opens a deadline of its seconds plus the larger of 15 s
+              and a quarter of them, and until the first one a 120 s window applies; a step that runs past its deadline
+              is recorded as an overrun (the step, by how much, and the last output line at the deadline) in the log,
+              the compact line, and the summary, and the script keeps running. Only `stop` ends a script that hangs: the
+              lead decides it is dead, and it is then STALLED. --timeout is deprecated for rerun and dryrun and
+              ignored with a warning. An ENVIRONMENT run is
               queued again for when `capacity` passes, at most 2 times per run, and is then INCONCLUSIVE with reason
               environment; it writes no log, records no verdict, and is no fix attempt. Once a script has ended, verify
               reads its output for at most 2 seconds more, so a process it left running (one in another session too)
@@ -211,7 +219,8 @@ directory.
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
 the root, --dir overrides the whole path). It holds base.json (the adopted plan and base), plan.md when no phase was adopted,
 plan.lock, report.md, observations.md, review.md, decision.tsv, units.json, fix-attempts.json, scripts.lock.json,
-rerun.ledger.json, rerun.summary, dryrun.summary, the <id>.base.log and <id>.rerun.log files, and the evidence files. An
+rerun.ledger.json, rerun.summary, dryrun.summary, running.json while a run lasts, the <id>.base.log and <id>.rerun.log
+files, and the evidence files. An
 oracle check <id> also has <id>.expected.json, written by an agent that read only the spec and the seed data, and
 <id>.observed.json, read from the running app.
 """
@@ -305,7 +314,8 @@ SCRIPT_RUNNERS = {".py": [sys.executable], ".sh": ["bash"], ".js": ["node"], ".m
 NODE_LOCKS = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bunx", "bun.lockb": "bunx"}
 DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
 SCRIPT_TIMEOUT = 900
-RERUN_TIMEOUT = 7200
+RUNNING = "running.json"
+RUNNING_LOCK = ".running.lock"
 RERUN_STAMP = "rerun.stamp.json"
 SCRIPTS_LOCK = "scripts.lock.json"
 RERUN_LEDGER = "rerun.ledger.json"
@@ -1913,34 +1923,47 @@ def could_not_run(error):
     return f"verify could not run it: {type(error).__name__}: {error}"
 
 
-def supervised_run(path, args, env, run, cwd=None):
+def supervised_run(path, args, env, run, cwd=None, directory=None, kind=None):
     """One run of a check script under progress supervision: its exit code, stdout, output, whether it printed READY_LINE,
-    the step open on stdout when it did, its last step and output line, and, when verify stopped it (killed) or could not
-    start it, the verdict and reason."""
-    progress, seen, at_ready = {"step": None, "last": ""}, threading.Event(), {}
+    the step open on stdout when it did, its last step and output line, the steps that overran their deadlines, and, when
+    the lead stopped it (killed) or verify could not start it, the verdict and reason. With directory, the script is listed
+    in running.json while it runs, so `stop` can find it."""
+    progress, seen, at_ready = {"step": None, "last": "", "overruns": []}, threading.Event(), {}
+    check_id = script_id(path)
 
     def on_ready():
         at_ready.setdefault("step", progress["step"])
         seen.set()
         if run:
             run["ready"]()
-    hooks = {"on_start": lambda pid: run.update(pid=pid)} if run else {}
+
+    def on_start(pid):
+        if run:
+            run.update(pid=pid)
+        if directory:
+            register_running(directory, check_id, kind, pid)
+
+    def on_progress(state):
+        if directory:
+            note_running(directory, check_id, state)
     outcome = {"code": None, "stdout": "", "output": "", "verdict": None, "reason": "", "killed": False}
     command = script_command(path)
     if not command:
         outcome.update(verdict="CRASH", reason=f"{path.name} is not executable and has no interpreter for {path.suffix}")
     else:
         try:
-            r = run_in_group([*command, *args.rest], args.timeout, cwd=cwd, env=env, on_ready=on_ready, progress=progress, **hooks)
+            r = run_in_group([*command, *args.rest], None, cwd=cwd, env=env, on_start=on_start, on_ready=on_ready,
+                             progress=progress, on_progress=on_progress)
             outcome.update(code=r.returncode, stdout=r.stdout, output=(r.stdout + r.stderr).strip("\n"))
-        except Stalled as e:
-            outcome.update(verdict="STALLED", reason=str(e), output=(e.output + e.stderr).strip("\n"), killed=True)
-        except subprocess.TimeoutExpired as e:
-            outcome.update(verdict="CRASH", reason=f"timed out after {args.timeout}s, the --timeout safety net",
-                           output=((e.output or "") + (e.stderr or "")).strip("\n"), killed=True)
         except Exception as e:
             outcome.update(verdict="CRASH", reason=could_not_run(e))
-    return {**outcome, "ready": seen.is_set(), "ready_step": at_ready.get("step"), "step": progress["step"], "last": progress["last"]}
+        finally:
+            stopped = directory and (finish_running(directory, check_id) or {}).get("stop")
+        if stopped and outcome["code"] not in EXIT_VERDICTS:
+            outcome.update(verdict="STALLED", killed=True, reason=f"stopped by `verify.py stop`"
+                                                                  + (f"; last line: {progress['last']}" if progress["last"] else ""))
+    return {**outcome, "ready": seen.is_set(), "ready_step": at_ready.get("step"), "step": progress["step"], "last": progress["last"],
+            "overruns": progress["overruns"]}
 
 
 def rerun_verdict(outcome):
@@ -1973,9 +1996,18 @@ def verdict_tail(verdict, step, reason):
     return " ".join([*([f"step {step}"] if step and verdict != "PASS" else []), *([" ".join(reason.split())] if reason else [])])
 
 
-def compact_line(check_id, verdict, seconds, step, reason):
-    """`<id> <VERDICT> <seconds>s [step <name>] [<reason>]`: one line per script, for an agent that opens a log only on FAIL."""
-    return " ".join([check_id, verdict, f"{seconds:.1f}s", *filter(None, [verdict_tail(verdict, step, reason)])])
+def overrun_text(overrun):
+    """Where a run passed a deadline and kept going: the step, by how much, and the last output line at the deadline."""
+    where = (f"overran step {overrun['step']} by {overrun['by']:.1f}s past its {overrun['window']:g}s deadline" if overrun["step"]
+             else f"overran its first {overrun['window']:g}s with no step line by {overrun['by']:.1f}s")
+    return where + (f" (last line: {overrun['last']})" if overrun["last"] else "")
+
+
+def compact_line(check_id, verdict, seconds, step, reason, overruns=()):
+    """`<id> <VERDICT> <seconds>s [step <name>] [<reason>]`: one line per script, for an agent that opens a log only on FAIL,
+    with each step deadline the run passed after the reason."""
+    tail = "; ".join(filter(None, [verdict_tail(verdict, step, reason), *map(overrun_text, overruns)]))
+    return " ".join([check_id, verdict, f"{seconds:.1f}s", *filter(None, [tail])])
 
 
 def write_summary(directory, kind, lines):
@@ -1983,18 +2015,18 @@ def write_summary(directory, kind, lines):
 
 
 def run_check(directory, path, args, env, concurrent=set, run=None, record=None):
-    """(verdict, reason, step) for one check script; its output and verdict go to <id>.rerun.log, and record(path, verdict)
+    """(verdict, reason, step, overruns) for one check script; its output, overruns, and verdict go to <id>.rerun.log, and record(path, verdict)
     runs in the same locked step, a script verify could not start included. concurrent() names the checks that ran beside
     it. run, when given, learns the script's pid and readiness; a run the watchdog evicted is REQUEUED, and an ENVIRONMENT
     run with requeues left records nothing."""
     check_id = script_id(path)
     before = file_sizes(directory)
-    outcome = supervised_run(path, args, env, run)
+    outcome = supervised_run(path, args, env, run, directory=directory, kind="rerun")
     if run and run["evicted"]:
-        return "REQUEUED", "", None
+        return "REQUEUED", "", None, []
     verdict, reason = environment_retry(*rerun_verdict(outcome), run)
     if verdict == "ENVIRONMENT":
-        return verdict, reason, outcome["step"]
+        return verdict, reason, outcome["step"], outcome["overruns"]
     beside = sorted(concurrent())
     lost = lost_files(before, file_sizes(directory), {check_id, *beside})
     if lost:
@@ -2003,16 +2035,17 @@ def run_check(directory, path, args, env, concurrent=set, run=None, record=None)
             "deleted or emptied files that are not its own"
         reason = f"{culprit}: {', '.join(lost)}" + (f"; {reason}" if reason else "")
     output, tail = outcome["output"], verdict_tail(verdict, outcome["step"], reason)
+    overran = "".join(f"rerun: {overrun_text(o)}\n" for o in outcome["overruns"])
     with rerun_state(directory):
-        (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}"
+        (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + overran + f"rerun: {verdict}"
                                                          + (f" ({tail})" if tail else "") + "\n")
         if record:
             record(path, verdict)
-    return verdict, reason, outcome["step"]
+    return verdict, reason, outcome["step"], outcome["overruns"]
 
 
 def run_checks(directory, scripts, args, run_one):
-    """({check id: (verdict, detail, seconds, step)}, [requeue lines]). A script starts while every running one has printed
+    """({check id: (verdict, detail, seconds, step, overruns)}, [requeue lines]). A script starts while every running one has printed
     READY_LINE, the running count is under --jobs when given, and the machine has capacity; a script that waits
     CAPACITY_WAIT_S for capacity is queued again behind the rest, and after a second such wait it is NOT-RUN. The watchdog
     evicts the newest while the load stays overloaded. An ENVIRONMENT run is queued again, up to ENVIRONMENT_REQUEUES times.
@@ -2038,9 +2071,9 @@ def run_checks(directory, scripts, args, run_one):
     def work(check_id, run):
         started = time.time()
         try:
-            verdict, detail, step = run_one(run["path"], lambda: beside_of(check_id), run)
+            verdict, detail, step, overruns = run_one(run["path"], lambda: beside_of(check_id), run)
         except Exception as e:
-            verdict, detail, step = "ERROR", could_not_run(e), None
+            verdict, detail, step, overruns = "ERROR", could_not_run(e), None, []
         with turn:
             running.pop(check_id, None)
             if verdict == "REQUEUED":
@@ -2051,7 +2084,7 @@ def run_checks(directory, scripts, args, run_one):
                 requeued.append(f"REQUEUED {check_id}  {detail}: the instance or machine could not support the run; queued again "
                                 f"for when `capacity` passes ({environment[check_id]} of {ENVIRONMENT_REQUEUES})")
             else:
-                results[check_id] = (verdict, detail, time.time() - started, step)
+                results[check_id] = (verdict, detail, time.time() - started, step, overruns)
             turn.notify_all()
 
     def room(width):
@@ -2108,7 +2141,7 @@ def run_checks(directory, scripts, args, run_one):
                         requeued.append(f"REQUEUED {check_id}  {why}; queued again behind the rest")
                     else:
                         results[check_id] = ("NOT-RUN", f"{why} twice; run it with --only {check_id} once the machine has room",
-                                             0.0, None)
+                                             0.0, None, [])
                     refused_since, next_check = None, 0.0
                     continue
                 turn.wait(min(ADMIT_POLL_S, WATCH_POLL_S))
@@ -2116,15 +2149,148 @@ def run_checks(directory, scripts, args, run_one):
 
 
 def evict(directory, run, others):
-    """Stop an evicted script's process group, then the detached processes it started under this run's places."""
+    """Stop an evicted script's process tree and the detached processes it started under this run's places."""
+    # Admission waits for every running script's ready line, so a detached process started after this one began is its own.
+    stop_tree(directory, run["pid"], run["started"], others)
+
+
+def descendants(table, pid):
+    """pid and every process below it by parent, whatever its session or process group."""
+    children = collections.defaultdict(list)
+    for row in table:
+        children[row["ppid"]].append(row["pid"])
+    found, todo = set(), [pid]
+    while todo:
+        current = todo.pop()
+        if current not in found:
+            found.add(current)
+            todo += children[current]
+    return found
+
+
+def stop_tree(directory, pid, started, others, before=None):
+    """Stop a script's whole tree: its process group, every descendant by parent (one detached into its own session
+    included), and the orphans under this run's places (parent init) that started after it and before `before`, outside
+    the process groups of others. Returns how many processes it stopped."""
+    found = []
     with contextlib.suppress(CannotScan):
-        stop_processes([row for row in process_table() if row["pgid"] == run["pid"]])
-        # Admission waits for every running script's ready line, so a detached process started after this one began is its own.
-        stray = [row for row in find_leftovers(default_roots(directory)) if row["ppid"] == 1 and row["pgid"] not in others
-                 and row["started"] is not None and row["started"] >= run["started"] - ELAPSED_SLACK_S]
-        if stray:
-            stop_processes(stray)
-    kill_group(run["pid"])
+        table = process_table()
+        tree = descendants(table, pid)
+        found = [row for row in table if row["pid"] in tree or row["pgid"] == pid]
+        found += [row for row in find_leftovers(default_roots(directory)) if row["ppid"] == 1 and row["pgid"] not in others
+                  and row["pid"] not in tree and row["started"] is not None and row["started"] >= started - ELAPSED_SLACK_S
+                  and (before is None or row["started"] < before - ELAPSED_SLACK_S)]
+        if found:
+            stop_processes(found)
+    kill_group(pid)
+    return len(found)
+
+
+@contextlib.contextmanager
+def running_scripts(directory):
+    """running.json, under its own lock: {check id: the script a rerun or dryrun runs now}, for `stop`."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / RUNNING_LOCK, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        path = directory / RUNNING
+        try:
+            scripts = json.loads(path.read_text())
+        except (OSError, ValueError):
+            scripts = {}
+        before = json.dumps(scripts, sort_keys=True)
+        yield scripts
+        if json.dumps(scripts, sort_keys=True) != before:
+            if scripts:
+                write_json(path, scripts)
+            else:
+                path.unlink(missing_ok=True)
+
+
+def register_running(directory, check_id, kind, pid):
+    now = time.time()
+    with running_scripts(directory) as scripts:
+        scripts[check_id] = {"kind": kind, "runner": os.getpid(), "pid": pid, "started": now, "step": None,
+                             "window": FIRST_STEP_S, "deadline": now + FIRST_STEP_S, "overrun": None, "stop": None}
+
+
+def note_running(directory, check_id, progress):
+    """Record the step a running script is in and, once it passes its deadline, the overrun with the last line then."""
+    deadline = time.time() + progress["until"] - time.monotonic()
+    with running_scripts(directory) as scripts:
+        if entry := scripts.get(check_id):
+            entry.update(step=progress["step"], window=progress["window"], deadline=deadline,
+                         overrun={"last": progress["overrun"]["last"]} if progress["overrun"] else None)
+
+
+def finish_running(directory, check_id):
+    """Take a script that ended off running.json; returns its entry, whose 'stop' says whether the lead stopped it."""
+    with running_scripts(directory) as scripts:
+        return scripts.pop(check_id, None)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def live_scripts(directory):
+    """running.json without the entries whose run is gone (a rerun killed before it could clean up)."""
+    with running_scripts(directory) as scripts:
+        for check_id in [i for i, e in scripts.items() if not alive(e["runner"])]:
+            del scripts[check_id]
+        return {i: dict(e) for i, e in scripts.items()}
+
+
+def running_state(entry, now):
+    """How a running script stands: its kind, how long it has run, its step, and its deadline or the overrun past it."""
+    where = f"step {entry['step']}" if entry["step"] else "before its first step line"
+    if now >= entry["deadline"]:
+        state = f"past its {entry['window']:g}s deadline by {now - entry['deadline']:.0f}s"
+        last = (entry.get("overrun") or {}).get("last")
+        state += f" (last line then: {last})" if last else ""
+    else:
+        state = f"{entry['deadline'] - now:.0f}s left of its {entry['window']:g}s deadline"
+    return f"{entry['kind']} running {now - entry['started']:.0f}s, {where}, {state}"
+
+
+def cmd_stop(directory, args):
+    scripts = live_scripts(directory)
+    now = time.time()
+    if not args.rest:
+        if not scripts:
+            return f"stop: no script of a rerun or dryrun runs from {directory}"
+        return "\n".join([*(f"{i} {running_state(scripts[i], now)}" for i in sorted(scripts)),
+                          "Stop one only once you judge it dead: verify.py stop <id>"])
+    unknown = [i for i in args.rest if i not in scripts]
+    if unknown:
+        running = ", ".join(sorted(scripts)) or "none"
+        raise Failed(f"no running script {', '.join(unknown)} in {directory}; running now: {running}. `verify.py stop` lists them")
+    lines = []
+    for check_id in args.rest:
+        entry = scripts[check_id]
+        with running_scripts(directory) as current:
+            still = check_id in current and current[check_id]["pid"] == entry["pid"]
+            if still:
+                current[check_id]["stop"] = time.time()
+        if not still:
+            lines.append(f"{check_id} ended on its own before the stop; its run records how")
+            continue
+        others = {e["pid"] for i, e in scripts.items() if i != check_id}
+        later = [e["started"] for i, e in scripts.items() if i != check_id and e["started"] > entry["started"]]
+        count = stop_tree(directory, entry["pid"], entry["started"], others, before=min(later, default=None))
+        until = time.monotonic() + 2 * KILL_WAIT_S + HELD_OUTPUT_S
+        while check_id in live_scripts(directory) and time.monotonic() < until:
+            time.sleep(PROGRESS_POLL_S)
+        log = f"{check_id}{'.rerun.log' if entry['kind'] == 'rerun' else BASE_LOG}"
+        recorded = ("records it STALLED with its step and last line in" if check_id not in live_scripts(directory)
+                    else "has not recorded it yet; it will show STALLED in")
+        lines.append(f"stopped {check_id} ({count} processes), {running_state(entry, now)}; the {entry['kind']} {recorded} {log}")
+    return "\n".join(lines)
 
 
 def spent_line(check_id):
@@ -2186,11 +2352,13 @@ def cmd_rerun(directory, args):
                                    lambda path, beside, run: run_check(directory, path, args, env, beside, run, record))
     verdicts = collections.defaultdict(list)
     compact = {i: compact_line(i, "SKIP", 0.0, None, "its fix budget is spent") for i in skipped}
+    overran = []
     for path in runnable:
         check_id = script_id(path)
-        verdict, detail, seconds, step = results[check_id]
+        verdict, detail, seconds, step, overruns = results[check_id]
         verdicts[verdict].append(check_id)
-        compact[check_id] = compact_line(check_id, verdict, seconds, step, detail)
+        overran += [check_id] if overruns else []
+        compact[check_id] = compact_line(check_id, verdict, seconds, step, detail, overruns)
     lines = [*requeued, *map(spent_line, skipped), *(compact[script_id(p)] for p in runnable)]
     summary = f"rerun: {len(runnable)} checks, {len(verdicts['PASS'])} PASS, {len(verdicts['FAIL'])} FAIL"
     summary += "".join(f", {len(verdicts[v])} {v}" for v in ("INCONCLUSIVE", "STALLED", "CRASH") if verdicts[v])
@@ -2198,6 +2366,7 @@ def cmd_rerun(directory, args):
     summary += f", {len(verdicts['NOT-RUN'])} not run for lack of capacity" if verdicts["NOT-RUN"] else ""
     summary += f", {len(verdicts['ERROR'])} errored before verify recorded the run" if verdicts["ERROR"] else ""
     summary += f", {len(requeued)} requeued" if requeued else ""
+    summary += f", {len(overran)} overran a step deadline" if overran else ""
     lines.append(summary + (" (--only: no stamp; the ledger records these runs)" if args.only else ""))
     lines += [budget[i] for i in verdicts["FAIL"] if i in budget]
     with rerun_state(directory):
@@ -2230,25 +2399,26 @@ def dry_verdict(outcome):
 
 
 def dry_check(directory, path, args, env, base, run):
-    """(verdict, reason, step) for one check script run on base, graded by dry_verdict. The log goes to <id>.base.log."""
+    """(verdict, reason, step, overruns) for one check script run on base, graded by dry_verdict. The log goes to <id>.base.log."""
     check_id = script_id(path)
-    outcome = supervised_run(path, args, env, run, cwd=base["path"])
+    outcome = supervised_run(path, args, env, run, cwd=base["path"], directory=directory, kind="dryrun")
     if run and run["evicted"]:
-        return "REQUEUED", "", None
+        return "REQUEUED", "", None, []
     verdict, why = environment_retry(*dry_verdict(outcome), run)
     if verdict == "ENVIRONMENT":
-        return verdict, why, outcome["step"]
-    ended = f"exit {outcome['code']}" if outcome["code"] is not None else outcome["reason"] if outcome["killed"] else None
+        return verdict, why, outcome["step"], outcome["overruns"]
+    ended = outcome["reason"] if outcome["killed"] else f"exit {outcome['code']}" if outcome["code"] is not None else None
     trailer = [f"dryrun: base {base['path']} at {base['head']}", f"dryrun: script sha256 {hashlib.sha256(path.read_bytes()).hexdigest()}",
                "dryrun: ready" if outcome["ready"] else f"dryrun: never printed \"{READY_LINE}\""]
     trailer += [f"dryrun: {ended}"] if ended else []
     trailer += [f"dryrun: step {outcome['ready_step']} before ready" if outcome["ready_step"] else DRYRUN_NO_STEP_BEFORE_READY]
     trailer += [f"dryrun: last step {outcome['step']}"] if outcome["step"] else []
+    trailer += [f"dryrun: {overrun_text(o)}" for o in outcome["overruns"]]
     output = outcome["output"]
     (directory / f"{check_id}{BASE_LOG}").write_text((output + "\n" if output else "") + "\n".join([*trailer, f"dryrun: {verdict} ({why})"]) + "\n")
     if verdict == "CRASH" and outcome["code"] is not None and outcome["last"]:
         why += f"; last line: {outcome['last']}"
-    return verdict, why, outcome["step"]
+    return verdict, why, outcome["step"], outcome["overruns"]
 
 
 def cmd_dryrun(directory, args):
@@ -2276,14 +2446,16 @@ def cmd_dryrun(directory, args):
     env = {**os.environ, "VERIFY_DIR": str(directory), "VERIFY_DRYRUN": "1"}
     results, lines = run_checks(directory, scripts, args, lambda path, beside, run: dry_check(directory, path, args, env, where, run))
     tally = collections.Counter(verdict for verdict, *_ in results.values())
-    compact = [compact_line(script_id(p), verdict, seconds, step, detail)
-               for p in scripts for verdict, detail, seconds, step in [results[script_id(p)]]]
+    compact = [compact_line(script_id(p), verdict, seconds, step, detail, overruns)
+               for p in scripts for verdict, detail, seconds, step, overruns in [results[script_id(p)]]]
     lines += compact
     summary = (f"dryrun: {len(scripts)} scripts on base {where['head'][:12]}: {tally['FAIL']} fail a predicate, {tally['PASS']} pass "
                f"(behavior already on base), {tally['CRASH']} crash")
     summary += "".join(f", {tally[v]} {v.lower()}" for v in ("INCONCLUSIVE", "STALLED") if tally[v])
     summary += f", {tally['NOT-RUN']} not run for lack of capacity" if tally["NOT-RUN"] else ""
-    lines.append(summary + (f", {tally['ERROR']} errored before verify recorded the run" if tally["ERROR"] else ""))
+    summary += f", {tally['ERROR']} errored before verify recorded the run" if tally["ERROR"] else ""
+    overran = sum(1 for *_, overruns in results.values() if overruns)
+    lines.append(summary + (f", {overran} overran a step deadline" if overran else ""))
     write_summary(directory, "dryrun", compact)
     if any(tally[v] for v in ("CRASH", "INCONCLUSIVE", "STALLED", "NOT-RUN", "ERROR")):
         raise Failed("\n" + "\n".join(lines))
@@ -2317,7 +2489,7 @@ def dry_run_problems(check_id, script, log, allowed):
         return [f"{check_id}: {script.name} changed since its dry run; run {again}"], None
     problems = [] if stepped_before_ready(text) else [
         f"{check_id}: {log.name} shows no '{STEP_FORMAT}' line on stdout before \"{READY_LINE}\", so {script.name} runs its setup "
-        f"with no step deadline and a stall there waits for the --timeout safety net. Print one to stdout, flushed, on entering "
+        f"with no step deadline and a stall there shows no overrun of its own. Print one to stdout, flushed, on entering "
         f"each step, setup first, then run {again}"]
     graded = verdict.group(1)
     if graded in UNGRADED:
@@ -2569,28 +2741,28 @@ def step_window(seconds):
     return seconds + max(STEP_MARGIN_S, STEP_MARGIN_RATIO * seconds)
 
 
-class Stalled(Exception):
-    """A supervised command passed the deadline its last step line opened, or printed none within FIRST_STEP_S."""
-
-    def __init__(self, progress):
-        step, last = progress["step"], progress["last"]
-        why = f"passed its {progress['window']:g}s deadline" if step else f"no '{STEP_FORMAT}' line within {FIRST_STEP_S:g}s"
-        super().__init__(why + (f"; last line: {last}" if last else ""))
-        self.output = self.stderr = ""
-
-
-def run_in_group(command, timeout, on_start=None, on_ready=None, progress=None, **kwargs):
-    """subprocess.run in its own session, so a timeout kills the command and everything it started. on_start gets the
-    pid (the process group), and on_ready runs when stdout prints READY_LINE. With progress, a dict, each STEP_LINE on
-    stdout opens a deadline (FIRST_STEP_S until the first), and one that passes kills the group and raises Stalled;
-    progress holds the step, its window, and the last output line. Once the command has exited or been killed, its output
-    is read for at most HELD_OUTPUT_S more, since a process it detached into another session can hold the pipes forever."""
+def run_in_group(command, timeout, on_start=None, on_ready=None, progress=None, on_progress=None, **kwargs):
+    """subprocess.run in its own session, so a timeout, when given, kills the command and everything it started. on_start
+    gets the pid (the process group), and on_ready runs when stdout prints READY_LINE. With progress, a dict, each STEP_LINE
+    on stdout opens a deadline (FIRST_STEP_S until the first); one that passes is recorded, never killed: progress holds the
+    step, its window and deadline, the last output line, the overrun still open, and the finished overruns, each with its
+    step, window, seconds past the deadline, and the last line when the deadline passed. on_progress(progress) runs when a
+    step opens or an overrun starts. Once the command has exited or been killed, its output is read for at most
+    HELD_OUTPUT_S more, since a process it detached into another session can hold the pipes forever."""
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, **kwargs) as proc:
         if on_start:
             on_start(proc.pid)
         if progress is not None:
-            progress.update(step=None, window=FIRST_STEP_S, until=time.monotonic() + FIRST_STEP_S, last="")
+            progress.update(step=None, window=FIRST_STEP_S, until=time.monotonic() + FIRST_STEP_S, last="", overrun=None,
+                            overruns=[])
+        changed = on_progress or (lambda state: None)
         streams = {proc.stdout.fileno(): OutputStream(True), proc.stderr.fileno(): OutputStream(False)}
+
+        def close_overrun():
+            if progress is not None and progress["overrun"]:
+                overrun = progress["overrun"]
+                progress["overruns"].append({**overrun, "by": time.monotonic() - overrun.pop("until")})
+                progress["overrun"] = None
 
         def take(line, stdout):
             text = line.rstrip("\n")
@@ -2600,8 +2772,10 @@ def run_in_group(command, timeout, on_start=None, on_ready=None, progress=None, 
             if progress is not None and text.strip():
                 progress["last"] = text.strip()
                 if stdout and (m := STEP_LINE.match(text.strip())):
+                    close_overrun()
                     window = step_window(float(m.group(2)))
                     progress.update(step=m.group(1), window=window, until=time.monotonic() + window)
+                    changed(progress)
             return True
 
         with selectors.DefaultSelector() as selector:
@@ -2623,27 +2797,33 @@ def run_in_group(command, timeout, on_start=None, on_ready=None, progress=None, 
                     stream.feed(b"", take)
                 return held
 
-            deadline = time.monotonic() + timeout
+            deadline = None if timeout is None else time.monotonic() + timeout
             try:
                 while proc.poll() is None:
                     now = time.monotonic()
-                    if now >= deadline:
+                    if deadline is not None and now >= deadline:
                         raise subprocess.TimeoutExpired(command, timeout)
-                    if progress is not None and now >= progress["until"]:
-                        raise Stalled(progress)
-                    wait = min(PROGRESS_POLL_S, min(deadline, progress["until"]) - now if progress is not None else deadline - now)
+                    if progress is not None and not progress["overrun"] and now >= progress["until"]:
+                        progress["overrun"] = {"step": progress["step"], "window": progress["window"], "last": progress["last"],
+                                               "until": progress["until"]}
+                        changed(progress)
+                    bounds = [deadline - now] if deadline is not None else [PROGRESS_POLL_S]
+                    if progress is not None:
+                        bounds += [PROGRESS_POLL_S] + ([] if progress["overrun"] else [progress["until"] - now])
+                    wait = max(0.0, min(bounds))
                     if selector.get_map():
                         read(wait)
                     else:
                         with contextlib.suppress(subprocess.TimeoutExpired):
                             proc.wait(timeout=wait)
-            except (subprocess.TimeoutExpired, Stalled) as e:
+            except subprocess.TimeoutExpired as e:
                 kill_group(proc.pid)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=KILL_WAIT_S)
                 held = finish(time.monotonic() + HELD_OUTPUT_S)
                 e.output, e.stderr = streams[proc.stdout.fileno()].text(), streams[proc.stderr.fileno()].text(held)
                 raise
+            close_overrun()
             held = finish(time.monotonic() + HELD_OUTPUT_S)
             out, err = streams[proc.stdout.fileno()].text(), streams[proc.stderr.fileno()].text(held)
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
@@ -3035,7 +3215,7 @@ COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracl
             "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "dryrun": cmd_dryrun,
             "scripts": cmd_scripts, "review": cmd_review, "premises": cmd_premises, "spec": cmd_spec, "script-fix": cmd_script_fix,
             "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "base": cmd_base, "leftovers": cmd_leftovers,
-            "capacity": cmd_capacity}
+            "capacity": cmd_capacity, "stop": cmd_stop}
 
 
 def main():
@@ -3068,11 +3248,14 @@ def main():
     passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
     args = parser.parse_intermixed_args(argv[:len(argv) - len(passthrough) - 1] if "--" in argv else argv)
     args.rest += passthrough
-    if args.rest and args.command not in ("units", "rerun", "dryrun", "phases", "adopt", "script-fix", "base"):
+    if args.rest and args.command not in ("units", "rerun", "dryrun", "phases", "adopt", "script-fix", "base", "stop"):
         parser.error(f"{args.command} takes no arguments")
     if args.jobs is not None and args.jobs < 1:
         parser.error("--jobs needs at least 1")
-    args.timeout = args.timeout or (RERUN_TIMEOUT if args.command in ("rerun", "dryrun") else SCRIPT_TIMEOUT)
+    if args.timeout is not None and args.command in ("rerun", "dryrun"):
+        print(f"verify {args.command}: --timeout is deprecated and ignored: a script is never killed on time. A step past its "
+              "deadline is recorded as an overrun, and `verify.py stop <id>` ends a script you judge dead.", file=sys.stderr)
+    args.timeout = args.timeout or SCRIPT_TIMEOUT
     try:
         try:
             directory = verification_dir(args.dir)
