@@ -3,7 +3,8 @@
 
 usage: verify.py <command> [--dir DIR]
        verify.py plan [--checks]
-       verify.py adopt <phase folder>
+       verify.py adopt <phase folder> [--base <branch>]
+       verify.py base [<branch>]
        verify.py premises [--resolved]
        verify.py freeze [--revision "<what changed and why>" [--gate <autorun gate id>]]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
@@ -24,7 +25,11 @@ directory.
               expensive tier, so fewer is better: keep only core behavior no unit spec can see, and 10 is a ceiling, not a
               target; move the rest to unit or drop them, or split the phase. A plan with any e2e or walk check needs a
               non-empty '## Drive contract' section: every name those checks drive (test ids, accessible names, routes,
-              HTTP paths, CLI commands and flags, wire and event names, file paths), settled before code. Every HTTP path
+              HTTP paths, CLI commands and flags, wire and event names, file paths), settled before code. The contract
+              names product-side names only: a line whose label (the text before its first colon) starts with driver or
+              harness is refused, because driver commands are the verifier's own; a line the plan lock already held
+              stays. An e2e or perf check may carry '- Base: passes: <why the base already has this behavior>', the only
+              way its script may pass on base (see `scripts`); a unit or walk check may not. Every HTTP path
               (`/x` or `GET /x`) and CLI flag (`--name`) an e2e or walk check names in backticks in its Scenario or Pass
               must appear in the Drive contract; a contract path with :id, {id}, <id>, or * segments covers any value
               there. An optional '## Sensitive paths' section lists paths or globs (auth, permissions, crypto) where the
@@ -32,14 +37,20 @@ directory.
               decision), before the Drive contract exists. Prints the count per tier.
   adopt       record a phase folder's plan.md from a feature plan as this branch's plan, and HEAD as the phase's base, so
               every command reads the plan where it lives and `lock` measures code from where the phase starts. The plan
-              must pass `plan --checks`. A plan.md left in the verification directory by an older adopt is removed when it
-              matches, and refused when it differs.
+              must pass `plan --checks`, and HEAD must pass `base` for --base <branch> (default main, the repository's
+              default branch), which it records beside the base commit. A plan.md left in the verification directory by
+              an older adopt is removed when it matches, and refused when it differs.
+  base        the phase branch is cut from the latest <branch>: runs `git fetch origin <branch>` and passes when
+              origin/<branch> is an ancestor of HEAD (without an origin remote, the local <branch>). With no <branch>, the
+              branch `adopt --base` recorded for this branch, else main (the repository's default branch). A phase that
+              stacks on an earlier phase's open PR passes that phase's branch.
   premises    premises.md and grounding.md sit beside the plan (the phase folder, else the verification directory), each
               with a line 'Base: <sha>' naming the base it was checked at, which must be the phase's base (the commit
               `adopt` recorded, else the merge-base with main); a full or abbreviated sha of it counts. premises.md holds
               a table with the columns Check | Premise | Holds | Evidence | Resolution: every check id of the plan in at
-              least one row, Holds yes or no, and Evidence on every row. --resolved also needs a Resolution on every row
-              whose premise does not hold.
+              least one row, and Holds yes or no, with Evidence, or new: a premise is a fact a check assumes already
+              holds on the base, and what this phase builds gets one 'new' row per check at most, Evidence optional.
+              --resolved also needs a Resolution on every row whose premise does not hold ('new' rows need none).
   driver      a project verification skill is on main, or was committed before any product change, or HEAD holds a
               driver-only commit whose patch (git patch-id) matches a commit on a local branch whose commits since the
               phase base (the commit `adopt` recorded, else the merge-base with main) touch only the driver: the
@@ -65,12 +76,15 @@ directory.
               Head, with the Head's product tree when no finding is triaged fixed. HEAD must hold Fixed at's product tree,
               so no product change follows the reviewed fixes.
   scripts     every e2e check, perf checks included, has its <id>.check.<ext> script and an <id>.base.log from
-              `dryrun` of that same script that reached "verify: ready" and failed a predicate: exit 1 with a FAIL line
-              last on stdout. A script that crashed (no ready line, any other exit, or no FAIL line) fails the gate; one
-              that passes on base is accepted with a note, because its behavior already exists there.
+              `dryrun` of that same script that holds a "verify: step <name> within <seconds>" line, reached "verify:
+              ready", and failed a predicate: exit 1 with a FAIL line last on stdout. A script that crashed (no ready
+              line, an exit other than 0 to 3, or no FAIL line), stalled, or was inconclusive fails the gate. One that
+              passes on base fails it too, unless its check carries '- Base: passes: <why>': fix the script or its helper
+              so it fails on base, or revise the plan through `freeze --revision` to add the field.
   dryrun      run each saved check script with --base, a worktree at the phase base whose product files match it, as its
               working directory, VERIFY_DRYRUN=1 in its environment, and write <id>.base.log with its output and verdict.
-              Scripts start the way `rerun` starts them, as parallel as capacity allows. Exits 1 when a script crashed.
+              Scripts start, are supervised, and are requeued on exit 3 the way `rerun` does it, and the compact lines go
+              to dryrun.summary. Exits 1 when a script crashed, stalled, or was inconclusive.
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match the comparison; the
               report's Head is HEAD or a commit with HEAD's product code (a regrouped history, or later commits that touch
               only the adopted plan folder or the project's verification skills). A PASS is backed by its tier's
@@ -106,13 +120,26 @@ directory.
               Each run records units.json (per spec its verdict and the plan check ids its text names, so a test
               titled "U2: ..." proves unit check U2) and units.log in the verification directory, for `report`.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
-              instance id) to each; one PASS or FAIL line per check from its exit code, in id order, and a summary. Each
-              script gets 300 seconds unless --timeout raises it. Scripts run as parallel as capacity allows: the next
+              instance id) to each, and print one compact line per check in id order, '<id> <VERDICT> <seconds>s [step
+              <name>] [<reason>]', then a summary; the same lines go to rerun.summary, so read one line per check and
+              open a log only on FAIL. A check script prints, on stdout and flushed, "verify: step <name> within
+              <seconds>" on entering each step, setup included, with the most that step may take; "verify: ready" once
+              its instance is up; and a PASS or FAIL line last. Its exit code is its verdict: 0 PASS, 1 FAIL (a predicate
+              failed), 2 INCONCLUSIVE (a premise or blocker named on the last line), 3 ENVIRONMENT (the instance or
+              machine could not support the run: a load refusal, an instance that died, a usage limit); any other exit,
+              or a kill, is CRASH. Runs are supervised by progress: each step line opens a deadline of its seconds plus
+              the larger of 15 s and a quarter of them, and until the first one a 120 s window applies; when the open
+              deadline passes, verify kills the script's process group and records STALLED with the step and the last
+              output line, however long the run has taken before, so a slow run that progresses is never killed.
+              --timeout is only a total safety net, 7200 seconds by default, recorded as CRASH. An ENVIRONMENT run is
+              queued again for when `capacity` passes, at most 2 times per run, and is then INCONCLUSIVE with reason
+              environment; it writes no log, records no verdict, and is no fix attempt. Scripts run as parallel as
+              capacity allows: the next
               starts once every running script has printed the line "verify: ready" (its instance is up; the line stays
               out of its log), while fewer than --jobs run when it is given, and while `capacity` passes, because the
               1-minute load lags an instance start; a script that never prints the line runs alone. While capacity is
               short a script waits, checking every 15 seconds; after 10 minutes it is REQUEUED behind the rest, and
-              after a second such wait it is NOT RUN, which fails the run. A watchdog samples the load every 3 seconds;
+              after a second such wait it is NOT-RUN, which fails the run. A watchdog samples the load every 3 seconds;
               once it stays above 1.0 x cores for 15 seconds, it stops the most recently started script with its
               process group and the detached processes it started, queues it again, prints it as REQUEUED with the load,
               and lowers the jobs to the scripts still running, never below one. A requeued run is neither a FAIL nor a
@@ -124,8 +151,8 @@ directory.
               arguments and provisions and tears down its own instance through the project driver (optional ARGS may
               reuse a running instance); it cleans only its own evidence (evidence/<id>/ or files starting with <id>),
               never a shared folder, and a script that deletes or empties another check's file FAILs; the report cites
-              <id>.rerun.log, not the script, and the log's last line is "rerun: PASS" or "rerun: FAIL (<why>)". After a
-              run where every script passes, rerun stamps rerun.stamp.json with HEAD's tree, a hash of the tracked
+              <id>.rerun.log, not the script, and the log's last line is "rerun: PASS" or "rerun: <VERDICT> (<why>)".
+              After a run where every script passes, rerun stamps rerun.stamp.json with HEAD's tree, a hash of the tracked
               working-tree diff, and a sha256 per check script and helper (.mjs .cjs .js .ts .py .sh). A later rerun with
               the same ARGS and an unchanged stamp prints one line and exits 0 without running; --force skips that check.
               Any run deletes the stamp first, so a failed or interrupted run leaves none. The first full rerun is the
@@ -140,8 +167,10 @@ directory.
               rerun.ledger.json, keeping each check's latest run with its script's sha256, for `report`. Once report.md
               marks a check FAIL, a run in which it still fails is one failed fix attempt, counted in fix-attempts.json,
               when a product file or its script changed since its previous failing run; a rerun with no such change (an
-              environment rerun) is not one. After 2, every rerun skips the check with a note instead of running it,
-              without failing, because it goes to the user or the backlog. A check script finds the repository from its working directory, never a hard-coded worktree path.
+              environment rerun) is not one, and only a FAIL verdict counts, never INCONCLUSIVE, STALLED, or CRASH.
+              After 2, every rerun skips the check with a note instead of running it, without failing, because it goes
+              to the user or the backlog. A check script finds the repository from its working directory, never a
+              hard-coded worktree path.
   script-fix  record why a check script or helper that scripts.lock.json locked changed after the prove: <file> in the
               verification directory and --reason "<why it crashed before its predicate>". It appends the time, the file,
               its old and new sha256, and the reason to the lock's script fixes and locks the new hash, so a rerun may
@@ -178,9 +207,9 @@ directory.
 The verification directory is ~/.agents/verify/<repo>-<clone hash>/<branch>/, so two clones of one repo never share it ($VERIFY_HOME overrides
 the root, --dir overrides the whole path). It holds base.json (the adopted plan and base), plan.md when no phase was adopted,
 plan.lock, report.md, observations.md, review.md, decision.tsv, units.json, fix-attempts.json, scripts.lock.json,
-rerun.ledger.json, the <id>.base.log and <id>.rerun.log files, and the evidence files. An oracle check <id> also has
-<id>.expected.json, written by an agent that read only the spec and the seed data, and <id>.observed.json, read from the
-running app.
+rerun.ledger.json, rerun.summary, dryrun.summary, the <id>.base.log and <id>.rerun.log files, and the evidence files. An
+oracle check <id> also has <id>.expected.json, written by an agent that read only the spec and the seed data, and
+<id>.observed.json, read from the running app.
 """
 import argparse
 import collections
@@ -253,6 +282,12 @@ OBSERVATIONS = "observations.md"
 SPEC = "spec.md"
 CHANGE_LOG = "Change log"
 MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"}
+DRIVER_LABELS = ("driver", "harness")
+PRODUCT_NAMES = ("DOM handles, routes and HTTP paths, the product's CLI commands and flags, env vars, wire and log event names, "
+                 "and file paths the product writes")
+BASE_PASSES = re.compile(r"^passes:\s*(\S.*)$")
+BASE_FIELD = "- Base: passes: <why the base already has this behavior>"
+HOLDS = ("yes", "no", "new")
 
 
 SPEC_FILE = re.compile(r"(^|/)(test_[^/]*\.py|[^/]*_test\.(py|go)|[^/]*\.(test|spec)\.[cm]?[jt]sx?|[^/]*_spec\.rb|[^/]*Tests?\.(swift|kt|java))$")
@@ -262,7 +297,7 @@ SCRIPT_RUNNERS = {".py": [sys.executable], ".sh": ["bash"], ".js": ["node"], ".m
 NODE_LOCKS = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bunx", "bun.lockb": "bunx"}
 DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}
 SCRIPT_TIMEOUT = 900
-RERUN_TIMEOUT = 300
+RERUN_TIMEOUT = 7200
 RERUN_STAMP = "rerun.stamp.json"
 SCRIPTS_LOCK = "scripts.lock.json"
 RERUN_LEDGER = "rerun.ledger.json"
@@ -271,7 +306,8 @@ STATE_LOCK = ".rerun-state.lock"
 TMP_SUFFIX = ".verify-tmp"
 RERUN_PASS = "rerun: PASS"
 BASE_LOG = ".base.log"
-DRYRUN_VERDICT = re.compile(r"^dryrun: (FAIL|PASS|CRASH)\b")
+DRYRUN_VERDICT = re.compile(r"^dryrun: (FAIL|PASS|CRASH|INCONCLUSIVE|STALLED)\b")
+UNGRADED = {"CRASH": "crashed", "STALLED": "stalled", "INCONCLUSIVE": "was inconclusive"}
 DRYRUN_SCRIPT = re.compile(r"^dryrun: script sha256 ([0-9a-f]{64})$", re.M)
 FAIL_LINE = re.compile(r"^FAIL\b")
 FIX_ATTEMPTS = 2
@@ -295,6 +331,15 @@ GLOB_MAGIC = re.compile(r"[*?\[]")
 KILL_WAIT_S = 3.0
 ADMIT_POLL_S = 1.0
 READY_LINE = "verify: ready"
+STEP_FORMAT = "verify: step <name> within <seconds>"
+STEP_LINE = re.compile(r"^verify: step (\S.*?) within (\d+(?:\.\d+)?)$")
+FIRST_STEP_S = 120.0
+STEP_MARGIN_S = 15.0
+STEP_MARGIN_RATIO = 0.25
+PROGRESS_POLL_S = 0.5
+EXIT_VERDICTS = {0: "PASS", 1: "FAIL", 2: "INCONCLUSIVE", 3: "ENVIRONMENT"}
+ENVIRONMENT_REQUEUES = 2
+SUMMARY = ".summary"
 CAPACITY_POLL_S = 15.0
 CAPACITY_WAIT_S = 600.0
 OVERLOAD_RATIO = 1.0
@@ -446,9 +491,23 @@ def check_tier(entry, problems, tiers, oracles):
         tiers[check_id] = value
 
 
-def lint_plan(text, full=True):
+def check_base(entry, tier, problems):
+    field = entry["fields"].get("Base")
+    if field is None:
+        return
+    number, value = field
+    if tier != "e2e":
+        problems.append(f"{number}: Base belongs to an e2e or perf check, whose script must fail on base; a unit spec of behavior "
+                        f"that already works is marked {GUARD_MARK}")
+    elif not (m := BASE_PASSES.match(value)) or len(m.group(1)) < MIN_REASON or PLACEHOLDER.search(value):
+        problems.append(f"{number}: Base must read 'passes: <why the base already has this behavior>', the only way a check "
+                        "may pass on base")
+
+
+def lint_plan(text, full=True, frozen=()):
     """Return (problems, check ids, {oracle check id: tolerance}, {check id: tier}) for a plan's text. Without full, only the
-    checks part: no Drive contract, names, or Sensitive paths rules."""
+    checks part: no Drive contract, names, or Sensitive paths rules. frozen holds the Drive contract lines the plan lock
+    already holds, which predate the driver-label rule."""
     problems, ids, oracles, tiers = [], [], {}, {}
     found = sections(text.splitlines())
     checks = []
@@ -462,6 +521,8 @@ def lint_plan(text, full=True):
             check_entry(entry, CHECK_FIELDS, problems)
             check_oracle(entry, problems, oracles)
             check_tier(entry, problems, tiers, oracles)
+            if tier := tiers.get(entry_id(entry)):
+                check_base(entry, tier, problems)
             ids.append((entry_id(entry), entry["line"]))
     if "Perf" not in found:
         problems.append("1: missing '## Perf' section: add perf checks, or 'n/a: <reason>'")
@@ -482,6 +543,7 @@ def lint_plan(text, full=True):
                 problems.append(f"{tier[0]}: a perf check is always e2e: a script that measures and compares against its Rule")
             if check_id := entry_id(entry):
                 tiers[check_id] = "e2e"
+            check_base(entry, "e2e", problems)
             ids.append((check_id, entry["line"]))
     for name, body in found.items():
         if name not in ("Checks", "Perf"):
@@ -494,15 +556,23 @@ def lint_plan(text, full=True):
         seen.setdefault(check_id, line)
     problems += e2e_cap_problems(tiers)
     if full:
-        problems += contract_problems(found, tiers) + name_problems(found, checks, tiers)
+        problems += contract_problems(found, tiers, frozen) + name_problems(found, checks, tiers)
         problems += [f"{n}: {SENSITIVE} still holds a template placeholder" for n, line in found.get(SENSITIVE, []) if PLACEHOLDER.search(line)]
     return problems, [i for i, _ in ids if i], oracles, tiers
 
 
-def contract_problems(found, tiers):
+def contract_label(line):
+    """The text before a Drive contract line's first colon, without its bullet, emphasis, or backticks."""
+    return line.strip().lstrip("-*+ ").partition(":")[0].strip("`*_'\" ")
+
+
+def contract_problems(found, tiers, frozen=()):
     driven = [i for i, t in tiers.items() if t in DRIVEN_TIERS]
     lines = [(n, line) for n, line in found.get(CONTRACT, []) if line.strip()]
     problems = [f"{n}: {CONTRACT} still holds a template placeholder" for n, line in lines if PLACEHOLDER.search(line)]
+    problems += [f"{n}: the {CONTRACT} line '{contract_label(line)}' names a driver command. The contract names product-side names "
+                 f"only ({PRODUCT_NAMES}); driver commands are the verifier's own, so drop the line"
+                 for n, line in lines if contract_label(line).lower().startswith(DRIVER_LABELS) and line.strip() not in frozen]
     if driven and not lines:
         problems.append(f"1: {', '.join(driven)} {'is an e2e or walk check' if len(driven) == 1 else 'are e2e or walk checks'}, "
                         f"but the plan has no '## {CONTRACT}' listing what they drive. Settle every name before any code: DOM "
@@ -569,10 +639,20 @@ def plan_file(directory):
     return pathlib.Path(record["plan_file"]) if record.get("plan_file") else directory / "plan.md"
 
 
+def frozen_contract(directory):
+    """The Drive contract lines of the plan lock's text, stripped."""
+    lock_path = directory / "plan.lock"
+    try:
+        text = json.loads(lock_path.read_text()).get("text", "") if lock_path.is_file() else ""
+    except ValueError:
+        return set()
+    return {line.strip() for _, line in sections(text.splitlines()).get(CONTRACT, []) if line.strip()}
+
+
 def load_plan(directory, full=True):
     path = plan_file(directory)
     text = read(path, "plan (write it from the verify skill's references/plan-template.md)")
-    problems, ids, oracles, tiers = lint_plan(text, full)
+    problems, ids, oracles, tiers = lint_plan(text, full, frozen_contract(directory) if full else ())
     if problems:
         raise Failed("\n".join(f"{path}:{p}" for p in problems))
     return path, text, ids, oracles, tiers
@@ -815,6 +895,40 @@ def cmd_freeze(directory, args):
 BASE_RECORD = "base.json"
 
 
+def latest_base(branch):
+    """(ref, sha) of the latest <branch>, which HEAD must descend from: fetched as origin/<branch>, or the local branch in a
+    repository without an origin remote. Failed otherwise."""
+    ref = branch
+    if "origin" in git("remote").split():
+        fetched = subprocess.run(["git", "fetch", "-q", "origin", branch], capture_output=True, text=True)
+        if fetched.returncode:
+            raise Failed(f"cannot fetch {branch} from origin: {fetched.stderr.strip()}. Name the branch this phase is cut from, "
+                         "pushed: `verify.py base <branch>`")
+        ref = f"origin/{branch}"
+    try:
+        tip = git("rev-parse", "--verify", "-q", f"{ref}^{{commit}}")
+    except Failed:
+        raise Failed(f"no branch {ref} to cut the phase from; name the branch this phase stacks on: `verify.py base <branch>`")
+    if not is_ancestor(tip, "HEAD"):
+        raise Failed(f"the phase branch is not cut from the latest {branch}; fetch it and cut again: HEAD "
+                     f"{git('rev-parse', 'HEAD')[:12]} does not descend from {ref} at {tip[:12]}. A phase stacked on an earlier open "
+                     "phase passes that phase's branch")
+    return ref, tip
+
+
+def default_base_branch():
+    return default_branch().removeprefix("origin/")
+
+
+def cmd_base(directory, args):
+    if len(args.rest) > 1:
+        raise Failed("base takes at most one <branch>")
+    branch = args.rest[0] if args.rest else base_record(directory).get("base_branch") or default_base_branch()
+    ref, tip = latest_base(branch)
+    local = "" if ref.startswith("origin/") else ", the local branch, since no origin remote exists"
+    return f"base ok: HEAD descends from {ref} at {tip[:12]}{local}"
+
+
 def cmd_adopt(directory, args):
     if len(args.rest) != 1:
         raise Failed("adopt takes one <phase folder> from the feature plan")
@@ -827,6 +941,8 @@ def cmd_adopt(directory, args):
     record = base_record(directory)
     if record.get("plan_file") and pathlib.Path(record["plan_file"]) != path:
         raise Failed(f"this branch already adopted {record['plan_file']}; one branch carries one phase")
+    branch = args.base or default_base_branch()
+    latest_base(branch)
     copy = directory / "plan.md"
     if copy.exists():
         if copy.read_text() != text:
@@ -834,9 +950,9 @@ def cmd_adopt(directory, args):
         copy.unlink()
     directory.mkdir(parents=True, exist_ok=True)
     head = git("rev-parse", "HEAD")
-    (directory / BASE_RECORD).write_text(json.dumps({"base": head, "plan": str(folder.parent.parent), "plan_file": str(path)},
-                                                    indent=2) + "\n")
-    return f"adopted {folder.name}: {len(ids)} checks, base {head[:12]}; every command reads {path}"
+    (directory / BASE_RECORD).write_text(json.dumps({"base": head, "base_branch": branch, "plan": str(folder.parent.parent),
+                                                     "plan_file": str(path)}, indent=2) + "\n")
+    return f"adopted {folder.name}: {len(ids)} checks, base {head[:12]} on {branch}; every command reads {path}"
 
 
 def listed(names):
@@ -1404,7 +1520,7 @@ def check_state(directory, check_id, tier, graded, oracles, lock):
         if check_id not in graded["scripts"] or not log.is_file() or log.stat().st_mtime < frozen_ts:
             state, why = "missing", tier_gap(directory, check_id, tier, graded)
         elif last_line(log) != RERUN_PASS:
-            state, why = "fail", last_line(log)
+            state, why = "fail" if last_line(log).startswith("rerun: FAIL") else "missing", last_line(log)
         else:
             why = tier_gap(directory, check_id, tier, graded)
             state = "missing" if why else "pass"
@@ -1762,62 +1878,106 @@ def could_not_run(error):
     return f"verify could not run it: {type(error).__name__}: {error}"
 
 
-def run_script(path, args, env, hooks):
-    """(verdict, detail, output) of one run of a check script."""
+def supervised_run(path, args, env, run, cwd=None):
+    """One run of a check script under progress supervision: its exit code, stdout, output, whether it printed READY_LINE,
+    its last step and output line, and, when verify stopped it (killed) or could not start it, the verdict and reason."""
+    progress, seen = {"step": None, "last": ""}, threading.Event()
+
+    def on_ready():
+        seen.set()
+        if run:
+            run["ready"]()
+    hooks = {"on_start": lambda pid: run.update(pid=pid)} if run else {}
+    outcome = {"code": None, "stdout": "", "output": "", "verdict": None, "reason": "", "killed": False}
     command = script_command(path)
     if not command:
-        return "FAIL", f"{path.name} is not executable and has no interpreter for {path.suffix}", ""
-    try:
-        r = run_in_group([*command, *args.rest], args.timeout, env=env, **hooks)
-    except subprocess.TimeoutExpired:
-        return "FAIL", f"timed out after {args.timeout}s", ""
-    output = (r.stdout + r.stderr).strip()
-    if r.returncode == 0:
-        return "PASS", "", output
-    tail = "".join(f"\n    {line}" for line in output.splitlines()[-5:])
-    return "FAIL", f"exit {r.returncode}{tail}", output
+        outcome.update(verdict="CRASH", reason=f"{path.name} is not executable and has no interpreter for {path.suffix}")
+    else:
+        try:
+            r = run_in_group([*command, *args.rest], args.timeout, cwd=cwd, env=env, on_ready=on_ready, progress=progress, **hooks)
+            outcome.update(code=r.returncode, stdout=r.stdout, output=(r.stdout + r.stderr).strip("\n"))
+        except Stalled as e:
+            outcome.update(verdict="STALLED", reason=str(e), output=(e.output + e.stderr).strip("\n"), killed=True)
+        except subprocess.TimeoutExpired as e:
+            outcome.update(verdict="CRASH", reason=f"timed out after {args.timeout}s, the --timeout safety net",
+                           output=((e.output or "") + (e.stderr or "")).strip("\n"), killed=True)
+        except Exception as e:
+            outcome.update(verdict="CRASH", reason=could_not_run(e))
+    return {**outcome, "ready": seen.is_set(), "step": progress["step"], "last": progress["last"]}
+
+
+def rerun_verdict(outcome):
+    """(verdict, reason) of a rerun: the class of its exit code (EXIT_VERDICTS, else CRASH), or why verify stopped it."""
+    if outcome["verdict"]:
+        return outcome["verdict"], outcome["reason"]
+    code, last = outcome["code"], outcome["last"]
+    verdict = EXIT_VERDICTS.get(code, "CRASH")
+    return verdict, "" if verdict == "PASS" else f"exit {code}" + (f": {last}" if last else "")
+
+
+def environment_retry(verdict, reason, run):
+    """An ENVIRONMENT run with requeues left stays ENVIRONMENT, for run_checks to queue again; past them it is INCONCLUSIVE."""
+    if verdict != "ENVIRONMENT" or (run and not run["last_chance"]):
+        return verdict, reason
+    return "INCONCLUSIVE", f"environment: {reason}"
+
+
+def verdict_tail(verdict, step, reason):
+    """'[step <name>] [<reason>]' on one line: where a run that did not pass ended, and why."""
+    return " ".join([*([f"step {step}"] if step and verdict != "PASS" else []), *([" ".join(reason.split())] if reason else [])])
+
+
+def compact_line(check_id, verdict, seconds, step, reason):
+    """`<id> <VERDICT> <seconds>s [step <name>] [<reason>]`: one line per script, for an agent that opens a log only on FAIL."""
+    return " ".join([check_id, verdict, f"{seconds:.1f}s", *filter(None, [verdict_tail(verdict, step, reason)])])
+
+
+def write_summary(directory, kind, lines):
+    (directory / f"{kind}{SUMMARY}").write_text("".join(f"{line}\n" for line in lines))
 
 
 def run_check(directory, path, args, env, concurrent=set, run=None, record=None):
-    """(verdict, detail) for one check script; its output and verdict go to <id>.rerun.log, and record(path, verdict) runs in
-    the same locked step, a script verify could not start included. concurrent() names the checks that ran beside it. run,
-    when given, learns the script's pid and readiness, and a run the watchdog evicted is REQUEUED."""
+    """(verdict, reason, step) for one check script; its output and verdict go to <id>.rerun.log, and record(path, verdict)
+    runs in the same locked step, a script verify could not start included. concurrent() names the checks that ran beside
+    it. run, when given, learns the script's pid and readiness; a run the watchdog evicted is REQUEUED, and an ENVIRONMENT
+    run with requeues left records nothing."""
     check_id = script_id(path)
     before = file_sizes(directory)
-    hooks = {"on_start": lambda pid: run.update(pid=pid), "on_ready": run["ready"]} if run else {}
-    try:
-        verdict, detail, output = run_script(path, args, env, hooks)
-    except Exception as e:
-        verdict, detail, output = "FAIL", could_not_run(e), ""
+    outcome = supervised_run(path, args, env, run)
     if run and run["evicted"]:
-        return "REQUEUED", ""
+        return "REQUEUED", "", None
+    verdict, reason = environment_retry(*rerun_verdict(outcome), run)
+    if verdict == "ENVIRONMENT":
+        return verdict, reason, outcome["step"]
     beside = sorted(concurrent())
     lost = lost_files(before, file_sizes(directory), {check_id, *beside})
     if lost:
         verdict = "FAIL"
         culprit = f"files that are not its own were deleted or emptied while it ran beside {', '.join(beside)}" if beside else \
             "deleted or emptied files that are not its own"
-        detail = f"{culprit}: {', '.join(lost)}" + (f"\n{detail}" if detail else "")
-    reason = detail.partition("\n")[0]
+        reason = f"{culprit}: {', '.join(lost)}" + (f"; {reason}" if reason else "")
+    output, tail = outcome["output"], verdict_tail(verdict, outcome["step"], reason)
     with rerun_state(directory):
-        (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}" + (f" ({reason})" if reason else "") + "\n")
+        (directory / f"{check_id}.rerun.log").write_text((output + "\n" if output else "") + f"rerun: {verdict}"
+                                                         + (f" ({tail})" if tail else "") + "\n")
         if record:
             record(path, verdict)
-    return verdict, detail
+    return verdict, reason, outcome["step"]
 
 
 def run_checks(directory, scripts, args, run_one):
-    """({check id: (verdict, detail, seconds)}, [requeue lines]). A script starts while every running one has printed
+    """({check id: (verdict, detail, seconds, step)}, [requeue lines]). A script starts while every running one has printed
     READY_LINE, the running count is under --jobs when given, and the machine has capacity; a script that waits
-    CAPACITY_WAIT_S for capacity is queued again behind the rest, and after a second such wait it is NOT RUN. The watchdog
-    evicts the newest while the load stays overloaded. Perf checks run alone at the end."""
+    CAPACITY_WAIT_S for capacity is queued again behind the rest, and after a second such wait it is NOT-RUN. The watchdog
+    evicts the newest while the load stays overloaded. An ENVIRONMENT run is queued again, up to ENVIRONMENT_REQUEUES times.
+    Perf checks run alone at the end."""
     perf = perf_ids(directory)
     batches = (([p for p in scripts if script_id(p) not in perf], args.jobs), ([p for p in scripts if script_id(p) in perf], 1))
     results, beside, running, requeued = {}, {}, {}, []
     queue = collections.deque()
     turn = threading.Condition()
     jobs = args.jobs
-    waits = collections.Counter()
+    waits, environment = collections.Counter(), collections.Counter()
     load_ratio()
 
     def beside_of(check_id):
@@ -1832,15 +1992,20 @@ def run_checks(directory, scripts, args, run_one):
     def work(check_id, run):
         started = time.time()
         try:
-            verdict, detail = run_one(run["path"], lambda: beside_of(check_id), run)
+            verdict, detail, step = run_one(run["path"], lambda: beside_of(check_id), run)
         except Exception as e:
-            verdict, detail = "ERROR", could_not_run(e)
+            verdict, detail, step = "ERROR", could_not_run(e), None
         with turn:
             running.pop(check_id, None)
             if verdict == "REQUEUED":
                 queue.appendleft(run["path"])
+            elif verdict == "ENVIRONMENT":
+                environment[check_id] += 1
+                queue.append(run["path"])
+                requeued.append(f"REQUEUED {check_id}  {detail}: the instance or machine could not support the run; queued again "
+                                f"for when `capacity` passes ({environment[check_id]} of {ENVIRONMENT_REQUEUES})")
             else:
-                results[check_id] = (verdict, detail, time.time() - started)
+                results[check_id] = (verdict, detail, time.time() - started, step)
             turn.notify_all()
 
     def room(width):
@@ -1875,7 +2040,8 @@ def run_checks(directory, scripts, args, run_one):
                     beside[check_id] = set(running)
                     for other in running:
                         beside[other].add(check_id)
-                    run = {"path": path, "started": time.time(), "pid": None, "is_ready": False, "evicted": False}
+                    run = {"path": path, "started": time.time(), "pid": None, "is_ready": False, "evicted": False,
+                           "last_chance": environment[check_id] >= ENVIRONMENT_REQUEUES}
                     run["ready"] = lambda run=run: ready(run)
                     running[check_id] = run
                     threading.Thread(target=work, args=(check_id, run), daemon=True).start()
@@ -1895,7 +2061,8 @@ def run_checks(directory, scripts, args, run_one):
                         queue.append(path)
                         requeued.append(f"REQUEUED {check_id}  {why}; queued again behind the rest")
                     else:
-                        results[check_id] = ("NOT RUN", f"{why} twice; run it with --only {check_id} once the machine has room", 0.0)
+                        results[check_id] = ("NOT-RUN", f"{why} twice; run it with --only {check_id} once the machine has room",
+                                             0.0, None)
                     refused_since, next_check = None, 0.0
                     continue
                 turn.wait(min(ADMIT_POLL_S, WATCH_POLL_S))
@@ -1971,75 +2138,71 @@ def cmd_rerun(directory, args):
             budget[script_id(path)] = line
     results, requeued = run_checks(directory, runnable, args,
                                    lambda path, beside, run: run_check(directory, path, args, env, beside, run, record))
-    lines, failed = [*requeued, *map(spent_line, skipped)], []
-    not_run = [i for i, (verdict, _, _) in results.items() if verdict == "NOT RUN"]
-    errored = [i for i, (verdict, _, _) in results.items() if verdict == "ERROR"]
+    verdicts = collections.defaultdict(list)
+    compact = {i: compact_line(i, "SKIP", 0.0, None, "its fix budget is spent") for i in skipped}
     for path in runnable:
         check_id = script_id(path)
-        verdict, detail, seconds = results[check_id]
-        if verdict == "FAIL":
-            failed.append(check_id)
-        head, _, rest = detail.partition("\n")
-        lines.append(f"{verdict:<5} {check_id}  ({seconds:.1f}s)" + (f"  {head}" if head else "") + (f"\n{rest}" if rest else ""))
-    summary = f"rerun: {len(runnable)} checks, {len(runnable) - len(failed) - len(not_run) - len(errored)} PASS, {len(failed)} FAIL"
+        verdict, detail, seconds, step = results[check_id]
+        verdicts[verdict].append(check_id)
+        compact[check_id] = compact_line(check_id, verdict, seconds, step, detail)
+    lines = [*requeued, *map(spent_line, skipped), *(compact[script_id(p)] for p in runnable)]
+    summary = f"rerun: {len(runnable)} checks, {len(verdicts['PASS'])} PASS, {len(verdicts['FAIL'])} FAIL"
+    summary += "".join(f", {len(verdicts[v])} {v}" for v in ("INCONCLUSIVE", "STALLED", "CRASH") if verdicts[v])
     summary += f", {len(skipped)} skipped past the fix budget" if skipped else ""
-    summary += f", {len(not_run)} not run for lack of capacity" if not_run else ""
-    summary += f", {len(errored)} errored before verify recorded the run" if errored else ""
+    summary += f", {len(verdicts['NOT-RUN'])} not run for lack of capacity" if verdicts["NOT-RUN"] else ""
+    summary += f", {len(verdicts['ERROR'])} errored before verify recorded the run" if verdicts["ERROR"] else ""
     summary += f", {len(requeued)} requeued" if requeued else ""
     lines.append(summary + (" (--only: no stamp; the ledger records these runs)" if args.only else ""))
-    lines += [budget[i] for i in failed if i in budget]
+    lines += [budget[i] for i in verdicts["FAIL"] if i in budget]
     with rerun_state(directory):
-        if failed or not_run or errored:
+        write_summary(directory, "rerun", [compact[i] for i in sorted(compact)])
+        if any(ids for verdict, ids in verdicts.items() if verdict != "PASS"):
             raise Failed("\n" + "\n".join(lines))
         if inputs:
             write_json(stamp_path, {**inputs, "at": now_iso(), "known": skipped})
     return "\n".join(lines)
 
 
-def dry_check(directory, path, args, env, base, run):
-    """(verdict, detail) for one check script run on base: FAIL when it reached READY_LINE and failed a predicate (exit 1 with
-    a FAIL line last on stdout), PASS when the behavior already exists there, CRASH otherwise. The log goes to <id>.base.log."""
-    check_id = script_id(path)
-    command = script_command(path)
-    seen = threading.Event()
+def dry_verdict(outcome):
+    """(verdict, why) of a run on base: FAIL when it reached READY_LINE and failed a predicate (exit 1 with a FAIL line last
+    on stdout), PASS when the behavior already exists there, INCONCLUSIVE or ENVIRONMENT on exit 2 or 3, and CRASH or
+    STALLED otherwise."""
+    if outcome["verdict"]:
+        return outcome["verdict"], outcome["reason"]
+    code, last = outcome["code"], f": {outcome['last']}" if outcome["last"] else ""
+    printed = [line for line in outcome["stdout"].splitlines() if line.strip()]
+    if EXIT_VERDICTS.get(code) in ("INCONCLUSIVE", "ENVIRONMENT"):
+        return EXIT_VERDICTS[code], f"exit {code}{last}"
+    if not outcome["ready"]:
+        return "CRASH", f"it never printed \"{READY_LINE}\", so it failed before its instance was up"
+    if code == 0:
+        return "PASS", "the behavior already exists on base"
+    if code == 1 and printed and FAIL_LINE.match(printed[-1].strip()):
+        return "FAIL", "it reached its predicates and one failed"
+    if code == 1:
+        return "CRASH", "exit 1 with no FAIL line last on stdout, so no predicate reported the failure"
+    return "CRASH", f"exit {code}, not the exit 1 of a failed predicate"
 
-    def on_ready():
-        seen.set()
-        if run:
-            run["ready"]()
-    hooks = {"on_start": lambda pid: run.update(pid=pid)} if run else {}
-    output, ended = "", None
-    if not command:
-        verdict, why = "CRASH", f"{path.name} is not executable and has no interpreter for {path.suffix}"
-    else:
-        try:
-            r = run_in_group([*command, *args.rest], args.timeout, cwd=base["path"], env=env, on_ready=on_ready, **hooks)
-            output, ended = (r.stdout + r.stderr).strip("\n"), f"exit {r.returncode}"
-            printed = [line for line in r.stdout.splitlines() if line.strip()]
-            fail_line = bool(printed) and FAIL_LINE.match(printed[-1].strip())
-            if not seen.is_set():
-                verdict, why = "CRASH", f"it never printed \"{READY_LINE}\", so it failed before its instance was up"
-            elif r.returncode == 0:
-                verdict, why = "PASS", "the behavior already exists on base"
-            elif r.returncode == 1 and fail_line:
-                verdict, why = "FAIL", "it reached its predicates and one failed"
-            elif r.returncode == 1:
-                verdict, why = "CRASH", "exit 1 with no FAIL line last on stdout, so no predicate reported the failure"
-            else:
-                verdict, why = "CRASH", f"exit {r.returncode}, not the exit 1 of a failed predicate"
-        except subprocess.TimeoutExpired:
-            verdict, why, ended = "CRASH", f"timed out after {args.timeout}s", f"timed out after {args.timeout}s"
-        except Exception as e:
-            verdict, why = "CRASH", could_not_run(e)
+
+def dry_check(directory, path, args, env, base, run):
+    """(verdict, reason, step) for one check script run on base, graded by dry_verdict. The log goes to <id>.base.log."""
+    check_id = script_id(path)
+    outcome = supervised_run(path, args, env, run, cwd=base["path"])
     if run and run["evicted"]:
-        return "REQUEUED", ""
+        return "REQUEUED", "", None
+    verdict, why = environment_retry(*dry_verdict(outcome), run)
+    if verdict == "ENVIRONMENT":
+        return verdict, why, outcome["step"]
+    ended = f"exit {outcome['code']}" if outcome["code"] is not None else outcome["reason"] if outcome["killed"] else None
     trailer = [f"dryrun: base {base['path']} at {base['head']}", f"dryrun: script sha256 {hashlib.sha256(path.read_bytes()).hexdigest()}",
-               "dryrun: ready" if seen.is_set() else f"dryrun: never printed \"{READY_LINE}\""]
+               "dryrun: ready" if outcome["ready"] else f"dryrun: never printed \"{READY_LINE}\""]
     trailer += [f"dryrun: {ended}"] if ended else []
+    trailer += [f"dryrun: last step {outcome['step']}"] if outcome["step"] else []
+    output = outcome["output"]
     (directory / f"{check_id}{BASE_LOG}").write_text((output + "\n" if output else "") + "\n".join([*trailer, f"dryrun: {verdict} ({why})"]) + "\n")
-    if verdict == "CRASH" and output:
-        why += "\n" + "\n".join(f"    {line}" for line in output.splitlines()[-5:])
-    return verdict, why
+    if verdict == "CRASH" and outcome["code"] is not None and outcome["last"]:
+        why += f"; last line: {outcome['last']}"
+    return verdict, why, outcome["step"]
 
 
 def cmd_dryrun(directory, args):
@@ -2066,46 +2229,72 @@ def cmd_dryrun(directory, args):
     where = {"path": str(base), "head": git("rev-parse", "HEAD", cwd=base)}
     env = {**os.environ, "VERIFY_DIR": str(directory), "VERIFY_DRYRUN": "1"}
     results, lines = run_checks(directory, scripts, args, lambda path, beside, run: dry_check(directory, path, args, env, where, run))
-    tally = collections.Counter(verdict for verdict, _, _ in results.values())
-    for path in scripts:
-        verdict, detail, seconds = results[script_id(path)]
-        head, _, rest = detail.partition("\n")
-        lines.append(f"{verdict:<5} {script_id(path)}  ({seconds:.1f}s)  {head}" + (f"\n{rest}" if rest else ""))
+    tally = collections.Counter(verdict for verdict, *_ in results.values())
+    compact = [compact_line(script_id(p), verdict, seconds, step, detail)
+               for p in scripts for verdict, detail, seconds, step in [results[script_id(p)]]]
+    lines += compact
     summary = (f"dryrun: {len(scripts)} scripts on base {where['head'][:12]}: {tally['FAIL']} fail a predicate, {tally['PASS']} pass "
                f"(behavior already on base), {tally['CRASH']} crash")
-    summary += f", {tally['NOT RUN']} not run for lack of capacity" if tally["NOT RUN"] else ""
+    summary += "".join(f", {tally[v]} {v.lower()}" for v in ("INCONCLUSIVE", "STALLED") if tally[v])
+    summary += f", {tally['NOT-RUN']} not run for lack of capacity" if tally["NOT-RUN"] else ""
     lines.append(summary + (f", {tally['ERROR']} errored before verify recorded the run" if tally["ERROR"] else ""))
-    if tally["CRASH"] or tally["NOT RUN"] or tally["ERROR"]:
+    write_summary(directory, "dryrun", compact)
+    if any(tally[v] for v in ("CRASH", "INCONCLUSIVE", "STALLED", "NOT-RUN", "ERROR")):
         raise Failed("\n" + "\n".join(lines))
     return "\n".join(lines)
 
 
+def base_passes(text):
+    """{check id: why} for each check whose '- Base: passes: <why>' allows it to pass on base."""
+    found = sections(text.splitlines())
+    return {check_id: m.group(1) for name in ("Checks", "Perf") for entry in entries(found.get(name, []))[1]
+            if (check_id := entry_id(entry)) and (m := BASE_PASSES.match(entry["fields"].get("Base", (0, ""))[1]))}
+
+
+def has_step_line(text):
+    return any(STEP_LINE.match(line.strip()) for line in text.splitlines())
+
+
+def dry_run_problems(check_id, script, log, allowed):
+    """(problems, note) for one e2e check's dry run on base."""
+    again = f"`verify.py dryrun --only {check_id} --base <worktree at the base>`"
+    if not log.is_file():
+        return [f"{check_id}: no {log.name}; dry-run the script on base with {again}"], None
+    text = log.read_text(errors="replace")
+    recorded, verdict = DRYRUN_SCRIPT.search(text), DRYRUN_VERDICT.match(last_line(log))
+    if not recorded or not verdict:
+        return [f"{check_id}: {log.name} is not a `verify.py dryrun` log; run {again}"], None
+    if recorded.group(1) != hashlib.sha256(script.read_bytes()).hexdigest():
+        return [f"{check_id}: {script.name} changed since its dry run; run {again}"], None
+    problems = [] if has_step_line(text) else [
+        f"{check_id}: {log.name} holds no '{STEP_FORMAT}' line, so {script.name} reports no progress and a stall waits for the "
+        f"--timeout safety net. Print one, flushed, on entering each step, setup included, then run {again}"]
+    graded = verdict.group(1)
+    if graded in UNGRADED:
+        problems.append(f"{check_id}: it {UNGRADED[graded]} on base: {last_line(log).removeprefix(f'dryrun: {graded} ')}. A script "
+                        f"reaches \"{READY_LINE}\" and fails on a predicate there; fix it, then run {again}")
+    elif graded == "PASS" and check_id not in allowed:
+        problems.append(f"{check_id}: it passes on base, so it shows no new behavior. Fix {script.name} or its helper so it fails "
+                        f"on base, then run {again}; or, when the base already has this behavior, revise the plan with "
+                        f"`verify.py freeze --revision \"<what changed and why>\"` to give {check_id} '{BASE_FIELD}'")
+    elif graded == "PASS":
+        return problems, f"note: {check_id} passes on base, as its Base field allows: {allowed[check_id]}"
+    return problems, None
+
+
 def cmd_scripts(directory, args):
-    _, _, ids, _, tiers = load_plan(directory)
+    _, text, ids, _, tiers = load_plan(directory)
     e2e = [i for i in ids if tiers.get(i) == "e2e"]
     scripts = {script_id(p): p for p in check_scripts(directory)}
+    allowed = base_passes(text)
     problems, notes = [], []
     for check_id in e2e:
         if check_id not in scripts:
             problems.append(f"{check_id}: no {check_id}.check.<ext>; the verifier writes one per e2e check, perf checks included")
             continue
-        log = directory / f"{check_id}{BASE_LOG}"
-        again = f"`verify.py dryrun --only {check_id} --base <worktree at the base>`"
-        if not log.is_file():
-            problems.append(f"{check_id}: no {log.name}; dry-run the script on base with {again}")
-            continue
-        text = log.read_text(errors="replace")
-        recorded = DRYRUN_SCRIPT.search(text)
-        verdict = DRYRUN_VERDICT.match(last_line(log))
-        if not recorded or not verdict:
-            problems.append(f"{check_id}: {log.name} is not a `verify.py dryrun` log; run {again}")
-        elif recorded.group(1) != hashlib.sha256(scripts[check_id].read_bytes()).hexdigest():
-            problems.append(f"{check_id}: {scripts[check_id].name} changed since its dry run; run {again}")
-        elif verdict.group(1) == "CRASH":
-            problems.append(f"{check_id}: it crashed on base: {last_line(log).removeprefix('dryrun: CRASH ')}. A script reaches "
-                            f"\"{READY_LINE}\" and fails on a predicate there; fix it, then run {again}")
-        elif verdict.group(1) == "PASS":
-            notes.append(f"note: {check_id} passes on base, so its behavior already exists there")
+        found, note = dry_run_problems(check_id, scripts[check_id], directory / f"{check_id}{BASE_LOG}", allowed)
+        problems += found
+        notes += [note] if note else []
     if problems:
         raise Failed("\n".join(problems))
     failed = len(e2e) - len(notes)
@@ -2219,27 +2408,39 @@ def cmd_premises(directory, args):
     if not path.is_file():
         raise Failed("\n".join(problems))
     rows = premise_rows(path)
-    covered, false = set(), 0
+    covered, false, new, built = set(), 0, 0, {}
     for number, row in rows:
         named = [i for i in ids if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", row.get("check", ""))]
         covered.update(named)
         holds = row.get("holds", "").strip("*` ").lower()
-        if holds not in ("yes", "no"):
-            problems.append(f"{path}:{number}: Holds must be yes or no, not {row.get('holds', '')!r}")
-        if not row.get("evidence", "").strip("-– ") or PLACEHOLDER.search(row.get("evidence", "")):
-            problems.append(f"{path}:{number}: Evidence is empty; cite the file:line on main that shows whether the premise holds")
-        if holds == "no":
-            false += 1
-            if args.resolved and not row.get("resolution", "").strip("-– "):
-                problems.append(f"{path}:{number}: the premise does not hold and has no Resolution; say how the design resolves it "
-                                "(build what is missing, change the check, or the user's call)")
+        problems += premise_row_problems(path, number, row, holds, args.resolved)
+        false += holds == "no"
+        new += holds == "new"
+        if holds == "new":
+            problems += [f"{path}:{number}: {i} has a second 'new' row (the first is line {built[i]}). What the phase builds gets "
+                         f"one 'new' row per check; merge them, and keep as premises only what {i} assumes already holds on the base"
+                         for i in named if i in built]
+            built.update({i: number for i in named if i not in built})
     if missing := [i for i in ids if i not in covered]:
         problems.append(f"{path}: no premise row for {', '.join(missing)}; every check of the plan gets at least one row")
     if problems:
         raise Failed("\n".join(problems))
     open_note = "" if args.resolved or not false else "; resolve them in the design, then pass `verify.py premises --resolved`"
     return (f"premises ok: {len(rows)} premises cover {len(ids)} checks, {false} do not hold"
-            + (", each with its resolution" if args.resolved and false else "") + open_note)
+            + (", each with its resolution" if args.resolved and false else "") + (f", {new} new" if new else "") + open_note)
+
+
+def premise_row_problems(path, number, row, holds, resolved):
+    """A premises row holds yes, no, or new (built by this phase); yes and no rows cite Evidence, and with resolved a no row
+    names its Resolution."""
+    problems = [] if holds in HOLDS else [
+        f"{path}:{number}: Holds must be yes, no, or new (built by this phase), not {row.get('holds', '')!r}"]
+    if holds != "new" and (not row.get("evidence", "").strip("-– ") or PLACEHOLDER.search(row.get("evidence", ""))):
+        problems.append(f"{path}:{number}: Evidence is empty; cite the file:line on main that shows whether the premise holds")
+    if holds == "no" and resolved and not row.get("resolution", "").strip("-– "):
+        problems.append(f"{path}:{number}: the premise does not hold and has no Resolution; say how the design resolves it "
+                        "(build what is missing, change the check, or the user's call)")
+    return problems
 
 
 def adopted_phase(directory):
@@ -2314,38 +2515,72 @@ def kill_group(pgid):
         os.killpg(pgid, signal.SIGKILL)
 
 
-def run_in_group(command, timeout, on_start=None, on_ready=None, **kwargs):
+def step_window(seconds):
+    return seconds + max(STEP_MARGIN_S, STEP_MARGIN_RATIO * seconds)
+
+
+class Stalled(Exception):
+    """A supervised command passed the deadline its last step line opened, or printed none within FIRST_STEP_S."""
+
+    def __init__(self, progress):
+        step, last = progress["step"], progress["last"]
+        why = f"passed its {progress['window']:g}s deadline" if step else f"no '{STEP_FORMAT}' line within {FIRST_STEP_S:g}s"
+        super().__init__(why + (f"; last line: {last}" if last else ""))
+        self.output = self.stderr = ""
+
+
+def run_in_group(command, timeout, on_start=None, on_ready=None, progress=None, **kwargs):
     """subprocess.run in its own session, so a timeout kills the command and everything it started. on_start gets the
-    pid (the process group), and on_ready runs when stdout prints READY_LINE."""
+    pid (the process group), and on_ready runs when stdout prints READY_LINE. With progress, a dict, each STEP_LINE on
+    stdout opens a deadline (FIRST_STEP_S until the first), and one that passes kills the group and raises Stalled;
+    progress holds the step, its window, and the last output line."""
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, **kwargs) as proc:
         if on_start:
             on_start(proc.pid)
         out, err = [], []
+        if progress is not None:
+            progress.update(step=None, window=FIRST_STEP_S, until=time.monotonic() + FIRST_STEP_S, last="")
 
-        def drain(stream, sink, ready):
+        def drain(stream, sink, stdout):
             for line in stream:
-                if ready and line.rstrip("\n") == READY_LINE:
-                    ready()
-                else:
-                    sink.append(line)
+                text = line.rstrip("\n")
+                if stdout and on_ready and text == READY_LINE:
+                    on_ready()
+                    continue
+                sink.append(line)
+                if progress is None or not text.strip():
+                    continue
+                progress["last"] = text.strip()
+                if stdout and (m := STEP_LINE.match(text.strip())):
+                    window = step_window(float(m.group(2)))
+                    progress.update(step=m.group(1), window=window, until=time.monotonic() + window)
 
-        readers = [threading.Thread(target=drain, args=(proc.stdout, out, on_ready), daemon=True),
-                   threading.Thread(target=drain, args=(proc.stderr, err, None), daemon=True)]
+        readers = [threading.Thread(target=drain, args=(proc.stdout, out, True), daemon=True),
+                   threading.Thread(target=drain, args=(proc.stderr, err, False), daemon=True)]
         for reader in readers:
             reader.start()
         deadline = time.monotonic() + timeout
         try:
-            proc.wait(timeout=timeout)
-            for reader in readers:
-                reader.join(max(0.0, deadline - time.monotonic()))
-            if any(reader.is_alive() for reader in readers):
-                raise subprocess.TimeoutExpired(command, timeout)
-        except subprocess.TimeoutExpired:
+            while proc.poll() is None or any(reader.is_alive() for reader in readers):
+                now = time.monotonic()
+                if now >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if progress is not None and now >= progress["until"]:
+                    raise Stalled(progress)
+                limit = min(deadline, progress["until"]) if progress is not None else deadline
+                wait = min(PROGRESS_POLL_S, limit - now)
+                if proc.poll() is None:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=wait)
+                else:
+                    next((r for r in readers if r.is_alive()), readers[0]).join(wait)
+        except (subprocess.TimeoutExpired, Stalled) as e:
             kill_group(proc.pid)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=KILL_WAIT_S)
             for reader in readers:
                 reader.join(KILL_WAIT_S)
+            e.output, e.stderr = "".join(out), "".join(err)
             raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, "".join(out), "".join(err))
 
@@ -2714,7 +2949,8 @@ def indent(text):
 COMMANDS = {"plan": cmd_plan, "driver": cmd_driver, "freeze": cmd_freeze, "oracles": cmd_oracles, "compare": cmd_compare,
             "report": cmd_report, "decisions": cmd_decisions, "units": cmd_units, "rerun": cmd_rerun, "dryrun": cmd_dryrun,
             "scripts": cmd_scripts, "review": cmd_review, "premises": cmd_premises, "spec": cmd_spec, "script-fix": cmd_script_fix,
-            "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "leftovers": cmd_leftovers, "capacity": cmd_capacity}
+            "phases": cmd_phases, "lock": cmd_lock, "adopt": cmd_adopt, "base": cmd_base, "leftovers": cmd_leftovers,
+            "capacity": cmd_capacity}
 
 
 def main():
@@ -2747,7 +2983,7 @@ def main():
     passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
     args = parser.parse_intermixed_args(argv[:len(argv) - len(passthrough) - 1] if "--" in argv else argv)
     args.rest += passthrough
-    if args.rest and args.command not in ("units", "rerun", "dryrun", "phases", "adopt", "script-fix"):
+    if args.rest and args.command not in ("units", "rerun", "dryrun", "phases", "adopt", "script-fix", "base"):
         parser.error(f"{args.command} takes no arguments")
     if args.jobs is not None and args.jobs < 1:
         parser.error("--jobs needs at least 1")
