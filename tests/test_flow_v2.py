@@ -19,7 +19,7 @@ FEATURE = ROOT / "skills" / "eng" / "feature" / "SKILL.md"
 PHASE = "01-mul"
 
 AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
-GATES = {1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
+GATES = {1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
          7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
 MANDATORY = {1, 2, 3, 4, 5, 7, 8, 10}
 
@@ -94,7 +94,9 @@ UNIT_SPEC = """\
             self.assertEqual(mul(2, 3), 6)
     """
 CHECK_SCRIPT = """\
+    echo "verify: step setup within 30"
     echo "verify: ready"
+    echo "verify: step mul within 10"
     out=$({python} calc.py mul 2 3 --json 2>&1)
     if [ "$out" = '{{"product": 6}}' ]; then echo "PASS E1: mul 2 3 prints 6"; exit 0; fi
     echo "  not ok: expected {{\\"product\\": 6}}, got: $out"
@@ -292,7 +294,7 @@ class FlowV2(unittest.TestCase):
         self.assertIn("A fix group is still working", self.denied(self.bash("python3 ../verify/scripts/verify.py rerun")))
         self.hook("SubagentStop", {"agent_id": "fix-1", "last_assistant_message": "Fixed the error message."})
         self.assertIsNone(self.hook("PreToolUse", self.bash("python3 ../verify/scripts/verify.py rerun")))
-        self.assertRegex(self.verify("rerun"), r"PASS\s+E1")
+        self.assertRegex(self.verify("rerun"), r"E1 PASS ")
         self.assertEqual((where / "E1.rerun.log").read_text().splitlines()[-1], "rerun: PASS")
         (where / "observations.md").write_text('E1: stdout was {"product": 6}\nU1: mul(2, 3) returned 6 in tests/test_mul.py\n')
         written = self.verify("report", "--write", "--author", "codex:gpt-5.6", "--verifier", "claude:sonnet")

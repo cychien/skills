@@ -10,6 +10,7 @@
 - Pass: <a predicate another agent can check against the evidence>
 - Oracle: n/a: <why the result is not a value computed from data>
 - Tier: <e2e, unit, or walk, per the Terms in plan.md; e2e only for core behavior no unit spec can see>
+- Base: <optional, e2e only: 'passes: <why the base already has this behavior>' when this check guards existing behavior; omit otherwise>
 - Agent: <optional: real, fake, or n/a, with why>
 
 ### <id>. <title of a check whose result is computed from data>

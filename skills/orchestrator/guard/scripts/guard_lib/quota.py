@@ -235,10 +235,14 @@ def guard_cli():
 
 
 def spawn_problem(command, cwd, lead):
-    """A deny message when a shell line starts an agent that is limited or reserved for this branch's real-agent checks."""
+    """A deny message when a shell line starts an agent that is limited or reserved for the real-agent checks of the branch
+    it runs on, read from the directory a leading cd moves it to. A cd guard cannot follow reserves nothing, because a
+    false deny stops every agent while a missed reservation costs one run's quota."""
     started = launches(command)
     if not started:
         return None
+    where = shell.workdir(command, cwd)
+    cwd = where or cwd
     limited = limits()
     for agent, launched in started:
         if agent in limited:
@@ -248,7 +252,7 @@ def spawn_problem(command, cwd, lead):
     if any(rest[:1] == ["rerun"] for rest in shell.invocations(command, "verify.py")):
         return None
     others = {a for a, _ in started if a != lead}
-    if not others:
+    if not others or where is None:
         return None
     held = reserved(cwd, lead)
     clash = sorted(others & set(held))

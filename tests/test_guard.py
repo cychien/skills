@@ -1,8 +1,13 @@
+import contextlib
 import datetime
 import hashlib
+import io
 import json
 import os
 import pathlib
+import re
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -472,8 +477,7 @@ class Guard(unittest.TestCase):
             self.assertIn("end the turn or do other work", out["permissionDecisionReason"])
         self.env["GUARD_HEADLESS"] = "1"
         reason = self.hook("PreToolUse", poll)["hookSpecificOutput"]["permissionDecisionReason"]
-        self.assertIn("foreground", reason)
-        self.assertNotIn("end the turn or do other work", reason)
+        self.assertIn("end the turn or do other work", reason, "a non-interactive session waits for its subagent too")
         self.env["GUARD_HEADLESS"] = "0"
         self.assertIsNone(self.hook("PreToolUse", server))
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "sleep 5"}}))
@@ -484,13 +488,16 @@ class Guard(unittest.TestCase):
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
         self.assertEqual(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}})["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_a_headless_session_cannot_end_the_turn_on_background_work(self):
+    def test_a_headless_session_ends_the_turn_on_the_tasks_it_waits_for_but_not_on_a_cron_alone(self):
         self.todo("add", "Ship it")
+        cron = {"id": "c1", "schedule": "* * * * *", "recurring": True, "prompt": "check the run"}
         self.env["GUARD_HEADLESS"] = "1"
-        blocked = self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}])
-        self.assertIn("non-interactive", blocked["reason"])
+        self.assertIsNone(self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}],
+                                    session_crons=[cron]))
+        blocked = self.stop("Waiting for the cron.", background_tasks=[], session_crons=[cron])
+        self.assertIn("exits when the turn ends with only a scheduled cron left, so the cron never fires", blocked["reason"])
         self.env["GUARD_HEADLESS"] = "0"
-        self.assertIsNone(self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}]))
+        self.assertIsNone(self.stop("Waiting for the cron.", background_tasks=[], session_crons=[cron]))
 
     def test_waiting_on_background_work_may_end_the_turn(self):
         self.todo("add", "Implement it")
@@ -1201,6 +1208,208 @@ class Guard(unittest.TestCase):
         self.assertIn("(T3)", self.hook("PreToolUse", codex)["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertIsNone(self.hook("PreToolUse", {**codex, "tool_input": {"command": "codex exec -m gpt-5 -"}}, agent="codex"))
 
+    def plans_where_run(self, plans):
+        """A verify skill whose `where` answers per working directory, and each directory's plan."""
+        self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
+        scripts = self.skills / "verify" / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "verify.py").write_text("import os, sys\nif sys.argv[1:] == ['where']:\n    print(os.path.join(os.getcwd(), 'verification'))\n")
+        for directory, plan in plans.items():
+            (directory / "verification").mkdir(parents=True, exist_ok=True)
+            (directory / "verification" / "plan.md").write_text(plan)
+
+    def test_the_reserved_agent_is_read_from_the_plan_where_the_command_runs(self):
+        self.models()
+        here, worktree = pathlib.Path(self.tmp.name), pathlib.Path(self.tmp.name) / "worktrees" / "phase-2"
+        real = "# Plan\n\n### T1. A real turn\n\n- Agent: real: Codex must choose the command\n"
+        fake = "# Plan\n\n### T1. A fake turn\n\n- Agent: fake: wire logic\n"
+        launches = ["codex exec -m gpt-5 - < review.md", "python3 /x/salvo/scripts/salvo.py run --out /tmp/s codex:d:medium < review.md"]
+        self.plans_where_run({here: real, worktree: fake})
+        for launch in launches:
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launch}})
+            self.assertIn("codex is reserved", out["hookSpecificOutput"]["permissionDecisionReason"], launch)
+            for moved in (f"cd {worktree} && {launch}", f"cd worktrees/phase-2; {launch}", f"cd worktrees && cd phase-2 && {launch}"):
+                self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": moved}}), moved)
+        self.plans_where_run({here: fake, worktree: real})
+        for launch in launches:
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launch}}), launch)
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd '{worktree}' && {launch}"}})
+            self.assertIn("codex is reserved", out["hookSpecificOutput"]["permissionDecisionReason"], launch)
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"ls; cd {worktree} && {launches[0]}"}}),
+                          "only a leading cd moves the command")
+
+    def test_a_cd_whose_target_guard_cannot_know_never_applies_the_reservation(self):
+        self.models()
+        here, home = pathlib.Path(self.tmp.name), pathlib.Path(self.tmp.name) / "home"
+        real = "# Plan\n\n### T1. A real turn\n\n- Agent: real: Codex must choose the command\n"
+        self.plans_where_run({here: real, home: real})
+        self.env["HOME"] = str(home)
+        launch = "codex exec -m gpt-5 - < review.md"
+        for unknown in ("cd -", 'cd "$WORKTREE"', "cd $(git rev-parse --show-toplevel)", "cd `git rev-parse --show-toplevel`",
+                        "cd -P worktrees", "cd worktrees/*"):
+            self.assertIsNone(self.denial(f"{unknown} && {launch}"), unknown)
+        for literal in ("cd '~'", 'cd "~"', "cd \\~"):
+            self.assertIsNone(self.denial(f"{literal} && {launch}"), f"{literal} names the directory '~' here, which has no plan")
+        for moved in ("cd ~", "cd ~/", "cd ."):
+            self.assertIn("codex is reserved", self.denial(f"{moved} && {launch}") or "", moved)
+
+    def denial(self, command):
+        out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+        return out and out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_a_process_match_whose_pattern_matches_its_own_command_line_is_denied(self):
+        for command in ('until ! pgrep -f "C1.check.sh web-4906" >/dev/null; do sleep 3; done', "pgrep -fl 'shop.server' || echo none",
+                        "pkill -f inspector-relay.mjs; sleep 2; node relay.mjs", "running=$(pgrep -af 'next dev')",
+                        "bash -lc 'while pgrep -f build.sh >/dev/null; do sleep 5; done'", "sudo pkill -9 -f cl-test/clean.sh",
+                        "pgrep --full -u justin 'vite --port 5173'"):
+            reason = self.denial(command)
+            self.assertIn("matches the shell that runs this command", reason or "", command)
+            self.assertIn("[v]erify.py", reason, command)
+        for command in ("until ! pgrep -f '[C]1.check.sh web-4906' >/dev/null; do sleep 3; done", "pkill -f '[i]nspector-relay.mjs'",
+                        "pkill -f 'cl-test/clean\\.sh'",
+                        "pgrep -x node", "pgrep node || echo none", "pkill -F /tmp/server.pid", "grep -f patterns.txt server.log",
+                        "echo 'pgrep -f shop.server' >> notes.md", "git commit -m 'stop pkill -f from matching itself'"):
+            self.assertIsNone(self.denial(command), command)
+
+    def test_a_poll_loop_waiting_on_a_verify_run_is_denied(self):
+        for command in ('until ! pgrep -f "[v]erify.py rerun" >/dev/null; do sleep 10; done',
+                        "while ps aux | grep -v grep | grep -q 'verify.py dryrun'; do sleep 5; done",
+                        "python3 ../verify/scripts/verify.py rerun > /tmp/r.out 2>&1 & until grep -q 'PASS\\|FAIL' /tmp/r.out; do sleep 5; done",
+                        "until [ -s .verification/rerun.summary ]; do sleep 5; done; cat .verification/rerun.summary",
+                        "while true; do grep -q done ../verification/dryrun.log && break; sleep 5; done",
+                        "while true; do for f in a b; do echo $f; done; grep -q PASS rerun.out && break; sleep 5; done",
+                        "bash -c 'until test -s rerun.out; do sleep 2; done'"):
+            reason = self.denial(command)
+            self.assertIn("Do not poll for a verify.py rerun or dryrun", reason or "", command)
+            self.assertIn("completion notification arrives on its own", reason, command)
+        for command in ("python3 ../verify/scripts/verify.py rerun > rerun.out 2>&1 &", "nohup python3 ../verify/scripts/verify.py dryrun T1 &",
+                        "python3 ../verify/scripts/verify.py rerun --only T1", "until curl -sf localhost:3000/health; do sleep 1; done",
+                        "cat .verification/rerun.summary", "while read -r line; do echo \"$line\"; done < rerun.summary",
+                        "for i in 1 2 3; do grep -c PASS rerun.out; sleep 1; done"):
+            self.assertIsNone(self.denial(command), command)
+
+    def test_a_loop_is_judged_by_what_decides_its_exit_never_by_a_mention_in_its_body(self):
+        for command in ("while true; do if pgrep -f '[v]erify.py rerun' >/dev/null; then sleep 5; else break; fi; done",
+                        "while :; do [ -s rerun.summary ] && break; sleep 5; done",
+                        "while true; do [ -z \"$(pgrep -f '[v]erify.py dryrun')\" ] && exit 0; sleep 5; done",
+                        "while true; do if [ -s rerun.summary ]; then echo ready; break; fi; sleep 5; done",
+                        "while true; do grep -q PASS rerun.summary && { echo ready; break; }; sleep 5; done",
+                        "while true; do [ -s rerun.summary ] && { echo ready; echo done; break; }; sleep 5; done",
+                        "while true; do { grep -q PASS rerun.summary; } && break; sleep 5; done",
+                        "while true; do (grep -q PASS rerun.summary; echo checked) && break; sleep 5; done"):
+            self.assertIn("Do not poll for a verify.py rerun or dryrun", self.denial(command) or "", command)
+        for command in ("while true; do echo rerun.log; sleep 5; done",
+                        "while sleep 60; do cp rerun.summary backup/; tail -n 1 dryrun.log; done",
+                        "for n in 1 2; do while ! curl -sf localhost:3000; do sleep 1; done; echo rerun.out; done",
+                        "until python3 ../verify/scripts/verify.py rerun --only T1 > rerun.out; do sleep 30; done",
+                        "while true; do python3 ../verify/scripts/verify.py dryrun --only T1 > dryrun.out && break; sleep 30; done",
+                        "while true; do { echo tick; grep -c PASS rerun.out; }; [ -f stop ] && { echo stopping; break; }; sleep 5; done",
+                        "while true; do [ -f stop ] && { grep -c PASS rerun.out; break; }; sleep 5; done",
+                        "while true; do (echo tick; grep -c PASS rerun.out); [ -f stop ] && break; sleep 5; done"):
+            self.assertIsNone(self.denial(command), command)
+
+    def start_watchdog(self):
+        """A real watchdog of session s1 under this test process, with its pid file in place."""
+        dog = subprocess.Popen([sys.executable, str(GUARD), "watch", "--session", "claude:s1", "--interval", "0.2", "--initial", "60"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
+        self.addCleanup(reap, dog)
+        record = pathlib.Path(self.env["GUARD_HOME"]) / "sessions" / "claude-s1.watch.pid"
+        deadline = time.monotonic() + 10
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return dog, record
+
+    def watch_shell(self):
+        return {"id": "bw", "type": "shell", "status": "running", "description": "watchdog",
+                "command": f"python3 {GUARD} watch --session claude:s1"}
+
+    def test_the_lead_cannot_end_its_turn_on_background_work_no_watchdog_watches(self):
+        work = [{"id": "b1", "type": "shell", "status": "running", "description": "rerun", "command": "python3 verify.py rerun"}]
+        self.assertIsNone(self.stop("Waiting."))
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[]))
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[{"id": "m1", "type": "MCP task", "status": "running"}]))
+        blocked = self.stop("Waiting.", background_tasks=work)
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("Background work is in flight (python3 verify.py rerun) and no watchdog watches it", blocked["reason"])
+        self.assertIn(f"python3 {GUARD} watch --session claude:s1\n", blocked["reason"])
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[*work, self.watch_shell()]))
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a1", "last_assistant_message": "done", "background_tasks": work}))
+        dog, record = self.start_watchdog()
+        token = json.loads(record.read_text())["token"]
+        self.assertRegex(token, r"^[0-9a-f]{32}$")
+        live = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(dog.pid)], capture_output=True, text=True).stdout.strip()
+        self.assertTrue(live.endswith(f" watch --session claude:s1 --interval 0.2 --initial 60 --token {token}"), live)
+        self.assertIsNone(self.stop("Waiting.", background_tasks=work))
+        r = subprocess.run([sys.executable, str(GUARD), "watch", "--stop", "--session", "claude:s1"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.stdout, f"Stopped the watchdog (pid {dog.pid}).\n")
+        self.assertEqual(dog.wait(10), 0)
+        self.assertFalse(record.exists())
+        self.assertEqual(self.stop("Waiting.", background_tasks=work)["decision"], "block")
+
+    def test_the_watchdog_rule_lets_a_stuck_lead_go_after_three_blocks_until_the_next_prompt(self):
+        work = [{"id": "b1", "type": "subagent", "status": "running", "description": "verifier"}]
+        for _ in range(3):
+            self.assertEqual(self.stop("Waiting.", background_tasks=work)["decision"], "block")
+        self.assertIsNone(self.stop("Waiting.", background_tasks=work))
+        self.hook("UserPromptSubmit", {"prompt": "go on"})
+        self.assertEqual(self.stop("Waiting.", background_tasks=work)["decision"], "block")
+
+    def test_a_session_where_no_watchdog_can_run_is_not_held_and_a_headless_one_stops_a_watchdog_left_alone(self):
+        sessions = pathlib.Path(self.env["GUARD_HOME"]) / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "claude-s1.json").write_text(json.dumps({"watch_unavailable": {"at": 1, "why": "no agent"}}))
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[{"id": "b1", "type": "shell", "command": "sleep 300"}]))
+        (sessions / "claude-s1.json").write_text("{}")
+        dog, _ = self.start_watchdog()
+        self.assertIsNone(self.stop("Done.", background_tasks=[self.watch_shell()]))
+        self.assertIsNone(dog.poll(), "an interactive session keeps its watchdog between turns")
+        with mock.patch.dict(self.env, GUARD_HEADLESS="1"):
+            self.assertIsNone(self.stop("Done.", background_tasks=[self.watch_shell(), {"id": "b1", "type": "shell", "command": "sleep 9"}]))
+            self.assertIsNone(dog.poll(), "a watchdog beside other work keeps watching it")
+            self.assertIsNone(self.stop("Done.", background_tasks=[self.watch_shell()]))
+        self.assertEqual(dog.wait(10), 0, "a non-interactive session would wait on a lone watchdog forever")
+
+    def test_a_delegates_work_left_after_its_hand_back_holds_the_leads_turn_until_it_stops(self):
+        watched = [self.watch_shell()]
+
+        def launch(agent_id, task):
+            self.hook("PostToolUse", {"agent_id": agent_id, "tool_name": "Bash", "tool_input": {"command": "sleep 47", "run_in_background": True},
+                                      "tool_response": {"stdout": "", "backgroundTaskId": task}})
+
+        def hand_back(agent_id, success=True):
+            self.hook("PostToolUse", {"agent_id": agent_id, "tool_name": "SubagentHandback", "tool_input": {"message": "done"},
+                                      "tool_response": {"success": success, "message": "Report delivered to your caller."}})
+        for agent_id in ("a1", "a2", "a3"):
+            self.hook("SubagentStart", {"agent_id": agent_id, "agent_type": "general-purpose"})
+        launch("a1", "bx")
+        launch("a2", "by")
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[*watched, {"id": "bx", "type": "shell", "command": "sleep 47"}]))
+        hand_back("a1")
+        hand_back("a2", success=False)
+        work = [*watched, {"id": "bx", "type": "shell", "status": "running", "command": "sleep 47"},
+                {"id": "by", "type": "shell", "status": "running", "command": "sleep 47"}]
+        blocked = self.stop("Waiting.", background_tasks=work)
+        self.assertEqual(blocked["reason"], "These delegates handed back, but their work still runs, holding the machine and hiding "
+                                            "which job causes a later problem:\n   bx: shell sleep 47, of delegate a1\nStop each "
+                                            "with your agent's task-stop tool (Claude Code: TaskStop with the id), then end the turn.")
+        self.assertIn("   a1: subagent probe", self.stop("Waiting.", background_tasks=[
+            *watched, {"id": "a1", "type": "subagent", "status": "running", "description": "probe"}])["reason"])
+        self.assertIsNone(self.stop("Waiting.", background_tasks=watched))
+        self.hook("PreToolUse", {"tool_name": "SendMessage", "tool_input": {"to": "a1", "message": "one more thing"}})
+        self.assertIsNone(self.stop("Waiting.", background_tasks=work))
+        launch("a3", "bz")
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a3", "last_assistant_message": "a3 done"}))
+        self.assertIn("   bz: shell sleep 47, of delegate a3", self.stop("Waiting.", background_tasks=[
+            *watched, {"id": "bz", "type": "shell", "status": "running", "command": "sleep 47"}])["reason"])
+        self.hook("SubagentStart", {"agent_id": "a3", "agent_type": "general-purpose"})
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[*watched, {"id": "bz", "type": "shell", "command": "sleep 47"}]))
+
+
+def reap(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
 
 FEATURE_V2 = """\
 ---
@@ -1210,7 +1419,7 @@ description: x
 
 # Feature
 
-1. Clarify the requirements and run the basic checks. Close this step only when `../verify/scripts/verify.py plan --checks` passes. Mandatory: no skip-with-reason escape.
+1. Clarify the requirements and run the basic checks. Close this step only when `../verify/scripts/verify.py base` and `../verify/scripts/verify.py plan --checks` pass. Mandatory: no skip-with-reason escape.
 2. Ground in the code with the how skill (`../how/SKILL.md`) and check every check's premises. Close this step only when `../verify/scripts/verify.py premises` passes.
 3. Design. Read the principles index (`../principles/SKILL.md`) and the principles you apply. Close this step only when `../verify/scripts/verify.py plan` and `../verify/scripts/verify.py premises --resolved` pass.
 4. Lock. Close this step only when `../verify/scripts/verify.py lock` passes. Mandatory: no skip-with-reason escape.
@@ -1222,7 +1431,7 @@ description: x
 10. Close, then open the PR with the open-pr skill (`../open-pr/SKILL.md`). Close this step only when `../verify/scripts/verify.py report`, `../verify/scripts/verify.py spec` and `../verify/scripts/verify.py leftovers` pass. Mandatory: no skip-with-reason escape.
 """
 FEATURE_V2_AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
-FEATURE_V2_GATES = {1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
+FEATURE_V2_GATES = {1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
                     7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
 REPO_FEATURE = ROOT / "skills" / "eng" / "feature" / "SKILL.md"
 
@@ -1307,7 +1516,7 @@ class ShippedPlaybooks(unittest.TestCase):
     def test_feature_tests_premises_locks_before_code_reviews_before_the_e2e_run_and_gates_the_pr(self):
         mandatory = self.gated_mandatory_steps("feature")
         self.assertEqual(mandatory, {
-            1: {"plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"},
+            1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"},
             5: {"units"}, 7: {"review"}, 8: {"oracles"}, 10: {"report", "spec", "leftovers"},
         })
 
@@ -1336,6 +1545,303 @@ class ShippedPlaybooks(unittest.TestCase):
     def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
         mandatory = self.gated_mandatory_steps("plan-feature")
         self.assertEqual(mandatory, {5: {"phases"}})
+
+FAKE_AGENT = """\
+import json, os, subprocess, sys, time
+spec = json.loads(sys.argv[1])
+d = spec["dir"]
+
+def publish(name, value):
+    with open(os.path.join(d, name + ".tmp"), "w") as f:
+        f.write(json.dumps(value))
+    os.replace(os.path.join(d, name + ".tmp"), os.path.join(d, name))
+
+jobs = {}
+for name, command in spec["jobs"].items():
+    out = open(os.path.join(d, name + ".out"), "w")
+    jobs[name] = subprocess.Popen(["/bin/sh", "-c", command + "\\nexit $?"], stdout=out, stderr=subprocess.STDOUT,
+                                  start_new_session=True).pid
+publish("jobs.json", jobs)
+while not os.path.exists(os.path.join(d, "go")):
+    time.sleep(0.05)
+for i, watch in enumerate(spec["watch"]):
+    dog = subprocess.Popen(["/bin/sh", "-c", watch + "\\nexit $?"], stdout=open(os.path.join(d, f"watch{i}.out"), "w"),
+                           stderr=subprocess.STDOUT)
+    publish(f"watch{i}.pid", dog.pid)
+    if i + 1 < len(spec["watch"]):
+        time.sleep(1)
+publish("exit.json", dog.wait())
+time.sleep(600)
+"""
+
+
+class Watch(unittest.TestCase):
+    """The watchdog on real processes: a fake agent (a process that is not a shell) runs each job in a shell of its own,
+    with its output in a file, the way an agent harness runs background jobs, then starts the watchdog the same way."""
+
+    SESSION = "claude:w1"
+
+    @classmethod
+    def scenario(cls, tmp, jobs, watch=None, ack=(), initial=1.5):
+        d = pathlib.Path(tmp)
+        env = {**os.environ, "GUARD_HOME": str(d / "guard")}
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} watch --session {cls.SESSION} --interval 0.2 --initial {initial}"
+        (d / "agent.py").write_text(FAKE_AGENT)
+        spec = {"dir": str(d), "jobs": jobs, "watch": watch or [command]}
+        agent = subprocess.Popen([sys.executable, str(d / "agent.py"), json.dumps(spec)], env=env, start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pids = {}
+        try:
+            pids = json.loads(wait_for(d / "jobs.json"))
+            for name in ack:
+                r = subprocess.run([sys.executable, str(GUARD), "watch", "--ack", str(pids[name]), "--session", cls.SESSION],
+                                   capture_output=True, text=True, env=env)
+                assert r.returncode == 0, r.stdout + r.stderr
+        except BaseException:
+            cls.end(agent, pids)
+            raise
+        (d / "go").touch()
+        return agent, pids, env
+
+    @staticmethod
+    def end(agent, pids):
+        for pid in [*pids.values(), agent.pid]:
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+        agent.wait()
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        jobs = {"silent": "sleep 30", "printer": "while :; do echo tick $(date +%s); sleep 0.2; done",
+                "busy": f"{shlex.quote(sys.executable)} -c 'while True: pass'",
+                "children": "i=0; while :; do i=$((i+1)); sleep 0.3$i; done", "idle": "sleep 31"}
+        started = time.monotonic()
+        agent, cls.pids, _ = cls.scenario(cls.tmp.name, jobs, ack=["idle"])
+        try:
+            cls.exit = json.loads(wait_for(pathlib.Path(cls.tmp.name) / "exit.json", 20))
+            cls.elapsed = time.monotonic() - started
+            cls.report = (pathlib.Path(cls.tmp.name) / "watch0.out").read_text()
+        finally:
+            cls.end(agent, cls.pids)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def reported(self):
+        return {int(m) for m in re.findall(r"^pid (\d+) silent", self.report, re.M)}
+
+    def test_a_silent_sleep_job_is_reported_and_the_watchdog_exits_zero(self):
+        self.assertEqual(self.exit, 0, self.report)
+        self.assertIn(self.pids["silent"], self.reported(), self.report)
+        self.assertRegex(self.report, rf"(?m)^pid {self.pids['silent']} silent \d\.\ds \(asks after 1\.5s; no progress since the watchdog "
+                                      rf"started\): sleep 30; last output: \(none\) \[.*silent\.out\]$")
+        self.assertIn(f"acknowledge one meant to idle with `python3 {GUARD} watch --ack <pid> --session {self.SESSION}`", self.report)
+        self.assertLess(self.elapsed, 15)
+
+    def test_a_job_that_prints_steadily_is_not_reported(self):
+        self.assertNotIn(self.pids["printer"], self.reported(), self.report)
+
+    def test_a_silent_job_that_keeps_the_cpu_busy_is_not_reported(self):
+        self.assertNotIn(self.pids["busy"], self.reported(), self.report)
+
+    def test_a_job_whose_children_change_is_not_reported(self):
+        self.assertNotIn(self.pids["children"], self.reported(), self.report)
+
+    def test_an_acknowledged_process_is_not_reported(self):
+        self.assertNotIn(self.pids["idle"], self.reported(), self.report)
+        self.assertEqual(self.reported(), {self.pids["silent"]}, self.report)
+
+    def test_a_second_watchdog_of_the_session_refuses_to_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} watch --session {self.SESSION} --interval 0.2 --initial 60"
+            agent, pids, _ = self.scenario(tmp, {"silent": "sleep 30"}, watch=[first, first])
+            try:
+                self.assertEqual(json.loads(wait_for(pathlib.Path(tmp) / "exit.json", 20)), 3)
+                self.assertRegex((pathlib.Path(tmp) / "watch1.out").read_text(),
+                                 r"^guard watch: a watchdog already watches this session \(pid \d+\); nothing to start\.\n$")
+                first_dog = json.loads((pathlib.Path(tmp) / "guard" / "sessions" / "claude-w1.watch.pid").read_text())["pid"]
+                self.assertTrue(proc_alive(first_dog))
+            finally:
+                self.end(agent, pids)
+
+    def test_the_watchdog_exits_when_its_agent_process_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent, pids, _ = self.scenario(tmp, {"printer": "while :; do echo tick; sleep 0.2; done"}, initial=60)
+            record = pathlib.Path(tmp) / "guard" / "sessions" / "claude-w1.watch.pid"
+            try:
+                dog = json.loads(wait_for(record))["pid"]
+                self.assertTrue(proc_alive(dog))
+                os.kill(agent.pid, signal.SIGKILL)
+                agent.wait()
+                deadline = time.monotonic() + 10
+                while proc_alive(dog) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(proc_alive(dog))
+                self.assertFalse(record.exists())
+            finally:
+                self.end(agent, pids)
+
+    def test_the_threshold_grows_for_a_job_with_long_natural_gaps_and_never_drops_below_the_initial_value(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import procs, watch
+        root = procs.Process(10, 1, 0.0, 0.0, "sh -c job")
+
+        def job_with(beats):
+            job, cpu = watch.Job(root, 0.0), 0.0
+            for t in range(0, 200, 5):
+                cpu += 1.0 if t in beats else 0.001
+                job.observe({10: root._replace(cpu=cpu)}, [10], {}, float(t), watch.CPU_FLOOR)
+            return job
+        steady, slow = job_with(set(range(0, 200, 10))), job_with({0, 40, 80, 120})
+        self.assertEqual((steady.events, steady.longest), (19, 10.0))
+        self.assertEqual(steady.threshold(30, 3, 3), 30)
+        self.assertEqual((slow.events, slow.longest), (3, 40.0))
+        self.assertEqual(slow.threshold(30, 3, 3), 120)
+        self.assertEqual(slow.threshold(30, 3, 4), 30, "too few events yet: the initial value")
+        self.assertEqual(job_with(set()).events, 0, "CPU under the floor is no progress")
+
+    def test_with_no_agent_process_above_it_the_watchdog_says_so_and_watches_nothing(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import procs, state, watch
+        rows = {pid: procs.Process(pid, parent, 0.0, 0.0, command) for pid, parent, command in
+                ((1, 0, "/sbin/launchd"), (5, 1, "-zsh"), (6, 5, "bash -c x"), (7, 6, "python3 guard.py watch"))}
+        self.assertEqual(watch.find_agent(rows, me=7), (None, None))
+        rows[5] = rows[5]._replace(command="node agent.js")
+        self.assertEqual(watch.find_agent(rows, me=7), (rows[5], 6))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(state, "SESSIONS", pathlib.Path(tmp)), \
+                mock.patch.object(procs, "table", return_value={**rows, 5: rows[5]._replace(command="-zsh")}), \
+                mock.patch.object(os, "getpid", return_value=7), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(watch.run("claude", "w2", "t-me"), watch.NO_AGENT)
+            self.assertIn("found no agent process above this one", out.getvalue())
+            self.assertIn("no agent process", state.load("claude", "w2")["watch_unavailable"]["why"])
+
+
+class WatchIdentity(unittest.TestCase):
+    """The watchdog with a faked process table: what it does when ps fails, and whom its pid file names."""
+
+    def setUp(self):
+        sys.path.insert(0, str(GUARD.parent))
+        self.addCleanup(sys.path.remove, str(GUARD.parent))
+        from guard_lib import procs, state, watch
+        self.procs, self.state, self.watch = procs, state, watch
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.enterContext(mock.patch.object(state, "SESSIONS", pathlib.Path(tmp.name)))
+        self.record = state.watch_path("claude", "w3")
+
+    def ps(self, *rows):
+        """A ps run that lists rows of (pid, ppid, seconds since start, command), this process included."""
+        out = "".join(f"{pid} {ppid} {age // 60:02d}:{age % 60:02d} 0:00.01 {command}\n" for pid, ppid, age, command in rows)
+        return subprocess.CompletedProcess(["ps"], 0, out, "")
+
+    def tree(self, other):
+        """An agent (100) with a shell (200) running this process as the watchdog, beside other."""
+        return self.ps((100, 1, 600, "/usr/local/bin/agent"), (200, 100, 300, "-zsh"),
+                       (os.getpid(), 200, 1, "python3 guard.py watch --session claude:w3"), other)
+
+    def write(self, **fields):
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        self.record.write_text(json.dumps({"pid": 300, "session": "claude:w3", "agent": 100, "since": 0, **fields}))
+
+    def test_a_failed_ps_is_unknown_never_no_processes(self):
+        for failure in (FileNotFoundError("ps"), subprocess.CompletedProcess(["ps"], 1, "", "ps: sysctl failed")):
+            with mock.patch.object(self.procs.subprocess, "run", side_effect=[failure]), self.assertRaises(self.procs.Unseen):
+                self.procs.table()
+
+    def test_a_ps_failure_during_the_claim_never_takes_over_a_live_watchdogs_pid_file(self):
+        self.write(token="t-other")
+        before = self.record.read_text()
+        other = (300, 200, 50, "python3 guard.py watch --session claude:w3 --token t-other")
+        with mock.patch.object(self.procs.subprocess, "run", side_effect=[self.tree(other), FileNotFoundError("ps")]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.watch.run("claude", "w3", "t-me", interval=0), self.watch.UNSEEN)
+        self.assertIn("cannot tell whether another watchdog of this session runs; nothing started", out.getvalue())
+        self.assertEqual(self.record.read_text(), before)
+
+    def test_a_watchdog_that_cannot_see_processes_exits_with_an_error_instead_of_staying_forever(self):
+        other = (400, 1, 5, "sleep 5")
+        failures = [FileNotFoundError("ps")] * self.watch.UNSEEN_SAMPLES
+        with mock.patch.object(self.procs.subprocess, "run", side_effect=[self.tree(other), self.tree(other), *failures]), \
+                mock.patch.object(self.watch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.watch.run("claude", "w3", "t-me", interval=0), self.watch.UNSEEN)
+        self.assertIn(f"cannot list processes: {self.watch.UNSEEN_SAMPLES} samples in a row failed", out.getvalue())
+        self.assertIn("cannot list processes", self.state.load("claude", "w3")["watch_unavailable"]["why"])
+        self.assertFalse(self.record.exists())
+
+    def test_the_pid_file_is_trusted_and_signaled_only_for_the_watchdog_whose_command_line_carries_its_token(self):
+        now, mine = time.time(), "python3 guard.py watch --session claude:w3 --token t-mine"
+
+        def table(command):
+            return mock.patch.object(self.procs, "table", return_value={300: self.procs.Process(300, 200, now - 50, 0.0, command)})
+
+        def ps(command):
+            listed = subprocess.CompletedProcess(["ps"], 0, f"{command}\n", "") if command else subprocess.CompletedProcess(["ps"], 1, "", "")
+            return mock.patch.object(self.procs.subprocess, "run", return_value=listed)
+
+        def no_pidfd():
+            return mock.patch.object(self.procs.os, "pidfd_open", side_effect=OSError(38, "Function not implemented"), create=True)
+        cases = {"a pid reused within seconds by another session's watchdog":
+                 (dict(started=now - 50, token="t-mine"), "python3 guard.py watch --session claude:other --token t-other"),
+                 "the same pid and start with another token": (dict(started=now - 50, token="t-mine"), mine.replace("t-mine", "t-old")),
+                 "a token that is only a prefix of the live one": (dict(started=now - 50, token="t-mi"), mine),
+                 "a record of another session": (dict(started=now - 50, token="t-mine", session="claude:other"), mine),
+                 "a record that names no token": (dict(started=now - 50), mine)}
+        for case, (fields, command) in cases.items():
+            self.write(**fields)
+            with table(command), ps(command), no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill:
+                self.assertIsNone(self.watch.alive("claude", "w3"), case)
+                self.assertIsNone(self.watch.stop("claude", "w3"), case)
+                kill.assert_not_called()
+        self.write(started=now - 50, token="t-mine")
+        for case, then in {"the pid changed hands between the check and the signal": "sleep 60",
+                           "the watchdog ended between the check and the signal": None}.items():
+            with table(mine), ps(then), no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill:
+                self.assertIsNone(self.watch.stop("claude", "w3"), case)
+                kill.assert_not_called()
+        with table(mine), ps(mine), no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill:
+            self.assertEqual(self.watch.alive("claude", "w3")["pid"], 300)
+            self.assertEqual(self.watch.stop("claude", "w3"), 300)
+            kill.assert_called_once_with(300, signal.SIGTERM)
+        for failing in (mock.patch.object(self.procs, "table", side_effect=self.procs.Unseen("ps failed")),
+                        mock.patch.object(self.procs.subprocess, "run", side_effect=FileNotFoundError("ps"))):
+            with table(mine), failing, no_pidfd(), mock.patch.object(self.watch.os, "kill") as kill, self.assertRaises(self.procs.Unseen):
+                self.watch.stop("claude", "w3")
+            kill.assert_not_called()
+
+    def test_where_pidfds_exist_the_signal_goes_through_one_opened_before_the_command_line_is_read(self):
+        calls = mock.Mock()
+        calls.pidfd_open.side_effect = lambda _: os.open(os.devnull, os.O_RDONLY)
+        calls.command.return_value = "python3 guard.py watch --token t-mine"
+        with mock.patch.object(self.procs.os, "pidfd_open", calls.pidfd_open, create=True), \
+                mock.patch.object(self.procs.signal, "pidfd_send_signal", calls.send, create=True), \
+                mock.patch.object(self.procs, "command", calls.command), mock.patch.object(self.procs.os, "kill", calls.kill):
+            self.assertTrue(self.procs.signal_if(4242, lambda command: command.endswith("--token t-mine"), signal.SIGTERM))
+            self.assertFalse(self.procs.signal_if(4242, lambda command: command.endswith("--token t-other"), signal.SIGTERM))
+        self.assertEqual([name for name, *_ in calls.mock_calls], ["pidfd_open", "command", "send", "pidfd_open", "command"])
+        calls.kill.assert_not_called()
+
+
+def wait_for(path, wait=10):
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError):
+            return path.read_text()
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never appeared")
+
+
+def proc_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return not subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip().startswith("Z")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ class Event:
     last_message: str = ""
     stop_hook_active: bool = False
     waiting_on_background: bool = False
+    background_tasks: list = None
     can_inject: bool = True
     stop_status: str = None
     hold: dict = None

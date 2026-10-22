@@ -60,6 +60,7 @@ def parse(agent, native_event, payload):
         last_message=_get(payload, "last_assistant_message", "prompt_response", default="") or "",
         stop_hook_active=bool(_get(payload, "stop_hook_active", default=False)) or (payload.get("loop_count") or 0) > 0,
         waiting_on_background=background,
+        background_tasks=payload["background_tasks"] if isinstance(payload.get("background_tasks"), list) else None,
         can_inject=kind in INJECTS[agent],
         stop_status=payload.get("status"),
     )

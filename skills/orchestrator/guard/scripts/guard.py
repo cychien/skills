@@ -18,6 +18,10 @@ usage:
   guard.py quota pick --role <planner|executor> [--avoid AGENT[:MODEL] ...] [--relax]
   guard.py delegates [--session AGENT:ID]                the subagents guard tracks, and whether each still runs
   guard.py delegates end <id> --reason TEXT [--session AGENT:ID]  the lead ends one it confirmed gone
+  guard.py watch [--session AGENT:ID] [--interval S] [--initial S] [--multiple N] [--events N] [--cpu-floor F]
+                                                         run as a background job: exit with a report when a job goes silent
+  guard.py watch --ack <pid> [--session AGENT:ID]        never ask about this intentionally idle process again
+  guard.py watch --stop [--session AGENT:ID]             end the session's watchdog
 
 A subagent adds --agent ID (its agent id, which guard names when it asks) to every todo command, so its list stays its own.
 An item copied from a skill closes only with the token `todo show` prints for it, and only once the items it waits on resolve.
@@ -31,7 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from guard_lib import autonomy, gates, lint, order, proof, quota, skills, state  # noqa: E402
+from guard_lib import autonomy, gates, lint, order, procs, proof, quota, skills, state, watch  # noqa: E402
 
 MARKS = {"open": "[ ]", "waiting": "[?]", "done": "[x]", "skipped": "[-]"}
 NOT_RUN_DEPRECATED = ("guard: --not-run is deprecated and ignored: an item no longer needs the skills it names read first. "
@@ -270,6 +274,25 @@ def run_delegates(args):
         print(f"{agent_id}  {status}  since {quota.clock(delegate['since'])}  last tool call {int(now - last)}s ago")
 
 
+def run_watch(args):
+    agent, sid = session(args.session)
+    if args.ack is not None:
+        print(watch.ack(agent, sid, args.ack))
+        return
+    if args.stop:
+        try:
+            stopped = watch.stop(agent, sid)
+        except procs.Unseen as e:
+            sys.exit(f"guard: cannot list processes ({e}), so the watchdog's identity cannot be checked and nothing was signaled.")
+        print(f"Stopped the watchdog (pid {stopped})." if stopped else "No watchdog runs for this session.")
+        return
+    if args.token is None:
+        # Same pid, now with a token on its own command line that names this watchdog alone.
+        os.execv(sys.executable, [*getattr(sys, "orig_argv", [sys.executable, *sys.argv]), "--token", watch.new_token()])
+    sys.exit(watch.run(agent, sid, args.token, interval=args.interval, initial=args.initial, multiple=args.multiple, events=args.events,
+                       cpu_floor=args.cpu_floor))
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -316,10 +339,26 @@ def main():
     d.add_argument("id", nargs="?")
     d.add_argument("--reason")
     d.add_argument("--session")
+    w = sub.add_parser("watch", description="Ask the lead about background jobs that went silent; never stop one.")
+    w.add_argument("--session")
+    w.add_argument("--ack", type=int, metavar="PID", help="acknowledge an intentionally idle process: never ask about it again")
+    w.add_argument("--stop", action="store_true", help="end the session's watchdog")
+    w.add_argument("--token", help=argparse.SUPPRESS)
+    w.add_argument("--interval", type=float, default=watch.INTERVAL_S, help="seconds between samples (default %(default)g)")
+    w.add_argument("--initial", type=float, default=watch.INITIAL_S,
+                   help="seconds of silence before a question while a job has too few progress events to judge its rhythm, "
+                        "and the least it ever waits (default %(default)g)")
+    w.add_argument("--multiple", type=float, default=watch.MULTIPLE,
+                   help="a job is silent after this many times its longest gap between progress events (default %(default)g)")
+    w.add_argument("--events", type=int, default=watch.EVENTS,
+                   help="progress events a job shows before its own gaps set its threshold (default %(default)d)")
+    w.add_argument("--cpu-floor", type=float, default=watch.CPU_FLOOR,
+                   help="share of one core a job's processes must use between samples for CPU time to count as progress, "
+                        "so idle timers and pollers do not (default %(default)g)")
     args = parser.parse_args()
     if args.cmd == "delegates" and args.action == "end" and not (args.id and args.reason):
         parser.error("delegates end takes an id and --reason")
-    {"todo": run_todo, "lint": run_lint, "quota": run_quota, "delegates": run_delegates}[args.cmd](args)
+    {"todo": run_todo, "lint": run_lint, "quota": run_quota, "delegates": run_delegates, "watch": run_watch}[args.cmd](args)
 
 
 if __name__ == "__main__":
