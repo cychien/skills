@@ -371,12 +371,12 @@ class Verify(unittest.TestCase):
 
     def test_rerun_runs_every_saved_check_script_and_reports_each_verdict(self):
         self.check_script("B1.check.sh", "echo \"args: $*\" > \"$(dirname \"$0\")/B1.args\"\nexit 0\n")
-        self.check_script("B2.check.py", "import sys\nprint('observed 2 rows')\nsys.exit(1)\n")
+        self.check_script("B2.check.py", "import sys\nprint('FAIL B2: observed 2 rows')\nsys.exit(1)\n")
         self.check_script("B3.check.sh", "#!/bin/sh\nexit 0\n", 0o755)
         self.write("B1.observed.json", "{}")
         out = self.run_verify("rerun", "inst-7", "extra", ok=False)
         self.assertRegex(out, r"B1 PASS")
-        self.assertRegex(out, r"\nB2 FAIL \d+\.\ds exit 1: observed 2 rows\n")
+        self.assertRegex(out, r"\nB2 FAIL \d+\.\ds exit 1: FAIL B2: observed 2 rows\n")
         self.assertIn("observed 2 rows", out)
         self.assertRegex(out, r"B3 PASS")
         self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL", out)
@@ -416,7 +416,7 @@ class Verify(unittest.TestCase):
         self.assertNotIn("evidence/B1", out)
 
     MEET = ('d="$(dirname "$0")"; touch "$d/{me}.started"; echo "verify: ready"\n'
-            'for i in $(seq 30); do [ -e "$d/{other}.started" ] && exit 0; sleep 0.1; done\necho "{other} never ran beside it"; exit 1\n')
+            'for i in $(seq 30); do [ -e "$d/{other}.started" ] && exit 0; sleep 0.1; done\necho "FAIL {me}: {other} never ran beside it"; exit 1\n')
 
     def meeting_checks(self):
         self.new_prove()
@@ -427,7 +427,7 @@ class Verify(unittest.TestCase):
 
     def test_rerun_jobs_runs_scripts_side_by_side_and_reports_them_in_id_order(self):
         self.meeting_checks()
-        self.assertRegex(self.run_verify("rerun", "--jobs", "1", ok=False), r"B1 FAIL \d+\.\ds exit 1: B2 never ran beside it\n")
+        self.assertRegex(self.run_verify("rerun", "--jobs", "1", ok=False), r"B1 FAIL \d+\.\ds exit 1: FAIL B1: B2 never ran beside it\n")
         self.meeting_checks()
         out = self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
         self.assertRegex(out, r"^B1 PASS .*\nB2 PASS .*\nrerun: 2 checks, 2 PASS, 0 FAIL\n$")
@@ -540,7 +540,7 @@ class Verify(unittest.TestCase):
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; n=$(cat "$d/B2.count" 2>/dev/null || echo 0); echo $((n + 1)) > "$d/B2.count"\n'
                                          'echo "verify: ready"; [ "$n" = 0 ] && { sleep 5; echo "never stopped"; exit 1; }\n'
                                          '[ -e "$d/B1.done" ] || { echo "ran beside B1 after the requeue"; exit 1; }; exit 0\n')
-        self.check_script("B3.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B3.runs"; exit 1\n')
+        self.check_script("B3.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B3.runs"; echo "FAIL B3"; exit 1\n')
 
         def load():
             path = self.dir / "B2.count"
@@ -606,10 +606,10 @@ class Verify(unittest.TestCase):
         self.assertEqual((self.dir / "B1.rerun.log").read_text(), "3 records\nrerun: PASS\n")
         os.utime(self.dir / "B1.rerun.log", (1, 1))
         self.assertIn("B1.rerun.log is missing or predates the frozen plan", self.run_verify("report", ok=False))
-        self.check_script("B1.check.sh", "echo 2 records\nexit 1\n")
+        self.check_script("B1.check.sh", "echo FAIL B1: 2 records\nexit 1\n")
         self.run_verify("script-fix", "B1.check.sh", "--reason", "the fixture now holds 2 records; agreed by the user")
         self.run_verify("rerun", "--only", "B1", ok=False)
-        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "2 records\nrerun: FAIL (exit 1: 2 records)\n")
+        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "FAIL B1: 2 records\nrerun: FAIL (exit 1: FAIL B1: 2 records)\n")
         self.assertIn("B1.rerun.log records a failing run; a PASS needs a passing `verify.py rerun`", self.run_verify("report", ok=False))
         self.write("report.md", plan(REPORT).replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
                    .replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |", "| B1 | FAIL | B1.rerun.log | defect: 2 records |"))
@@ -820,7 +820,7 @@ class Verify(unittest.TestCase):
 
     def test_a_check_the_report_marks_fail_gets_two_failed_fix_attempts_then_every_rerun_skips_it(self):
         self.check_script("B1.check.sh", "exit 0\n")
-        self.check_script("B2.check.sh", "echo still 2 rows\nexit 1\n")
+        self.check_script("B2.check.sh", "echo FAIL B2: still 2 rows\nexit 1\n")
         self.assertNotIn("fix attempt", self.run_verify("rerun", "--only", "B2", ok=False))
         self.assertFalse((self.dir / "fix-attempts.json").exists())
         self.write("report.md", self.FAIL_REPORT)
@@ -836,7 +836,7 @@ class Verify(unittest.TestCase):
         self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 2})
         self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL, 1 skipped past the fix budget", self.run_verify("rerun"))
         self.new_prove()
-        self.check_script("B1.check.sh", "exit 1\n")
+        self.check_script("B1.check.sh", "echo FAIL B1\nexit 1\n")
         self.assertIn("rerun: 1 checks, 0 PASS, 1 FAIL, 1 skipped past the fix budget", self.run_verify("rerun", ok=False))
 
     def test_a_run_whose_bookkeeping_breaks_errors_the_rerun_instead_of_passing_it(self):
@@ -849,7 +849,7 @@ class Verify(unittest.TestCase):
         self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 errored before verify recorded the run", out)
 
     def test_a_run_that_fails_after_a_run_beside_it_spent_the_budget_counts_no_further(self):
-        self.check_script("B2.check.sh", "exit 1\n")
+        self.check_script("B2.check.sh", "echo FAIL B2\nexit 1\n")
         self.write("report.md", self.FAIL_REPORT)
         self.write("fix-attempts.json", '{"B2": 2}')
         with verify.rerun_state(self.dir):
@@ -859,7 +859,7 @@ class Verify(unittest.TestCase):
         self.assertEqual(verify.load_ledger(self.dir)["B2"]["verdict"], "FAIL")
 
     def test_a_fix_that_passes_spends_nothing(self):
-        self.check_script("B2.check.sh", "exit 1\n")
+        self.check_script("B2.check.sh", "echo FAIL B2\nexit 1\n")
         self.write("report.md", self.FAIL_REPORT)
         self.run_verify("rerun", "--only", "B2", ok=False)
         self.check_script("B2.check.sh", "exit 0\n")
@@ -1213,7 +1213,7 @@ class RerunStamp(unittest.TestCase):
     def test_a_failing_run_deletes_the_stamp(self):
         self.rerun()
         self.assertTrue((self.dir / "rerun.stamp.json").exists())
-        self.script("B2.check.sh", "exit 1\n")
+        self.script("B2.check.sh", "echo FAIL B2\nexit 1\n")
         self.rerun(*self.REASON, ok=False)
         self.assertFalse((self.dir / "rerun.stamp.json").exists())
         (self.dir / "B2.check.sh").unlink()
@@ -1289,7 +1289,7 @@ class RerunStamp(unittest.TestCase):
         self.assertIn("nothing changed", self.rerun())
 
     def test_a_check_left_fail_after_its_fix_budget_is_skipped_by_the_full_rerun_and_shows_in_the_stamp(self):
-        self.script("B2.check.sh", "exit 1\n")
+        self.script("B2.check.sh", "echo FAIL B2\nexit 1\n")
         (self.dir / "report.md").write_text("| Check | Verdict | Evidence | Observed |\n|---|---|---|---|\n| B2 | FAIL | B2.rerun.log | defect: x |\n")
         self.assertIn("fix attempt 1 of 2", self.rerun("--only", "B2", ok=False))
         self.assertIn("B2 still fails with no product or script change since its previous failing run, so this run is not a fix attempt",
@@ -1914,12 +1914,12 @@ class ReportWrite(RepoFixture):
         self.assertIn("not ready to merge: W1 FAIL; the PR lists them at the top and carries the 'do not merge' label", out)
         self.assertIn("## Not ready to merge\n\n- W1 FAIL: defect: Export wraps below Share | at 390 px\n\nHead:", self.report())
         self.assertIn("| W1 | FAIL | evidence/W1/ | defect: Export wraps below Share \\| at 390 px |", self.report())
-        (self.where / "B1.check.sh").write_text('echo "2 records"\nexit 1\n')
+        (self.where / "B1.check.sh").write_text('echo "FAIL B1: 2 records"\nexit 1\n')
         self.verify("script-fix", "B1.check.sh", "--reason", "the fixture now holds 2 records; agreed by the user")
         self.verify("rerun", "--only", "B1", ok=False)
         out = self.write(ok=False)
         self.assertIn("B1 is FAIL; start its Observed cell with 'defect:' and the repro", out)
-        self.assertIn("  B1 FAIL: rerun: FAIL (exit 1: 2 records)", out)
+        self.assertIn("  B1 FAIL: rerun: FAIL (exit 1: FAIL B1: 2 records)", out)
         self.observe(B1="blocker: the instance never came up", U1="mul(2, 3) is 6", W1="Export sits right of Share")
         (self.where / "B1.rerun.log").unlink()
         self.write()
@@ -2071,7 +2071,7 @@ class FixAttempts(RepoFixture):
         super().setUp()
         self.where = pathlib.Path(self.verify("where").strip())
         (self.where / "plan.md").write_text(plan(CHECKS, PERF_NA))
-        (self.where / "B1.check.sh").write_text('test ! -e "$(dirname "$0")/B1.broken"\n')
+        (self.where / "B1.check.sh").write_text('test ! -e "$(dirname "$0")/B1.broken" || { echo "FAIL B1: broken"; exit 1; }\n')
         (self.where / "report.md").write_text(Verify.FAIL_REPORT.replace("B2", "B1"))
 
     def attempts(self):
@@ -2125,7 +2125,7 @@ class FixAttempts(RepoFixture):
         (self.where / "report.md").write_text(Verify.FAIL_REPORT.replace("B2", "B1"))
         (self.where / "B1.check.sh").write_text('d="$(dirname "$0")"; touch "$d/B1.started.$$"; n=0\n'
                                                  'while [ "$(ls "$d" | grep -c "^B1.started")" -lt 2 ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n + 1)); done\n'
-                                                 'test ! -e "$d/B1.broken"\n')
+                                                 'test ! -e "$d/B1.broken" || { echo "FAIL B1: broken"; exit 1; }\n')
         outs = self.side_by_side_reruns()
         self.assertEqual(self.attempts(), 1, outs)
         self.assertEqual(sorted("fix attempt 1 of 2 for B1 failed" in o for o in outs), [False, True], outs)
@@ -2603,6 +2603,23 @@ class Supervision(unittest.TestCase):
         self.assertRegex(out, rf"^\n{pattern}\nrerun: 4 checks, 1 PASS, 1 FAIL, 1 INCONCLUSIVE, 1 CRASH")
         self.assertRegex((self.dir / "rerun.summary").read_text(), rf"^{pattern}\n$")
         self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B3": 1})
+
+    def test_an_exit_1_without_a_fail_line_last_is_a_crash_that_spends_no_fix_attempt(self):
+        self.script("B1.check.sh", 'set -e\necho "verify: step seed within 5"\necho "seeding"\nfalse\necho "PASS B1"\n')
+        self.script("B2.check.sh", 'echo "verify: step export within 5"\necho "FAIL B2: 0 of 3 records" >&2\nexit 1\n')
+        self.script("B3.check.sh", 'echo "verify: step export within 5"\necho "FAIL B3: 1 of 1 assertions failed"\necho\nexit 1\n')
+        (self.dir / "report.md").write_text(Verify.FAIL_REPORT + "| B1 | FAIL | B1.rerun.log | defect: x |\n"
+                                            "| B2 | FAIL | B2.rerun.log | defect: y |\n| B3 | FAIL | B3.rerun.log | defect: z |\n")
+        self.rerun("B1", "B2", "B3")
+        out = self.rerun("B1", "B2", "B3")
+        lines = ["B1 CRASH {s} step seed exit 1 with no FAIL line last on stdout, so no predicate reported the failure: seeding",
+                 "B2 CRASH {s} step export exit 1 with no FAIL line last on stdout, so no predicate reported the failure: "
+                 "FAIL B2: 0 of 3 records",
+                 "B3 FAIL {s} step export exit 1: FAIL B3: 1 of 1 assertions failed"]
+        pattern = "\n".join(re.escape(line).replace(re.escape("{s}"), r"\d+\.\ds") for line in lines)
+        self.assertRegex(out, rf"^\n{pattern}\nrerun: 3 checks, 0 PASS, 1 FAIL, 2 CRASH")
+        self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B3": 1})
+        self.assertEqual({i: e["verdict"] for i, e in verify.load_ledger(self.dir).items()}, {"B1": "CRASH", "B2": "CRASH", "B3": "FAIL"})
 
     def test_an_environment_exit_is_queued_again_twice_then_inconclusive_and_records_nothing_until_then(self):
         self.script("B1.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B1.runs"\necho "verify: step launch within 5"\n'

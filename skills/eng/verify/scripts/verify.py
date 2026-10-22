@@ -1917,9 +1917,18 @@ def rerun_verdict(outcome):
     """(verdict, reason) of a rerun: the class of its exit code (EXIT_VERDICTS, else CRASH), or why verify stopped it."""
     if outcome["verdict"]:
         return outcome["verdict"], outcome["reason"]
-    code, last = outcome["code"], outcome["last"]
+    code, last = outcome["code"], f": {outcome['last']}" if outcome["last"] else ""
     verdict = EXIT_VERDICTS.get(code, "CRASH")
-    return verdict, "" if verdict == "PASS" else f"exit {code}" + (f": {last}" if last else "")
+    if verdict == "FAIL" and not failed_a_predicate(outcome):
+        return "CRASH", f"exit 1 with no FAIL line last on stdout, so no predicate reported the failure{last}"
+    return verdict, "" if verdict == "PASS" else f"exit {code}{last}"
+
+
+def failed_a_predicate(outcome):
+    """Whether a run that exited 1 printed a FAIL line last on stdout, as a failed predicate does; an exit 1 without one is a
+    script that died, for example under set -e."""
+    printed = [line for line in outcome["stdout"].splitlines() if line.strip()]
+    return outcome["code"] == 1 and bool(printed) and bool(FAIL_LINE.match(printed[-1].strip()))
 
 
 def environment_retry(verdict, reason, run):
@@ -2177,14 +2186,13 @@ def dry_verdict(outcome):
     if outcome["verdict"]:
         return outcome["verdict"], outcome["reason"]
     code, last = outcome["code"], f": {outcome['last']}" if outcome["last"] else ""
-    printed = [line for line in outcome["stdout"].splitlines() if line.strip()]
     if EXIT_VERDICTS.get(code) in ("INCONCLUSIVE", "ENVIRONMENT"):
         return EXIT_VERDICTS[code], f"exit {code}{last}"
     if not outcome["ready"]:
         return "CRASH", f"it never printed \"{READY_LINE}\", so it failed before its instance was up"
     if code == 0:
         return "PASS", "the behavior already exists on base"
-    if code == 1 and printed and FAIL_LINE.match(printed[-1].strip()):
+    if failed_a_predicate(outcome):
         return "FAIL", "it reached its predicates and one failed"
     if code == 1:
         return "CRASH", "exit 1 with no FAIL line last on stdout, so no predicate reported the failure"
