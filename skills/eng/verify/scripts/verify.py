@@ -137,8 +137,8 @@ directory.
               --timeout is only a total safety net, 7200 seconds by default, recorded as CRASH. An ENVIRONMENT run is
               queued again for when `capacity` passes, at most 2 times per run, and is then INCONCLUSIVE with reason
               environment; it writes no log, records no verdict, and is no fix attempt. Once a script has ended, verify
-              reads its output for at most 2 seconds more, so a process it detached into another session cannot hold the
-              run. Scripts run as parallel as capacity allows: the next starts once every running script has printed
+              reads its output for at most 2 seconds more, so a process it left running (one in another session too)
+              cannot hold the run. Scripts run as parallel as capacity allows: the next starts once every running script has printed
               the line "verify: ready" (its instance is up; the line stays out of its log), while fewer than --jobs run
               when it is given, and while `capacity` passes, because the 1-minute load lags an instance start; a script
               that never prints the line runs alone. While capacity is
@@ -350,8 +350,8 @@ PROGRESS_POLL_S = 0.5
 EXIT_VERDICTS = {0: "PASS", 1: "FAIL", 2: "INCONCLUSIVE", 3: "ENVIRONMENT"}
 ENVIRONMENT_REQUEUES = 2
 HELD_OUTPUT_S = 2.0
-HELD_OUTPUT_NOTE = ("verify: a process the script detached into another session still held its output {seconds:g}s after the "
-                    "script ended, so verify closed the pipes without it\n")
+HELD_OUTPUT_NOTE = ("verify: a process the script left running still held its output {seconds:g}s after the script ended, "
+                    "so verify closed the pipes without it\n")
 SUMMARY = ".summary"
 CAPACITY_POLL_S = 15.0
 CAPACITY_WAIT_S = 600.0
