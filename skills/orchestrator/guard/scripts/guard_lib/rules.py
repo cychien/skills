@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from . import pr, procs, quota, shell, skills, state, verifiers
+from . import pr, procs, quota, shell, skills, state, verifiers, watch
 
 PASS = ("pass", None)
 SLASH = re.compile(r"^\s*/([a-z0-9][a-z0-9-]*)\b")
@@ -85,6 +85,13 @@ CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 QUESTION_END = re.compile(r"[?？]\s*\**\s*$")
 IDLE_LIMIT = 3
 HEADLESS = re.compile(r"(^|/)claude\b.*\s(-p|--print)\b|(^|/)codex\s+exec\b")
+LOCAL_WORK = {"shell", "subagent", "monitor", "workflow"}
+UNWATCHED = ("Background work is in flight ({work}) and no watchdog watches it, so a job that hangs without a sound would never "
+             "reach you. Start the watchdog as a background job of your own (Claude Code: Bash with run_in_background), then "
+             "end the turn:\n   {command}\nIt costs nothing while every job progresses, and it exits with a report when one goes "
+             "silent; time only ever asks you, it never stops a job.")
+HANDED_BACK = ("These delegates handed back, but their work still runs, holding the machine and hiding which job causes a later "
+               "problem:\n{work}\nStop each with your agent's task-stop tool (Claude Code: TaskStop with the id), then end the turn.")
 
 
 def headless():
@@ -112,6 +119,8 @@ def handle(event):
     if event.kind == "pre_tool":
         if event.agent_id:
             delegate_acts(event)
+        else:
+            resumes(event)
         return on_pre_tool(event)
     if event.kind == "post_tool":
         return on_post_tool(event)
@@ -126,6 +135,7 @@ def handle(event):
         decision = on_subagent_stop(event)
         if decision == PASS:
             delegates_end(event, {event.agent_id})
+            hands_back(event)
         return decision
     return PASS
 
@@ -138,11 +148,42 @@ def active_hold(event):
 
 
 def delegate_starts(event):
-    """A SubagentStart: this agent is a delegate, and from now on only started agents are."""
+    """A SubagentStart: this agent is a delegate, and from now on only started agents are; a resumed one has not handed back."""
     with state.update(event.agent, event.session) as data:
         data["starts_seen"] = True
         now = time.time()
         data.setdefault("delegates", {})[event.agent_id] = {"since": now, "last": now, "running": True, "via": "start"}
+        data.get("handed_back", {}).pop(event.agent_id, None)
+
+
+def hands_back(event):
+    """A delegate's report reached its lead: its SubagentHandback call went through, or its stop did."""
+    with state.update(event.agent, event.session) as data:
+        data.setdefault("handed_back", {})[event.agent_id] = time.time()
+
+
+def note_background(event):
+    """Remember which delegate started each background task, and which delegates handed back with the hand-back tool."""
+    response = event.tool_response if isinstance(event.tool_response, dict) else {}
+    if not event.agent_id:
+        return
+    if (event.tool or "").lower() in HANDBACK_TOOLS and response.get("success") is True:
+        hands_back(event)
+    elif isinstance(task := response.get("backgroundTaskId"), str):
+        with state.update(event.agent, event.session) as data:
+            data.setdefault("launched", {})[task] = event.agent_id
+
+
+def resumes(event):
+    """The lead sends a message to a delegate that handed back: it runs again, so its work is no longer left over."""
+    if not state.exists(event.agent, event.session) or not isinstance(event.tool_input, dict):
+        return
+    handed = state.load(event.agent, event.session).get("handed_back", {})
+    named = {v for v in event.tool_input.values() if isinstance(v, str)} & set(handed)
+    if named:
+        with state.update(event.agent, event.session) as data:
+            for agent_id in named:
+                data.get("handed_back", {}).pop(agent_id, None)
 
 
 def delegate_acts(event):
@@ -204,7 +245,7 @@ def on_prompt(event):
     if not path and not state.exists(event.agent, event.session):
         return PASS
     with state.update(event.agent, event.session) as data:
-        data["todo_undecided"], data["todo_decided"] = None, []
+        data["todo_undecided"], data["todo_decided"], data["watch_blocks"] = None, [], 0
         state.reopen_waiting(data)
         if path and m.group(1) not in data["skills"]:
             data["skills"].append(m.group(1))
@@ -289,6 +330,7 @@ def skipped(why):
 
 
 def on_post_tool(event):
+    note_background(event)
     if (event.tool or "").lower() == "taskstop":
         stopped = event.tool_input.get("task_id") if isinstance(event.tool_input, dict) else None
         if stopped:
@@ -600,15 +642,53 @@ def on_stop(event):
     problems = []
     if em_dash(message):
         problems.append("Your reply uses an em dash. Rewrite it without one; a period or comma usually reads best.")
-    if not state.exists(event.agent, event.session):
-        return ("block", "\n".join(problems)) if problems else PASS
-    data = state.load(event.agent, event.session)
-    sources = {i["source"]: i["source_path"] for i in data["todo"] if i["source"] and i["source_path"]}
-    needs_reply = [name for name, path in sources.items() if "../reply/SKILL.md" in (skills.read(path) or "")]
-    if needs_reply and data["todo"] and not state.unresolved(data) and "reply" not in data["skills"]:
-        problems.append(f"The `{needs_reply[0]}` skill asks for its reply per the reply skill. Read `../reply/SKILL.md` beside it and write the reply that way.")
-    problems += open_item_problems(event, message, data, others=bool(problems))
+    known = state.exists(event.agent, event.session)
+    data = state.load(event.agent, event.session) if known else state.fresh()
+    background = list(filter(None, [handed_back_work(event, data), unwatched_work(event, data)]))
+    if known:
+        sources = {i["source"]: i["source_path"] for i in data["todo"] if i["source"] and i["source_path"]}
+        needs_reply = [name for name, path in sources.items() if "../reply/SKILL.md" in (skills.read(path) or "")]
+        if needs_reply and data["todo"] and not state.unresolved(data) and "reply" not in data["skills"]:
+            problems.append(f"The `{needs_reply[0]}` skill asks for its reply per the reply skill. Read `../reply/SKILL.md` beside it and write the reply that way.")
+        problems += open_item_problems(event, message, data, others=bool(problems))
+    problems += background
     return ("block", "\n\n".join(problems)) if problems else PASS
+
+
+def handed_back_work(event, data):
+    """Why the lead's turn cannot end: work of a delegate that already handed back is still in flight. Only an agent whose
+    stop payload lists the in-flight work can show it."""
+    handed, launched = data.get("handed_back", {}), data.get("launched", {})
+    left = [(task, owner) for task in event.background_tasks or [] if isinstance(task, dict)
+            for owner in [task.get("id") if task.get("id") in handed else launched.get(task.get("id"))] if owner in handed]
+    if not left:
+        return None
+    work = "\n".join(f"   {task['id']}: {task.get('type', 'task')} {' '.join(str(task.get('command') or task.get('description') or '').split())[:120]}"
+                     + (f", of delegate {owner}" if owner != task["id"] else "") for task, owner in left)
+    return HANDED_BACK.format(work=work)
+
+
+def unwatched_work(event, data):
+    """Why the lead's turn cannot end: local background work is in flight and no watchdog of the session watches it. Where
+    the stop payload lists no in-flight work, nothing is asked; in a non-interactive session a watchdog left alone is
+    stopped instead, because the session would wait on it forever."""
+    local = [t for t in event.background_tasks or [] if isinstance(t, dict) and t.get("type") in LOCAL_WORK]
+    if not local or data.get("watch_unavailable"):
+        return None
+    watchdogs = [t for t in local if watch.runs_watchdog(t.get("command"))]
+    if watchdogs:
+        if len(watchdogs) == len(local) and headless():
+            watch.stop(event.agent, event.session)
+        return None
+    if watch.alive(event.agent, event.session):
+        return None
+    with state.update(event.agent, event.session) as d:
+        d["watch_blocks"] = blocks = d.get("watch_blocks", 0) + 1
+    if blocks > IDLE_LIMIT:
+        return None
+    names = ", ".join(" ".join(str(t.get("command") or t.get("description") or t.get("id")).split())[:60] for t in local[:3])
+    more = f" and {len(local) - 3} more" if len(local) > 3 else ""
+    return UNWATCHED.format(work=names + more, command=watch.cli(event.agent, event.session))
 
 
 def on_subagent_stop(event):

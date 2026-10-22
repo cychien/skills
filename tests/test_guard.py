@@ -1306,6 +1306,104 @@ class Guard(unittest.TestCase):
                         "while true; do (echo tick; grep -c PASS rerun.out); [ -f stop ] && break; sleep 5; done"):
             self.assertIsNone(self.denial(command), command)
 
+    def start_watchdog(self):
+        """A real watchdog of session s1 under this test process, with its pid file in place."""
+        dog = subprocess.Popen([sys.executable, str(GUARD), "watch", "--session", "claude:s1", "--interval", "0.2", "--initial", "60"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
+        self.addCleanup(reap, dog)
+        record = pathlib.Path(self.env["GUARD_HOME"]) / "sessions" / "claude-s1.watch.pid"
+        deadline = time.monotonic() + 10
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return dog, record
+
+    def watch_shell(self):
+        return {"id": "bw", "type": "shell", "status": "running", "description": "watchdog",
+                "command": f"python3 {GUARD} watch --session claude:s1"}
+
+    def test_the_lead_cannot_end_its_turn_on_background_work_no_watchdog_watches(self):
+        work = [{"id": "b1", "type": "shell", "status": "running", "description": "rerun", "command": "python3 verify.py rerun"}]
+        self.assertIsNone(self.stop("Waiting."))
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[]))
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[{"id": "m1", "type": "MCP task", "status": "running"}]))
+        blocked = self.stop("Waiting.", background_tasks=work)
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("Background work is in flight (python3 verify.py rerun) and no watchdog watches it", blocked["reason"])
+        self.assertIn(f"python3 {GUARD} watch --session claude:s1\n", blocked["reason"])
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[*work, self.watch_shell()]))
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a1", "last_assistant_message": "done", "background_tasks": work}))
+        dog, record = self.start_watchdog()
+        self.assertIsNone(self.stop("Waiting.", background_tasks=work))
+        r = subprocess.run([sys.executable, str(GUARD), "watch", "--stop", "--session", "claude:s1"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.stdout, f"Stopped the watchdog (pid {dog.pid}).\n")
+        self.assertEqual(dog.wait(10), 0)
+        self.assertFalse(record.exists())
+        self.assertEqual(self.stop("Waiting.", background_tasks=work)["decision"], "block")
+
+    def test_the_watchdog_rule_lets_a_stuck_lead_go_after_three_blocks_until_the_next_prompt(self):
+        work = [{"id": "b1", "type": "subagent", "status": "running", "description": "verifier"}]
+        for _ in range(3):
+            self.assertEqual(self.stop("Waiting.", background_tasks=work)["decision"], "block")
+        self.assertIsNone(self.stop("Waiting.", background_tasks=work))
+        self.hook("UserPromptSubmit", {"prompt": "go on"})
+        self.assertEqual(self.stop("Waiting.", background_tasks=work)["decision"], "block")
+
+    def test_a_session_where_no_watchdog_can_run_is_not_held_and_a_headless_one_stops_a_watchdog_left_alone(self):
+        sessions = pathlib.Path(self.env["GUARD_HOME"]) / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "claude-s1.json").write_text(json.dumps({"watch_unavailable": {"at": 1, "why": "no agent"}}))
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[{"id": "b1", "type": "shell", "command": "sleep 300"}]))
+        (sessions / "claude-s1.json").write_text("{}")
+        dog, _ = self.start_watchdog()
+        self.assertIsNone(self.stop("Done.", background_tasks=[self.watch_shell()]))
+        self.assertIsNone(dog.poll(), "an interactive session keeps its watchdog between turns")
+        with mock.patch.dict(self.env, GUARD_HEADLESS="1"):
+            self.assertIsNone(self.stop("Done.", background_tasks=[self.watch_shell(), {"id": "b1", "type": "shell", "command": "sleep 9"}]))
+            self.assertIsNone(dog.poll(), "a watchdog beside other work keeps watching it")
+            self.assertIsNone(self.stop("Done.", background_tasks=[self.watch_shell()]))
+        self.assertEqual(dog.wait(10), 0, "a non-interactive session would wait on a lone watchdog forever")
+
+    def test_a_delegates_work_left_after_its_hand_back_holds_the_leads_turn_until_it_stops(self):
+        watched = [self.watch_shell()]
+
+        def launch(agent_id, task):
+            self.hook("PostToolUse", {"agent_id": agent_id, "tool_name": "Bash", "tool_input": {"command": "sleep 47", "run_in_background": True},
+                                      "tool_response": {"stdout": "", "backgroundTaskId": task}})
+
+        def hand_back(agent_id, success=True):
+            self.hook("PostToolUse", {"agent_id": agent_id, "tool_name": "SubagentHandback", "tool_input": {"message": "done"},
+                                      "tool_response": {"success": success, "message": "Report delivered to your caller."}})
+        for agent_id in ("a1", "a2", "a3"):
+            self.hook("SubagentStart", {"agent_id": agent_id, "agent_type": "general-purpose"})
+        launch("a1", "bx")
+        launch("a2", "by")
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[*watched, {"id": "bx", "type": "shell", "command": "sleep 47"}]))
+        hand_back("a1")
+        hand_back("a2", success=False)
+        work = [*watched, {"id": "bx", "type": "shell", "status": "running", "command": "sleep 47"},
+                {"id": "by", "type": "shell", "status": "running", "command": "sleep 47"}]
+        blocked = self.stop("Waiting.", background_tasks=work)
+        self.assertEqual(blocked["reason"], "These delegates handed back, but their work still runs, holding the machine and hiding "
+                                            "which job causes a later problem:\n   bx: shell sleep 47, of delegate a1\nStop each "
+                                            "with your agent's task-stop tool (Claude Code: TaskStop with the id), then end the turn.")
+        self.assertIn("   a1: subagent probe", self.stop("Waiting.", background_tasks=[
+            *watched, {"id": "a1", "type": "subagent", "status": "running", "description": "probe"}])["reason"])
+        self.assertIsNone(self.stop("Waiting.", background_tasks=watched))
+        self.hook("PreToolUse", {"tool_name": "SendMessage", "tool_input": {"to": "a1", "message": "one more thing"}})
+        self.assertIsNone(self.stop("Waiting.", background_tasks=work))
+        launch("a3", "bz")
+        self.assertIsNone(self.hook("SubagentStop", {"agent_id": "a3", "last_assistant_message": "a3 done"}))
+        self.assertIn("   bz: shell sleep 47, of delegate a3", self.stop("Waiting.", background_tasks=[
+            *watched, {"id": "bz", "type": "shell", "status": "running", "command": "sleep 47"}])["reason"])
+        self.hook("SubagentStart", {"agent_id": "a3", "agent_type": "general-purpose"})
+        self.assertIsNone(self.stop("Waiting.", background_tasks=[*watched, {"id": "bz", "type": "shell", "command": "sleep 47"}]))
+
+
+def reap(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
 
 FEATURE_V2 = """\
 ---
