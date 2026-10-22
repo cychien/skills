@@ -1201,6 +1201,71 @@ class Guard(unittest.TestCase):
         self.assertIn("(T3)", self.hook("PreToolUse", codex)["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertIsNone(self.hook("PreToolUse", {**codex, "tool_input": {"command": "codex exec -m gpt-5 -"}}, agent="codex"))
 
+    def plans_where_run(self, plans):
+        """A verify skill whose `where` answers per working directory, and each directory's plan."""
+        self.write_skill("verify", "---\nname: verify\ndescription: x\n---\n\n# Verify\n")
+        scripts = self.skills / "verify" / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "verify.py").write_text("import os, sys\nif sys.argv[1:] == ['where']:\n    print(os.path.join(os.getcwd(), 'verification'))\n")
+        for directory, plan in plans.items():
+            (directory / "verification").mkdir(parents=True, exist_ok=True)
+            (directory / "verification" / "plan.md").write_text(plan)
+
+    def test_the_reserved_agent_is_read_from_the_plan_where_the_command_runs(self):
+        self.models()
+        here, worktree = pathlib.Path(self.tmp.name), pathlib.Path(self.tmp.name) / "worktrees" / "phase-2"
+        real = "# Plan\n\n### T1. A real turn\n\n- Agent: real: Codex must choose the command\n"
+        fake = "# Plan\n\n### T1. A fake turn\n\n- Agent: fake: wire logic\n"
+        launches = ["codex exec -m gpt-5 - < review.md", "python3 /x/salvo/scripts/salvo.py run --out /tmp/s codex:d:medium < review.md"]
+        self.plans_where_run({here: real, worktree: fake})
+        for launch in launches:
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launch}})
+            self.assertIn("codex is reserved", out["hookSpecificOutput"]["permissionDecisionReason"], launch)
+            for moved in (f"cd {worktree} && {launch}", f"cd worktrees/phase-2; {launch}", f"cd worktrees && cd phase-2 && {launch}"):
+                self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": moved}}), moved)
+        self.plans_where_run({here: fake, worktree: real})
+        for launch in launches:
+            self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": launch}}), launch)
+            out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"cd '{worktree}' && {launch}"}})
+            self.assertIn("codex is reserved", out["hookSpecificOutput"]["permissionDecisionReason"], launch)
+        self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"ls; cd {worktree} && {launches[0]}"}}),
+                          "only a leading cd moves the command")
+
+    def denial(self, command):
+        out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+        return out and out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_a_process_match_whose_pattern_matches_its_own_command_line_is_denied(self):
+        for command in ('until ! pgrep -f "C1.check.sh web-4906" >/dev/null; do sleep 3; done', "pgrep -fl 'shop.server' || echo none",
+                        "pkill -f inspector-relay.mjs; sleep 2; node relay.mjs", "running=$(pgrep -af 'next dev')",
+                        "bash -lc 'while pgrep -f build.sh >/dev/null; do sleep 5; done'", "sudo pkill -9 -f cl-test/clean.sh",
+                        "pgrep --full -u justin 'vite --port 5173'"):
+            reason = self.denial(command)
+            self.assertIn("matches the shell that runs this command", reason or "", command)
+            self.assertIn("[v]erify.py", reason, command)
+        for command in ("until ! pgrep -f '[C]1.check.sh web-4906' >/dev/null; do sleep 3; done", "pkill -f '[i]nspector-relay.mjs'",
+                        "pkill -f 'cl-test/clean\\.sh'",
+                        "pgrep -x node", "pgrep node || echo none", "pkill -F /tmp/server.pid", "grep -f patterns.txt server.log",
+                        "echo 'pgrep -f shop.server' >> notes.md", "git commit -m 'stop pkill -f from matching itself'"):
+            self.assertIsNone(self.denial(command), command)
+
+    def test_a_poll_loop_waiting_on_a_verify_run_is_denied(self):
+        for command in ('until ! pgrep -f "[v]erify.py rerun" >/dev/null; do sleep 10; done',
+                        "while ps aux | grep -v grep | grep -q 'verify.py dryrun'; do sleep 5; done",
+                        "python3 ../verify/scripts/verify.py rerun > /tmp/r.out 2>&1 & until grep -q 'PASS\\|FAIL' /tmp/r.out; do sleep 5; done",
+                        "until [ -s .verification/rerun.summary ]; do sleep 5; done; cat .verification/rerun.summary",
+                        "while true; do grep -q done ../verification/dryrun.log && break; sleep 5; done",
+                        "while true; do for f in a b; do echo $f; done; grep -q PASS rerun.out && break; sleep 5; done",
+                        "bash -c 'until test -s rerun.out; do sleep 2; done'"):
+            reason = self.denial(command)
+            self.assertIn("Do not poll for a verify.py rerun or dryrun", reason or "", command)
+            self.assertIn("completion notification arrives on its own", reason, command)
+        for command in ("python3 ../verify/scripts/verify.py rerun > rerun.out 2>&1 &", "nohup python3 ../verify/scripts/verify.py dryrun T1 &",
+                        "python3 ../verify/scripts/verify.py rerun --only T1", "until curl -sf localhost:3000/health; do sleep 1; done",
+                        "cat .verification/rerun.summary", "while read -r line; do echo \"$line\"; done < rerun.summary",
+                        "for i in 1 2 3; do grep -c PASS rerun.out; sleep 1; done"):
+            self.assertIsNone(self.denial(command), command)
+
 
 FEATURE_V2 = """\
 ---

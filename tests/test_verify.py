@@ -375,10 +375,10 @@ class Verify(unittest.TestCase):
         self.check_script("B3.check.sh", "#!/bin/sh\nexit 0\n", 0o755)
         self.write("B1.observed.json", "{}")
         out = self.run_verify("rerun", "inst-7", "extra", ok=False)
-        self.assertRegex(out, r"PASS\s+B1")
-        self.assertRegex(out, r"FAIL\s+B2.*exit 1")
+        self.assertRegex(out, r"B1 PASS")
+        self.assertRegex(out, r"\nB2 FAIL \d+\.\ds exit 1: observed 2 rows\n")
         self.assertIn("observed 2 rows", out)
-        self.assertRegex(out, r"PASS\s+B3")
+        self.assertRegex(out, r"B3 PASS")
         self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL", out)
         self.assertEqual((self.dir / "B1.args").read_text().strip(), "args: inst-7 extra")
         self.assertNotIn("B1.observed", out)
@@ -392,8 +392,9 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.rb", "puts 1\n")
         self.check_script("B2.check.sh", "sleep 30\n")
         out = self.run_verify("rerun", "--timeout", "1", ok=False)
-        self.assertRegex(out, r"FAIL\s+B1.*no interpreter")
-        self.assertRegex(out, r"FAIL\s+B2.*timed out after 1s")
+        self.assertRegex(out, r"B1 CRASH \d+\.\ds B1.check.rb is not executable and has no interpreter for .rb\n")
+        self.assertRegex(out, r"B2 CRASH \d+\.\ds timed out after 1s, the --timeout safety net\n")
+        self.assertIn("rerun: 2 checks, 0 PASS, 0 FAIL, 2 CRASH", out)
 
     def test_rerun_passes_flags_after_a_double_dash(self):
         self.check_script("B1.check.sh", "test \"$1\" = --instance && test \"$2\" = a\n")
@@ -409,8 +410,8 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"\nrm -rf "$d/evidence/B2" "$d/B1-own.txt" "$d/evidence/B1"\n: > "$d/evidence/B3/log.txt"\n')
         self.check_script("B2.check.sh", "exit 0\n")
         out = self.run_verify("rerun", ok=False)
-        self.assertRegex(out, r"FAIL\s+B1.*deleted or emptied files that are not its own: evidence/B2/shot.png, evidence/B3/log.txt\n")
-        self.assertRegex(out, r"PASS\s+B2")
+        self.assertRegex(out, r"B1 FAIL.*deleted or emptied files that are not its own: evidence/B2/shot.png, evidence/B3/log.txt\n")
+        self.assertRegex(out, r"B2 PASS")
         self.assertNotIn("B1-own", out)
         self.assertNotIn("evidence/B1", out)
 
@@ -426,10 +427,10 @@ class Verify(unittest.TestCase):
 
     def test_rerun_jobs_runs_scripts_side_by_side_and_reports_them_in_id_order(self):
         self.meeting_checks()
-        self.assertRegex(self.run_verify("rerun", "--jobs", "1", ok=False), r"FAIL\s+B1.*\n\s+B2 never ran beside it")
+        self.assertRegex(self.run_verify("rerun", "--jobs", "1", ok=False), r"B1 FAIL \d+\.\ds exit 1: B2 never ran beside it\n")
         self.meeting_checks()
         out = self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
-        self.assertRegex(out, r"^PASS\s+B1 .*\nPASS\s+B2 .*\nrerun: 2 checks, 2 PASS, 0 FAIL\n$")
+        self.assertRegex(out, r"^B1 PASS .*\nB2 PASS .*\nrerun: 2 checks, 2 PASS, 0 FAIL\n$")
         self.assertEqual((self.dir / "B2.rerun.log").read_text(), "rerun: PASS\n")
 
     def capacity_rerun(self, load, wait=1.0):
@@ -447,7 +448,7 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; touch "$d/B1.started"; echo "verify: ready"; sleep 0.2\n')
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.rerun.log" ] || { echo "started beside B1 without capacity"; exit 1; }\n')
         out = self.capacity_rerun(lambda: 3.0 if (self.dir / "B1.started").exists() and not (self.dir / "B1.rerun.log").exists() else 0.0)
-        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertRegex(out, r"B1 PASS .*\nB2 PASS ")
         self.assertNotIn("REQUEUED", out)
         self.new_prove()
         for name in ("rerun.stamp.json", "B1.started", "B1.rerun.log"):
@@ -455,7 +456,7 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; touch "$d/B1.started"; echo "verify: ready"; sleep 1.5\n')
         out = self.capacity_rerun(lambda: 3.0 if (self.dir / "B1.started").exists() and not (self.dir / "B1.rerun.log").exists() else 0.0)
         self.assertRegex(out, r"REQUEUED B2  waited 0\.01\d* min for capacity \(load 3\.0 on 4 cores, threshold 2\.8\); queued again behind the rest\n")
-        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertRegex(out, r"B1 PASS .*\nB2 PASS ")
         self.assertIn("rerun: 2 checks, 2 PASS, 0 FAIL, 1 requeued", out)
 
     def concurrent_reruns(self, *onlys, slow):
@@ -506,7 +507,7 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", "exit 0\n")
         out = self.capacity_rerun(lambda: 9.0, wait=0.2)
         self.assertIn("REQUEUED B1  waited", out)
-        self.assertRegex(out, r"NOT RUN B1  \(0\.0s\)  waited .* twice; run it with --only B1 once the machine has room")
+        self.assertRegex(out, r"B1 NOT-RUN 0\.0s waited .* twice; run it with --only B1 once the machine has room")
         self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 not run for lack of capacity, 1 requeued", out)
         self.assertFalse((self.dir / "B1.rerun.log").exists())
         self.assertNotIn("B1", verify.load_ledger(self.dir))
@@ -519,20 +520,20 @@ class Verify(unittest.TestCase):
         self.check_script("A0.check.sh", 'd="$(dirname "$0")"; ls "$d"/*.started >/dev/null 2>&1 || exit 1\n'
                                          'for c in B1 B2; do [ -e "$d/$c.rerun.log" ] || { echo "$c still running"; exit 1; }; done\n')
         out = self.run_verify("rerun", "--jobs", "3", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
-        self.assertRegex(out, r"^PASS\s+A0 .*\nPASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertRegex(out, r"^A0 PASS .*\nB1 PASS .*\nB2 PASS ")
 
     def test_rerun_jobs_admits_the_next_script_only_once_the_running_ones_print_ready(self):
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; touch "$d/B1.readied"; echo "verify: ready"; sleep 1\n')
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.readied" ] || { echo "started before B1 was ready"; exit 1; }\n'
                                          '[ -e "$d/B1.rerun.log" ] && { echo "waited for B1 to end"; exit 1; }; exit 0\n')
         out = self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"})
-        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertRegex(out, r"B1 PASS .*\nB2 PASS ")
         self.assertEqual((self.dir / "B1.rerun.log").read_text(), "rerun: PASS\n")
         (self.dir / "B1.rerun.log").unlink()
         self.new_prove()
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; sleep 0.5; touch "$d/B1.readied"\n')
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; [ -e "$d/B1.rerun.log" ] || { echo "started beside a script that never printed ready"; exit 1; }\n')
-        self.assertRegex(self.run_verify("rerun", "--jobs", "2", "--force", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertRegex(self.run_verify("rerun", "--jobs", "2", "--force", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"B1 PASS .*\nB2 PASS ")
 
     def test_rerun_jobs_requeues_the_newest_script_while_the_load_stays_over_the_cores_and_never_retries_a_fail(self):
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; echo "verify: ready"; sleep 1.5; touch "$d/B1.done"\n')
@@ -556,7 +557,7 @@ class Verify(unittest.TestCase):
                 verify.cmd_rerun(self.dir, args)
         out = str(raised.exception)
         self.assertRegex(out, r"REQUEUED B2  load 100\.0 on 4 cores for 0s; stopped and queued again, --jobs now 1\n")
-        self.assertRegex(out, r"PASS\s+B1 .*\nPASS\s+B2 .*\nFAIL\s+B3 ")
+        self.assertRegex(out, r"B1 PASS .*\nB2 PASS .*\nB3 FAIL ")
         self.assertIn("rerun: 3 checks, 2 PASS, 1 FAIL, 1 requeued", out)
         self.assertEqual((self.dir / "B2.count").read_text(), "2\n")
         self.assertEqual((self.dir / "B3.runs").read_text(), "x\n")
@@ -569,11 +570,11 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", 'd="$(dirname "$0")"; echo "verify: ready"; sleep 0.5; rm "$d/evidence/B1/shot.png"; sleep 1.5; echo png > "$d/evidence/B1/shot.png"\n')
         self.check_script("B2.check.sh", 'd="$(dirname "$0")"; sleep 1.2; rm "$d/evidence/W1/walk.png"\n')
         out = self.run_verify("rerun", "--jobs", "2", ok=False, env={"VERIFY_MAX_LOAD_RATIO": "1000"})
-        self.assertRegex(out, r"FAIL\s+B1 .*files that are not its own were deleted or emptied while it ran beside B2: evidence/W1/walk.png\n")
-        self.assertRegex(out, r"FAIL\s+B2 .*while it ran beside B1: evidence/W1/walk.png\n")
+        self.assertRegex(out, r"B1 FAIL .*files that are not its own were deleted or emptied while it ran beside B2: evidence/W1/walk.png\n")
+        self.assertRegex(out, r"B2 FAIL .*while it ran beside B1: evidence/W1/walk.png\n")
         self.new_prove()
         self.check_script("B2.check.sh", "sleep 1.2\n")
-        self.assertRegex(self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"PASS\s+B1 .*\nPASS\s+B2 ")
+        self.assertRegex(self.run_verify("rerun", "--jobs", "2", env={"VERIFY_MAX_LOAD_RATIO": "1000"}), r"B1 PASS .*\nB2 PASS ")
 
     def test_every_check_names_its_tier_and_the_plan_counts_them(self):
         self.write("plan.md", plan(CHECKS, UNIT, WALK, PERF_MAIN))
@@ -608,7 +609,7 @@ class Verify(unittest.TestCase):
         self.check_script("B1.check.sh", "echo 2 records\nexit 1\n")
         self.run_verify("script-fix", "B1.check.sh", "--reason", "the fixture now holds 2 records; agreed by the user")
         self.run_verify("rerun", "--only", "B1", ok=False)
-        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "2 records\nrerun: FAIL (exit 1)\n")
+        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "2 records\nrerun: FAIL (exit 1: 2 records)\n")
         self.assertIn("B1.rerun.log records a failing run; a PASS needs a passing `verify.py rerun`", self.run_verify("report", ok=False))
         self.write("report.md", plan(REPORT).replace("| P1 | PASS | P1-runs.txt | p50 41 ms on both sides |\n", "")
                    .replace("| B1 | PASS | B1-terminal.txt | stdout parsed, 3 records |", "| B1 | FAIL | B1.rerun.log | defect: 2 records |"))
@@ -714,6 +715,39 @@ class Verify(unittest.TestCase):
         self.write("plan.md", plan(CHECKS, self.NAMED.replace("Tier: e2e", "Tier: unit").replace("B2.rerun.log", "units.log"), PERF_NA))
         self.run_verify("plan")
 
+    def with_contract_line(self, line, text=None):
+        return (text or plan(CHECKS, PERF_NA)).replace("printing the records to stdout\n", f"printing the records to stdout\n{line}\n")
+
+    def test_the_drive_contract_names_product_side_names_only(self):
+        for line in ("- `driver launch --instance`: starts an isolated instance", "- Harness seed: three tasks",
+                     "- **DRIVER** `sign-in`: signs the test user in"):
+            self.write("plan.md", self.with_contract_line(line))
+            out = self.run_verify("plan", ok=False)
+            self.assertIn("names a driver command. The contract names product-side names only (DOM handles, routes and HTTP paths", out)
+            self.assertIn("driver commands are the verifier's own, so drop the line", out)
+            self.run_verify("plan", "--checks")
+        self.write("plan.md", self.with_contract_line("- `GET /drivers/:id`: the product's route for a driver profile"))
+        self.run_verify("plan")
+
+    def test_a_driver_line_the_plan_lock_already_held_stays_and_a_new_one_is_refused(self):
+        frozen = self.with_contract_line("- `harness up`: starts the app")
+        self.write("plan.md", frozen)
+        self.write("plan.lock", json.dumps({"sha": verify.sha(frozen), "text": frozen, "frozen_at": "2026-10-01T00:00:00+00:00",
+                                            "frozen_ts": time.time(), "revisions": []}))
+        self.run_verify("plan")
+        self.write("plan.md", self.with_contract_line("- `driver seed`: seeds three records", frozen))
+        self.assertIn("the Drive contract line 'driver seed' names a driver command", self.run_verify("freeze", ok=False))
+
+    def test_only_an_e2e_or_perf_check_may_pass_on_base(self):
+        why = "the timing exists on main; this phase must keep it"
+        self.write("plan.md", plan(CHECKS, PERF_MAIN.replace("    - Rule:", f"    - Base: passes: {why}\n    - Rule:")))
+        self.run_verify("plan")
+        self.write("plan.md", plan(CHECKS, UNIT.replace("    - Tier: unit\n", f"    - Tier: unit\n    - Base: passes: {why}\n"), PERF_NA))
+        self.assertIn("Base belongs to an e2e or perf check, whose script must fail on base; a unit spec of behavior that already "
+                      "works is marked regression-guard", self.run_verify("plan", "--checks", ok=False))
+        self.write("plan.md", plan(CHECKS.replace("    - Tier: e2e\n", "    - Tier: e2e\n    - Base: passes: <why>\n"), PERF_NA))
+        self.assertIn("Base must read 'passes: <why the base already has this behavior>'", self.run_verify("plan", ok=False))
+
     def test_sensitive_paths_cannot_keep_the_template_placeholder(self):
         self.write("plan.md", plan(CHECKS, PERF_NA, "\n## Sensitive paths\n\n- <path or glob>: <why>\n"))
         self.assertIn("Sensitive paths still holds a template placeholder", self.run_verify("plan", ok=False))
@@ -796,7 +830,7 @@ class Verify(unittest.TestCase):
         out = self.run_verify("rerun", "--only", "B1", "B2")
         self.assertIn("SKIP  B2  its fix budget is spent: 2 failed fix attempts since report.md marked it FAIL", out)
         self.assertIn("in an autonomous run put it in the project's backlog with the fix you recommend and leave it FAIL", out)
-        self.assertRegex(out, r"PASS\s+B1 ")
+        self.assertRegex(out, r"B1 PASS ")
         self.assertIn("rerun: 1 checks, 1 PASS, 0 FAIL, 1 skipped past the fix budget", out)
         self.assertNotIn("still 2 rows", out)
         self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B2": 2})
@@ -811,7 +845,7 @@ class Verify(unittest.TestCase):
         with mock.patch.object(verify, "record_run", side_effect=OSError("No space left on device")), self.assertRaises(verify.Failed) as raised:
             verify.cmd_rerun(self.dir, args)
         out = str(raised.exception)
-        self.assertRegex(out, r"ERROR B1  \(\d+\.\ds\)  verify could not run it: OSError: No space left on device")
+        self.assertRegex(out, r"B1 ERROR \d+\.\ds verify could not run it: OSError: No space left on device")
         self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 errored before verify recorded the run", out)
 
     def test_a_run_that_fails_after_a_run_beside_it_spent_the_budget_counts_no_further(self):
@@ -1465,7 +1499,7 @@ class Lock(RepoFixture):
     def test_adopt_starts_a_phase_from_its_own_base_and_every_command_reads_the_plan_where_it_lives(self):
         self.feature()
         folder = self.phase()
-        self.assertIn(f"adopted 02-csv: 1 checks, base {self.rev()[:12]}; every command reads {folder.resolve() / 'plan.md'}",
+        self.assertIn(f"adopted 02-csv: 1 checks, base {self.rev()[:12]} on main; every command reads {folder.resolve() / 'plan.md'}",
                       self.verify("adopt", str(folder)))
         self.assertFalse(self.where().joinpath("plan.md").exists())
         self.assertIn(f"{folder.resolve() / 'plan.md'}: plan ok", self.verify("plan"))
@@ -1622,7 +1656,7 @@ class Premises(RepoFixture):
         (self.folder / "grounding.md").write_text(self.based("# How export works\n"))
         (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="x").replace("| yes | calc.py:1 |", "| maybe |  |")))
         out = self.premises(ok=False)
-        self.assertIn(":5: Holds must be yes or no, not 'maybe'", out)
+        self.assertIn(":5: Holds must be yes, no, or new (built by this phase), not 'maybe'", out)
         self.assertIn(":5: Evidence is empty; cite the file:line on main", out)
         (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="x")))
         self.premises()
@@ -1647,9 +1681,83 @@ class Premises(RepoFixture):
         (where / "premises.md").write_text(self.based(self.TABLE.format(resolution=""), base))
         self.assertIn("premises ok: 2 premises cover 2 checks", self.premises())
 
+    BUILT = ("| Check | Premise | Holds | Evidence | Resolution |\n|---|---|---|---|---|\n"
+             "| B1 | export already writes a record list | yes | calc.py:1 | |\n"
+             "| B1 | export --json prints the records as JSON | new | | |\n"
+             "| P1 | the 60k-row fixture exists | no | fixtures/ holds 10 rows | {resolution} |\n")
+
+    def test_what_the_phase_builds_is_one_new_row_per_check_with_no_evidence_or_resolution(self):
+        (self.folder / "grounding.md").write_text(self.based("# How export works\n"))
+        (self.folder / "premises.md").write_text(self.based(self.BUILT.format(resolution="")))
+        self.assertEqual(self.premises(), "premises ok: 3 premises cover 2 checks, 1 do not hold, 1 new; resolve them in the design, "
+                                          "then pass `verify.py premises --resolved`\n")
+        self.assertEqual(self.premises("--resolved", ok=False), f"verify premises: {self.folder / 'premises.md'}:7: the premise does "
+                         "not hold and has no Resolution; say how the design resolves it (build what is missing, change the check, or "
+                         "the user's call)\n")
+        resolved = self.BUILT.format(resolution="the design adds a 60k-row fixture")
+        (self.folder / "premises.md").write_text(self.based(resolved))
+        self.assertEqual(self.premises("--resolved"), "premises ok: 3 premises cover 2 checks, 1 do not hold, each with its "
+                                                      "resolution, 1 new\n")
+        (self.folder / "premises.md").write_text(self.based(resolved + "| B1, P1 | the CLI parses a --json flag | new | | |\n"))
+        out = self.premises(ok=False)
+        self.assertIn(":8: B1 has a second 'new' row (the first is line 6). What the phase builds gets one 'new' row per check; "
+                      "merge them, and keep as premises only what B1 assumes already holds on the base", out)
+        self.assertNotIn("P1 has a second", out)
+
+
+class BaseBranch(RepoFixture):
+    def setUp(self):
+        super().setUp()
+        self.origin = pathlib.Path(self.tmp.name) / "origin.git"
+        self.git("clone", "-q", "--bare", str(self.repo), str(self.origin))
+        subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=self.origin, check=True)
+        self.git("remote", "add", "origin", str(self.origin))
+        self.git("fetch", "-q", "origin")
+
+    def advance_main(self):
+        """Land a commit on origin's main that this clone has not fetched."""
+        self.git("checkout", "-q", "-b", "moved-main", "origin/main")
+        self.put("README.md", "main moved on\n")
+        self.commit("Move main on")
+        self.git("push", "-q", "origin", "HEAD:main")
+        self.git("checkout", "-q", "-")
+        self.git("update-ref", "refs/remotes/origin/main", self.base)
+
+    def phase(self):
+        folder = self.repo / "docs" / "export" / "phases" / "02-csv"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        return folder
+
+    def test_a_phase_branch_cut_from_a_stale_main_is_refused_until_it_is_cut_from_the_latest(self):
+        self.assertIn("base ok: HEAD descends from origin/main at", self.verify("base"))
+        self.advance_main()
+        stale = "the phase branch is not cut from the latest main; fetch it and cut again"
+        self.assertIn(stale, self.verify("base", ok=False))
+        self.assertIn(stale, self.verify("adopt", str(self.phase()), ok=False))
+        self.git("rebase", "-q", "origin/main")
+        self.assertIn("adopted 02-csv: 1 checks", self.verify("adopt", str(self.phase())))
+        self.verify("base")
+
+    def test_a_phase_stacked_on_an_open_phase_checks_against_that_branch_by_default(self):
+        self.git("push", "-q", "origin", "HEAD:refs/heads/phase-1")
+        self.git("checkout", "-q", "-b", "phase-2")
+        self.advance_main()
+        self.assertIn("on phase-1", self.verify("adopt", str(self.phase()), "--base", "phase-1"))
+        self.assertIn("base ok: HEAD descends from origin/phase-1", self.verify("base"))
+        self.assertIn("not cut from the latest main", self.verify("base", "main", ok=False))
+        self.assertIn("cannot fetch phase-9 from origin: fatal: couldn't find remote ref phase-9. Name the branch this phase is cut "
+                      "from, pushed: `verify.py base <branch>`", self.verify("base", "phase-9", ok=False))
+
+    def test_without_an_origin_remote_the_local_branch_is_the_latest(self):
+        self.git("remote", "remove", "origin")
+        self.assertIn("base ok: HEAD descends from main at", self.verify("base"))
+        self.assertIn("the local branch, since no origin remote exists", self.verify("base"))
+
 
 class DryRun(RepoFixture):
-    SCRIPT = ('echo "verify: ready"\nif grep -q "def mul" calc.py; then echo "PASS B1: mul exists"; exit 0; fi\n'
+    STEPS = 'echo "verify: step launch within 30"\necho "verify: ready"\necho "verify: step export within 10"\n'
+    SCRIPT = (STEPS + 'if grep -q "def mul" calc.py; then echo "PASS B1: mul exists"; exit 0; fi\n'
               'echo "  not ok: mul is missing"\necho "FAIL B1: 1 of 1 assertions failed"\nexit 1\n')
 
     def setUp(self):
@@ -1673,38 +1781,77 @@ class DryRun(RepoFixture):
         self.assertIn("B1: no B1.base.log; dry-run the script on base with `verify.py dryrun --only B1 --base <worktree at the base>`",
                       self.verify("scripts", ok=False))
         out = self.dryrun()
-        self.assertRegex(out, r"FAIL\s+B1  \(\d+\.\ds\)  it reached its predicates and one failed\n")
+        self.assertRegex(out, r"B1 FAIL \d+\.\ds step export it reached its predicates and one failed\n")
         self.assertIn(f"dryrun: 1 scripts on base {self.base[:12]}: 1 fail a predicate, 0 pass (behavior already on base), 0 crash", out)
         log = (self.where / "B1.base.log").read_text()
-        self.assertTrue(log.startswith("  not ok: mul is missing\nFAIL B1: 1 of 1 assertions failed\n"), log)
+        self.assertTrue(log.startswith("verify: step launch within 30\nverify: step export within 10\n  not ok: mul is missing\n"
+                                       "FAIL B1: 1 of 1 assertions failed\n"), log)
         self.assertNotIn("verify: ready\n", log)
-        self.assertTrue(log.endswith("dryrun: ready\ndryrun: exit 1\ndryrun: FAIL (it reached its predicates and one failed)\n"), log)
+        self.assertTrue(log.endswith("dryrun: ready\ndryrun: exit 1\ndryrun: last step export\n"
+                                     "dryrun: FAIL (it reached its predicates and one failed)\n"), log)
         self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 1 failed a predicate there\n")
         (self.where / "B1.check.sh").write_text(self.SCRIPT + "# edited\n")
         self.assertIn("B1: B1.check.sh changed since its dry run", self.verify("scripts", ok=False))
 
     def test_a_script_that_crashes_on_base_fails_the_gate(self):
-        for body, why in (('echo "verify: ready"\nexit 3\n', "exit 3, not the exit 1 of a failed predicate"),
-                          ('echo "FAIL B1: no instance"\nexit 1\n', 'it never printed "verify: ready", so it failed before its instance was up'),
-                          ('echo "verify: ready"\necho "TypeError: x is undefined"\nexit 1\n', "exit 1 with no FAIL line last on stdout, so no predicate reported the failure")):
+        for body, why in ((self.STEPS + 'echo "Segmentation fault"\nexit 4\n', "exit 4, not the exit 1 of a failed predicate"),
+                          ('echo "verify: step launch within 30"\necho "FAIL B1: no instance"\nexit 1\n',
+                           'it never printed "verify: ready", so it failed before its instance was up'),
+                          (self.STEPS + 'echo "TypeError: x is undefined"\nexit 1\n', "exit 1 with no FAIL line last on stdout, so no predicate reported the failure")):
             (self.where / "B1.check.sh").write_text(body)
-            self.assertRegex(self.dryrun(ok=False), rf"CRASH B1  \(\d+\.\ds\)  {re.escape(why)}")
+            self.assertRegex(self.dryrun(ok=False), rf"B1 CRASH \d+\.\ds step \w+ {re.escape(why)}")
             self.assertIn(f"B1: it crashed on base: ({why}). A script reaches \"verify: ready\" and fails on a predicate there",
                           self.verify("scripts", ok=False))
 
     def test_a_script_verify_cannot_start_on_base_crashes_and_its_log_says_why(self):
         out = self.dryrun(ok=False, env={"PATH": self.git_only_path()})
-        self.assertRegex(out, r"CRASH B1  \(\d+\.\ds\)  verify could not run it: FileNotFoundError: ")
+        self.assertRegex(out, r"B1 CRASH \d+\.\ds verify could not run it: FileNotFoundError: ")
         self.assertIn("0 fail a predicate, 0 pass (behavior already on base), 1 crash", out)
         self.assertRegex(last := (self.where / "B1.base.log").read_text().splitlines()[-1],
                          r"^dryrun: CRASH \(verify could not run it: FileNotFoundError: .*'bash'\)$")
         self.assertIn(f"B1: it crashed on base: ({last.removeprefix('dryrun: CRASH (')}", self.verify("scripts", ok=False))
 
-    def test_a_script_that_passes_on_base_is_accepted_with_a_note(self):
-        (self.where / "B1.check.sh").write_text('echo "verify: ready"\necho "PASS B1"\n')
+    def test_a_script_that_passes_on_base_is_refused_unless_its_check_says_why_the_base_has_the_behavior(self):
+        (self.where / "B1.check.sh").write_text(self.STEPS + 'echo "PASS B1"\n')
         self.assertIn("1 pass (behavior already on base)", self.dryrun())
+        out = self.verify("scripts", ok=False)
+        self.assertIn("B1: it passes on base, so it shows no new behavior. Fix B1.check.sh or its helper so it fails on base, then run "
+                      "`verify.py dryrun --only B1 --base <worktree at the base>`", out)
+        self.assertIn("revise the plan with `verify.py freeze --revision \"<what changed and why>\"` to give B1 "
+                      "'- Base: passes: <why the base already has this behavior>'", out)
+        (self.where / "plan.md").write_text(plan(CHECKS.replace("    - Tier: e2e\n", "    - Tier: e2e\n    - Base: passes\n"), PERF_NA))
+        self.assertIn("Base must read 'passes: <why the base already has this behavior>'", self.verify("plan", ok=False))
+        why = "export --json already ships; this phase only moves it behind a flag"
+        (self.where / "plan.md").write_text(plan(CHECKS.replace("    - Tier: e2e\n", f"    - Tier: e2e\n    - Base: passes: {why}\n"), PERF_NA))
+        self.assertIn("B1 Base added", self.verify("freeze", ok=False))
+        self.verify("freeze", "--revision", "the base already exports JSON; agreed by the user")
         self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 0 failed a predicate there\n"
-                                                 "note: B1 passes on base, so its behavior already exists there\n")
+                                                 f"note: B1 passes on base, as its Base field allows: {why}\n")
+
+    def test_a_script_whose_base_log_has_no_step_line_is_refused_by_name(self):
+        (self.where / "B1.check.sh").write_text(self.SCRIPT.replace(self.STEPS, 'echo "verify: ready"\n'))
+        self.assertRegex(self.dryrun(), r"^B1 FAIL \d+\.\ds it reached its predicates and one failed\n")
+        self.assertEqual(self.verify("scripts", ok=False), "verify scripts: B1: B1.base.log holds no 'verify: step <name> within "
+                         "<seconds>' line, so B1.check.sh reports no progress and a stall waits for the --timeout safety net. Print "
+                         "one, flushed, on entering each step, setup included, then run `verify.py dryrun --only B1 --base <worktree "
+                         "at the base>`\n")
+
+    def test_a_run_on_base_that_is_inconclusive_or_stalls_fails_the_gate_and_the_summary_holds_one_line_per_script(self):
+        (self.where / "B1.check.sh").write_text(self.STEPS + 'echo "blocker: the export needs a license key"\nexit 2\n')
+        out = self.dryrun(ok=False)
+        self.assertIn("0 fail a predicate, 0 pass (behavior already on base), 0 crash, 1 inconclusive", out)
+        self.assertRegex((self.where / "dryrun.summary").read_text(),
+                         r"^B1 INCONCLUSIVE \d+\.\ds step export exit 2: blocker: the export needs a license key\n$")
+        self.assertIn("B1: it was inconclusive on base: (exit 2: blocker: the export needs a license key)", self.verify("scripts", ok=False))
+        (self.where / "B1.check.sh").write_text('echo "verify: step launch within 0.5"\necho "verify: ready"\n'
+                                                 'echo "verify: step seed within 0.5"\necho "seeding"\nsleep 30\n')
+        args = mock.Mock(base=str(self.worktree), only=None, rest=[], jobs=None, timeout=60)
+        with contextlib.chdir(self.repo), mock.patch.multiple(verify, STEP_MARGIN_S=0.3, PROGRESS_POLL_S=0.05), \
+                self.assertRaises(verify.Failed) as raised:
+            verify.cmd_dryrun(self.where, args)
+        self.assertRegex(str(raised.exception), r"\nB1 STALLED \d+\.\ds step seed passed its 0\.8s deadline; last line: seeding\n")
+        self.assertIn("dryrun: last step seed\ndryrun: STALLED", (self.where / "B1.base.log").read_text())
+        self.assertIn("B1: it stalled on base: (passed its 0.8s deadline; last line: seeding)", self.verify("scripts", ok=False))
 
     def test_the_base_worktree_must_hold_the_base_product_code(self):
         self.assertIn(f"is not at the phase base {self.base[:12]}: its product files differ (calc.py). Check out the base there",
@@ -1772,7 +1919,7 @@ class ReportWrite(RepoFixture):
         self.verify("rerun", "--only", "B1", ok=False)
         out = self.write(ok=False)
         self.assertIn("B1 is FAIL; start its Observed cell with 'defect:' and the repro", out)
-        self.assertIn("  B1 FAIL: rerun: FAIL (exit 1)", out)
+        self.assertIn("  B1 FAIL: rerun: FAIL (exit 1: 2 records)", out)
         self.observe(B1="blocker: the instance never came up", U1="mul(2, 3) is 6", W1="Export sits right of Share")
         (self.where / "B1.rerun.log").unlink()
         self.write()
@@ -2006,11 +2153,11 @@ class FixAttempts(RepoFixture):
         self.verify("rerun", "--only", "B1")
         self.assertEqual(json.loads((self.where / "rerun.ledger.json").read_text())["B1"]["verdict"], "PASS")
         out = self.verify("rerun", "--only", "B1", ok=False, env={"PATH": self.git_only_path()})
-        self.assertRegex(out, r"FAIL\s+B1  \(\d+\.\ds\)  verify could not run it: FileNotFoundError: ")
-        self.assertIn("rerun: 1 checks, 0 PASS, 1 FAIL", out)
-        self.assertRegex((self.where / "B1.rerun.log").read_text(), r"^rerun: FAIL \(verify could not run it: FileNotFoundError: .*'bash'\)\n$")
+        self.assertRegex(out, r"B1 CRASH \d+\.\ds verify could not run it: FileNotFoundError: ")
+        self.assertIn("rerun: 1 checks, 0 PASS, 0 FAIL, 1 CRASH", out)
+        self.assertRegex((self.where / "B1.rerun.log").read_text(), r"^rerun: CRASH \(verify could not run it: FileNotFoundError: .*'bash'\)\n$")
         entry = json.loads((self.where / "rerun.ledger.json").read_text())["B1"]
-        self.assertEqual((entry["head"], entry["verdict"]), (self.rev(), "FAIL"))
+        self.assertEqual((entry["head"], entry["verdict"]), (self.rev(), "CRASH"))
 
 
 class UnitTier(RepoFixture):
@@ -2394,9 +2541,89 @@ class RerunTimeout(unittest.TestCase):
                 verify.main()
             return run.call_args.args[1]
 
-    def test_defaults_to_300_seconds_and_timeout_raises_it(self):
-        self.assertEqual(self.rerun_timeout(), 300)
+    def test_defaults_to_a_7200_second_safety_net_and_timeout_changes_it(self):
+        self.assertEqual(self.rerun_timeout(), 7200)
         self.assertEqual(self.rerun_timeout("--timeout", "600"), 600)
+
+
+class Supervision(unittest.TestCase):
+    """rerun supervises each script by its step lines, with windows shortened so a stall shows in about a second."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name).resolve()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def script(self, name, body):
+        (self.dir / name).write_text(body)
+
+    def rerun(self, *only, timeout=60):
+        args = mock.Mock(only=list(only), rest=[], jobs=None, timeout=timeout, force=False, full_reason=None)
+        with mock.patch.multiple(verify, FIRST_STEP_S=1.0, STEP_MARGIN_S=0.3, PROGRESS_POLL_S=0.05):
+            try:
+                return verify.cmd_rerun(self.dir, args)
+            except verify.Failed as e:
+                return str(e)
+
+    def test_a_script_that_stops_progressing_is_killed_at_its_step_deadline_with_its_process_group(self):
+        pid = shlex.quote(str(self.dir / "pid"))
+        self.script("B1.check.sh", 'echo "verify: step seed within 0.5"\necho "seeding 3 tasks"\n'
+                                   f'sleep 30 & echo $! > {pid}; wait\n')
+        self.script("B2.check.sh", "".join(f'echo "verify: step s{i} within 0.5"\nsleep 0.4\n' for i in range(4)) + 'echo "PASS B2"\n')
+        started = time.monotonic()
+        out = self.rerun("B1", "B2")
+        self.assertLess(time.monotonic() - started, 10, out)
+        self.assertRegex(out, r"\nB1 STALLED \d+\.\ds step seed passed its 0\.8s deadline; last line: seeding 3 tasks\nB2 PASS ")
+        self.assertIn("rerun: 2 checks, 1 PASS, 0 FAIL, 1 STALLED", out)
+        self.assertTrue(gone(int((self.dir / "pid").read_text())))
+        self.assertEqual((self.dir / "B1.rerun.log").read_text().splitlines()[-1],
+                         "rerun: STALLED (step seed passed its 0.8s deadline; last line: seeding 3 tasks)")
+        self.assertEqual(verify.load_ledger(self.dir)["B1"]["verdict"], "STALLED")
+
+    def test_a_script_that_prints_no_step_line_stalls_after_the_first_window(self):
+        self.script("B1.check.sh", 'echo "starting the instance"\nsleep 30\n')
+        self.assertRegex(self.rerun("B1"), r"\nB1 STALLED \d+\.\ds no 'verify: step <name> within <seconds>' line within 1s; "
+                                           r"last line: starting the instance\n")
+
+    def test_the_exit_code_is_the_verdict_and_only_a_fail_spends_a_fix_attempt(self):
+        self.script("B1.check.sh", 'echo "verify: step seed within 5"\necho "blocker: the seed needs a license key"\nexit 2\n')
+        self.script("B2.check.sh", 'echo "verify: step seed within 5"\necho "TypeError: x is undefined"\nexit 4\n')
+        self.script("B3.check.sh", 'echo "verify: step export within 5"\necho "FAIL B3: 1 of 1 assertions failed"\nexit 1\n')
+        self.script("B4.check.sh", 'echo "verify: step export within 5"\necho "PASS B4"\n')
+        (self.dir / "report.md").write_text(Verify.FAIL_REPORT + "| B1 | FAIL | B1.rerun.log | defect: x |\n| B3 | FAIL | B3.rerun.log | defect: y |\n"
+                                            "| B2 | FAIL | B2.rerun.log | defect: z |\n")
+        self.rerun("B1", "B2", "B3")
+        out = self.rerun("B1", "B2", "B3", "B4")
+        lines = ["B1 INCONCLUSIVE {s} step seed exit 2: blocker: the seed needs a license key",
+                 "B2 CRASH {s} step seed exit 4: TypeError: x is undefined",
+                 "B3 FAIL {s} step export exit 1: FAIL B3: 1 of 1 assertions failed", "B4 PASS {s}"]
+        pattern = "\n".join(re.escape(line).replace(re.escape("{s}"), r"\d+\.\ds") for line in lines)
+        self.assertRegex(out, rf"^\n{pattern}\nrerun: 4 checks, 1 PASS, 1 FAIL, 1 INCONCLUSIVE, 1 CRASH")
+        self.assertRegex((self.dir / "rerun.summary").read_text(), rf"^{pattern}\n$")
+        self.assertEqual(json.loads((self.dir / "fix-attempts.json").read_text()), {"B3": 1})
+
+    def test_an_environment_exit_is_queued_again_twice_then_inconclusive_and_records_nothing_until_then(self):
+        self.script("B1.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B1.runs"\necho "verify: step launch within 5"\n'
+                                   '[ "$(wc -l < "$d/B1.runs")" -gt 1 ] && exit 0\necho "the load refused the instance"; exit 3\n')
+        self.script("B2.check.sh", 'd="$(dirname "$0")"; echo x >> "$d/B2.runs"\necho "verify: step launch within 5"\n'
+                                   'echo "usage limit reached"; exit 3\n')
+        (self.dir / "report.md").write_text(Verify.FAIL_REPORT)
+        out = self.rerun("B1", "B2")
+        self.assertIn("REQUEUED B1  exit 3: the load refused the instance: the instance or machine could not support the run; "
+                      "queued again for when `capacity` passes (1 of 2)\n", out)
+        self.assertIn("REQUEUED B2  exit 3: usage limit reached: the instance or machine could not support the run; queued again "
+                      "for when `capacity` passes (2 of 2)\n", out)
+        self.assertRegex(out, r"\nB1 PASS \d+\.\ds\nB2 INCONCLUSIVE \d+\.\ds step launch environment: exit 3: usage limit reached\n")
+        self.assertEqual([(self.dir / f"{i}.runs").read_text().count("x") for i in ("B1", "B2")], [2, 3])
+        self.assertEqual((self.dir / "B1.rerun.log").read_text(), "verify: step launch within 5\nrerun: PASS\n")
+        self.assertEqual({i: e["verdict"] for i, e in verify.load_ledger(self.dir).items()}, {"B1": "PASS", "B2": "INCONCLUSIVE"})
+        self.assertFalse((self.dir / "fix-attempts.json").exists())
+
+    def test_the_timeout_is_a_total_safety_net_recorded_as_a_crash(self):
+        self.script("B1.check.sh", "".join(f'echo "verify: step s{i} within 0.5"\nsleep 0.3\n' for i in range(10)))
+        self.assertRegex(self.rerun("B1", timeout=1), r"\nB1 CRASH \d+\.\ds step s\d timed out after 1s, the --timeout safety net\n")
 
 
 class RunGroup(unittest.TestCase):

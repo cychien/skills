@@ -31,6 +31,20 @@ SALVO_DETACHED = ("salvo runs every model and blocks until all finish. Detaching
                   "harness, so nothing notifies you when it ends. Run the same command without nohup or & in a background tool call "
                   "(Claude Code: Bash with run_in_background) and wait for its completion notification.")
 
+VERIFY_RUN = re.compile(r"verify\.py\b.*\b(?:rerun|dryrun)\b")
+VERIFY_OUTPUT = re.compile(r"(?:re|dry)run\w*\.[\w.]+$", re.I)
+BRACKETED = re.compile(r"\[([^\]\\])\]")
+VERIFY_POLL_DENIED = ("Do not poll for a verify.py rerun or dryrun to finish. Run it in a background tool call (Claude Code: Bash with "
+                      "run_in_background) and end the turn or do other work: the completion notification arrives on its own.")
+PROCESS_MATCHERS = {"pgrep", "pkill"}
+MATCHER_VALUED = {"-d", "-F", "-g", "-G", "-J", "-M", "-N", "-P", "-s", "-t", "-u", "-U", "--signal", "--delimiter", "--pgroup",
+                  "--group", "--parent", "--session", "--terminal", "--euid", "--uid", "--pidfile", "--ns", "--nslist", "--runstates",
+                  "--cgroup", "--env"}
+FULL_MATCH = re.compile(r"-[A-Za-z]*f[A-Za-z]*$")
+SELF_MATCH_DENIED = ("`{tool} -f {pattern}` matches the shell that runs this command, because that shell's command line holds the "
+                     "pattern, so a wait on it never ends and a kill hits the shell itself. Wait on a marker the job itself writes, or "
+                     "run the job in a background tool call and take its completion notification; to match only another process, "
+                     "bracket one character of the pattern, as in `[v]erify.py`.")
 
 POLL_LOOP = re.compile(r"\b(while|until|for)\b")
 POLL_SLEEP = re.compile(r"\bsleep\b|select\s*\(\s*undef|Start-Sleep")
@@ -367,6 +381,11 @@ def on_pre_tool(event):
     command = shell_command(event) or ""
     if detached_salvo(command):
         return "deny", SALVO_DETACHED
+    if polls_verify_run(command):
+        return "deny", VERIFY_POLL_DENIED
+    matcher = self_matching_pattern(command)
+    if matcher:
+        return "deny", SELF_MATCH_DENIED.format(tool=matcher[0], pattern=shlex.quote(matcher[1]))
     prompt = outgoing_prompt(event, command)
     unfilled = unfilled_template(prompt, event.cwd)
     if unfilled:
@@ -452,6 +471,67 @@ def runs_todo(command):
 
 def polls_for_subagent(command):
     return all(p.search(command) for p in (POLL_LOOP, POLL_SLEEP, POLL_TARGET))
+
+
+def polls_verify_run(command):
+    """Whether a while or until loop with a sleep waits on a verify.py rerun or dryrun: its process, by text another
+    command matches, or its output file, by name or by the redirect that wrote it."""
+    outputs = set()
+    for tokens in shell.commands(command):
+        name, rest = shell.script(tokens)
+        if name == "verify.py" and rest[:1] in (["rerun"], ["dryrun"]):
+            outputs |= set(redirect_targets(rest))
+    for body in shell.loops(command):
+        if not any(os.path.basename(tokens[0]) == "sleep" for tokens in body):
+            continue
+        for tokens in body:
+            if shell.script(tokens)[0] == "verify.py":
+                continue
+            args = tokens[1:]
+            if VERIFY_RUN.search(BRACKETED.sub(r"\1", " ".join(args)).replace("\\", "")):
+                return True
+            if any(arg in outputs or VERIFY_OUTPUT.search(os.path.basename(arg)) for arg in args):
+                return True
+    return False
+
+
+def redirect_targets(tokens):
+    targets = []
+    for i, token in enumerate(tokens):
+        found = shell.REDIRECT.match(token)
+        if found and ">" in token:
+            targets.append(found.group(1) or (tokens[i + 1] if i + 1 < len(tokens) else ""))
+    return [t for t in targets if t]
+
+
+def self_matching_pattern(command):
+    """(pgrep or pkill, pattern) for a full-command-line match whose pattern matches the command line that holds it."""
+    for tokens in shell.commands(command):
+        tool = os.path.basename(tokens[0])
+        if tool not in PROCESS_MATCHERS:
+            continue
+        full, patterns, rest = False, [], tokens[1:]
+        while rest:
+            token = rest.pop(0)
+            if token == "--":
+                patterns += rest
+                break
+            if redirect := shell.REDIRECT.match(token):
+                rest = rest if redirect.group(1) else rest[1:]
+            elif token in MATCHER_VALUED:
+                rest = rest[1:]
+            elif token == "--full" or FULL_MATCH.match(token):
+                full = True
+            elif not token.startswith("-"):
+                patterns.append(token)
+        for pattern in patterns if full else []:
+            try:
+                hit = re.search(pattern, command) is not None
+            except re.error:
+                hit = pattern in command
+            if hit:
+                return tool, pattern
+    return None
 
 
 def outgoing_prompt(event, command):
