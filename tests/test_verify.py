@@ -2572,14 +2572,16 @@ class RerunTimeout(unittest.TestCase):
 
 
 class Supervision(unittest.TestCase):
-    """rerun supervises each script by its step lines, with windows shortened so a stall shows in about a second."""
+    """rerun supervises each script by its step lines, with windows shortened so a stall shows in about a second. It runs
+    in a repository of its own, because whether a failing run is a fix attempt depends on the product state git reports."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.dir = pathlib.Path(self.tmp.name).resolve()
-
-    def tearDown(self):
-        self.tmp.cleanup()
+        for args in (["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "start"]):
+            subprocess.run(["git", *args], cwd=self.dir, check=True, capture_output=True)
+        self.enterContext(contextlib.chdir(self.dir))
 
     def script(self, name, body):
         (self.dir / name).write_text(body)
