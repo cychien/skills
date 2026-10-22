@@ -20,6 +20,9 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DEPTH = 4
 OPENERS = {"do", "then", "else", "elif", "{", "!"}
 LEADING_CD = re.compile(r"\s*cd\s+((?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^\s;&|'\"\\])+)\s*(?:&&|;)")
+LEADING_CD_WORD = re.compile(r"\s*cd(?:\s|;|&|$)")
+UNKNOWN_TARGET = re.compile(r"[$`*?\[]")
+UNQUOTED_TILDE = re.compile(r"^~[\w.-]*(?:/|$)")
 
 
 def substitution(text, i):
@@ -177,16 +180,22 @@ def invocations(line, name):
 
 
 def workdir(line, cwd):
-    """The directory a shell line's commands run in: cwd moved by each leading `cd <dir> &&` or `cd <dir>;`."""
-    directory, at = cwd, 0
-    while found := LEADING_CD.match(line or "", at):
+    """The directory a shell line's commands run in: cwd moved by each leading `cd <dir> &&` or `cd <dir>;`, or None when
+    a leading cd goes where only the shell can know (`cd -`, a variable, a substitution, a glob, an option)."""
+    directory, at, line = cwd, 0, line or ""
+    while LEADING_CD_WORD.match(line, at):
+        found = LEADING_CD.match(line, at)
+        if not found or UNKNOWN_TARGET.search(found.group(1)):
+            return None
         try:
             target = shlex.split(found.group(1))[0]
         except (ValueError, IndexError):
-            break
-        if target == "-" or "$" in target:
-            break
-        directory = os.path.normpath(os.path.join(directory or ".", os.path.expanduser(target)))
+            return None
+        if target.startswith("-"):
+            return None
+        if UNQUOTED_TILDE.match(found.group(1)):
+            target = os.path.expanduser(target)
+        directory = os.path.normpath(os.path.join(directory or ".", target))
         at = found.end()
     return directory
 

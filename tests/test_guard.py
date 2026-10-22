@@ -1231,6 +1231,21 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": f"ls; cd {worktree} && {launches[0]}"}}),
                           "only a leading cd moves the command")
 
+    def test_a_cd_whose_target_guard_cannot_know_never_applies_the_reservation(self):
+        self.models()
+        here, home = pathlib.Path(self.tmp.name), pathlib.Path(self.tmp.name) / "home"
+        real = "# Plan\n\n### T1. A real turn\n\n- Agent: real: Codex must choose the command\n"
+        self.plans_where_run({here: real, home: real})
+        self.env["HOME"] = str(home)
+        launch = "codex exec -m gpt-5 - < review.md"
+        for unknown in ("cd -", 'cd "$WORKTREE"', "cd $(git rev-parse --show-toplevel)", "cd `git rev-parse --show-toplevel`",
+                        "cd -P worktrees", "cd worktrees/*"):
+            self.assertIsNone(self.denial(f"{unknown} && {launch}"), unknown)
+        for literal in ("cd '~'", 'cd "~"', "cd \\~"):
+            self.assertIsNone(self.denial(f"{literal} && {launch}"), f"{literal} names the directory '~' here, which has no plan")
+        for moved in ("cd ~", "cd ~/", "cd ."):
+            self.assertIn("codex is reserved", self.denial(f"{moved} && {launch}") or "", moved)
+
     def denial(self, command):
         out = self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
         return out and out["hookSpecificOutput"]["permissionDecisionReason"]
