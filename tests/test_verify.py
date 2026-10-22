@@ -1749,6 +1749,22 @@ class BaseBranch(RepoFixture):
         self.assertIn("cannot fetch phase-9 from origin: fatal: couldn't find remote ref phase-9. Name the branch this phase is cut "
                       "from, pushed: `verify.py base <branch>`", self.verify("base", "phase-9", ok=False))
 
+    def test_with_no_default_branch_ref_here_the_default_branch_is_read_from_origin(self):
+        self.git("push", "-q", "origin", "main:trunk")
+        subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/trunk"], cwd=self.origin, check=True)
+        self.git("checkout", "-q", "--detach")
+        self.git("branch", "-q", "-D", "main", "feature/mul")
+        for ref in self.git("for-each-ref", "--format=%(refname)", "refs/remotes").split():
+            self.git("update-ref", "--no-deref", "-d", ref)
+        self.assertIn("base ok: HEAD descends from origin/trunk at", self.verify("base"))
+        self.assertIn(f"base {self.base[:12]} on trunk", self.verify("adopt", str(self.phase())))
+
+    def test_with_no_default_branch_ref_and_no_origin_remote_base_asks_for_the_branch(self):
+        self.git("checkout", "-q", "--detach")
+        self.git("branch", "-q", "-D", "main", "feature/mul")
+        self.git("remote", "remove", "origin")
+        self.assertIn("cannot find the branch this phase is cut from", self.verify("base", ok=False))
+
     def test_without_an_origin_remote_the_local_branch_is_the_latest(self):
         self.git("remote", "remove", "origin")
         self.assertIn("base ok: HEAD descends from main at", self.verify("base"))

@@ -42,8 +42,9 @@ directory.
               an older adopt is removed when it matches, and refused when it differs.
   base        the phase branch is cut from the latest <branch>: runs `git fetch origin <branch>` and passes when
               origin/<branch> is an ancestor of HEAD (without an origin remote, the local <branch>). With no <branch>, the
-              branch `adopt --base` recorded for this branch, else main (the repository's default branch). A phase that
-              stacks on an earlier phase's open PR passes that phase's branch.
+              branch `adopt --base` recorded for this branch, else main (the repository's default branch, asked of
+              origin when no ref here names it). A phase that stacks on an earlier phase's open PR passes that phase's
+              branch.
   premises    premises.md and grounding.md sit beside the plan (the phase folder, else the verification directory), each
               with a line 'Base: <sha>' naming the base it was checked at, which must be the phase's base (the commit
               `adopt` recorded, else the merge-base with main); a full or abbreviated sha of it counts. premises.md holds
@@ -929,7 +930,18 @@ def latest_base(branch):
 
 
 def default_base_branch():
-    return default_branch().removeprefix("origin/")
+    """The repository's default branch name: from the local refs, else from origin's HEAD, which a clone with no main or
+    remote-tracking ref here (a detached checkout, a single-branch fetch) still has."""
+    try:
+        return default_branch().removeprefix("origin/")
+    except Failed:
+        if "origin" in git("remote").split():
+            listed = subprocess.run(["git", "ls-remote", "--symref", "origin", "HEAD"], capture_output=True, text=True)
+            if m := re.search(r"^ref: refs/heads/(\S+)\tHEAD$", listed.stdout, re.M):
+                return m.group(1)
+        raise Failed("cannot find the branch this phase is cut from: no origin/HEAD, main or master ref here, and no origin "
+                     "remote that names its default branch. Name it: `verify.py base <branch>` or `verify.py adopt <phase "
+                     "folder> --base <branch>`")
 
 
 def cmd_base(directory, args):
