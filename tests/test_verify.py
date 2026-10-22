@@ -1787,7 +1787,7 @@ class DryRun(RepoFixture):
         self.assertTrue(log.startswith("verify: step launch within 30\nverify: step export within 10\n  not ok: mul is missing\n"
                                        "FAIL B1: 1 of 1 assertions failed\n"), log)
         self.assertNotIn("verify: ready\n", log)
-        self.assertTrue(log.endswith("dryrun: ready\ndryrun: exit 1\ndryrun: last step export\n"
+        self.assertTrue(log.endswith("dryrun: ready\ndryrun: exit 1\ndryrun: step launch before ready\ndryrun: last step export\n"
                                      "dryrun: FAIL (it reached its predicates and one failed)\n"), log)
         self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 1 failed a predicate there\n")
         (self.where / "B1.check.sh").write_text(self.SCRIPT + "# edited\n")
@@ -1828,13 +1828,22 @@ class DryRun(RepoFixture):
         self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 0 failed a predicate there\n"
                                                  f"note: B1 passes on base, as its Base field allows: {why}\n")
 
-    def test_a_script_whose_base_log_has_no_step_line_is_refused_by_name(self):
-        (self.where / "B1.check.sh").write_text(self.SCRIPT.replace(self.STEPS, 'echo "verify: ready"\n'))
-        self.assertRegex(self.dryrun(), r"^B1 FAIL \d+\.\ds it reached its predicates and one failed\n")
-        self.assertEqual(self.verify("scripts", ok=False), "verify scripts: B1: B1.base.log holds no 'verify: step <name> within "
-                         "<seconds>' line, so B1.check.sh reports no progress and a stall waits for the --timeout safety net. Print "
-                         "one, flushed, on entering each step, setup included, then run `verify.py dryrun --only B1 --base <worktree "
-                         "at the base>`\n")
+    def test_a_script_with_no_step_line_on_stdout_before_ready_is_refused_by_name(self):
+        refusal = ("verify scripts: B1: B1.base.log shows no 'verify: step <name> within <seconds>' line on stdout before \"verify: "
+                   "ready\", so B1.check.sh runs its setup with no step deadline and a stall there waits for the --timeout safety "
+                   "net. Print one to stdout, flushed, on entering each step, setup first, then run `verify.py dryrun --only B1 "
+                   "--base <worktree at the base>`\n")
+        after_ready = 'echo "verify: ready"\necho "verify: step export within 10"\n'
+        on_stderr = 'echo "verify: step launch within 30" >&2\necho "verify: ready"\necho "verify: step export within 10" >&2\n'
+        faked = 'echo "verify: ready"\necho "dryrun: step launch before ready"\n'
+        for steps in ('echo "verify: ready"\n', after_ready, on_stderr, faked):
+            (self.where / "B1.check.sh").write_text(self.SCRIPT.replace(self.STEPS, steps))
+            self.assertRegex(self.dryrun(), r"^B1 FAIL \d+\.\ds (step export )?it reached its predicates and one failed\n")
+            self.assertIn("dryrun: no step line on stdout before ready\n", (self.where / "B1.base.log").read_text())
+            self.assertEqual(self.verify("scripts", ok=False), refusal, steps)
+        (self.where / "B1.check.sh").write_text(self.SCRIPT)
+        self.dryrun()
+        self.assertEqual(self.verify("scripts"), "scripts ok: 1 e2e checks dry-ran on base, 1 failed a predicate there\n")
 
     def test_a_run_on_base_that_is_inconclusive_or_stalls_fails_the_gate_and_the_summary_holds_one_line_per_script(self):
         (self.where / "B1.check.sh").write_text(self.STEPS + 'echo "blocker: the export needs a license key"\nexit 2\n')

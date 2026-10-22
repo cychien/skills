@@ -313,6 +313,8 @@ BASE_LOG = ".base.log"
 DRYRUN_VERDICT = re.compile(r"^dryrun: (FAIL|PASS|CRASH|INCONCLUSIVE|STALLED)\b")
 UNGRADED = {"CRASH": "crashed", "STALLED": "stalled", "INCONCLUSIVE": "was inconclusive"}
 DRYRUN_SCRIPT = re.compile(r"^dryrun: script sha256 ([0-9a-f]{64})$", re.M)
+DRYRUN_STEP_BEFORE_READY = re.compile(r"^dryrun: step \S.* before ready$", re.M)
+DRYRUN_NO_STEP_BEFORE_READY = "dryrun: no step line on stdout before ready"
 FAIL_LINE = re.compile(r"^FAIL\b")
 FIX_ATTEMPTS = 2
 FIX_LEDGER = "fix-attempts.json"
@@ -1887,10 +1889,12 @@ def could_not_run(error):
 
 def supervised_run(path, args, env, run, cwd=None):
     """One run of a check script under progress supervision: its exit code, stdout, output, whether it printed READY_LINE,
-    its last step and output line, and, when verify stopped it (killed) or could not start it, the verdict and reason."""
-    progress, seen = {"step": None, "last": ""}, threading.Event()
+    the step open on stdout when it did, its last step and output line, and, when verify stopped it (killed) or could not
+    start it, the verdict and reason."""
+    progress, seen, at_ready = {"step": None, "last": ""}, threading.Event(), {}
 
     def on_ready():
+        at_ready.setdefault("step", progress["step"])
         seen.set()
         if run:
             run["ready"]()
@@ -1910,7 +1914,7 @@ def supervised_run(path, args, env, run, cwd=None):
                            output=((e.output or "") + (e.stderr or "")).strip("\n"), killed=True)
         except Exception as e:
             outcome.update(verdict="CRASH", reason=could_not_run(e))
-    return {**outcome, "ready": seen.is_set(), "step": progress["step"], "last": progress["last"]}
+    return {**outcome, "ready": seen.is_set(), "ready_step": at_ready.get("step"), "step": progress["step"], "last": progress["last"]}
 
 
 def rerun_verdict(outcome):
@@ -2212,6 +2216,7 @@ def dry_check(directory, path, args, env, base, run):
     trailer = [f"dryrun: base {base['path']} at {base['head']}", f"dryrun: script sha256 {hashlib.sha256(path.read_bytes()).hexdigest()}",
                "dryrun: ready" if outcome["ready"] else f"dryrun: never printed \"{READY_LINE}\""]
     trailer += [f"dryrun: {ended}"] if ended else []
+    trailer += [f"dryrun: step {outcome['ready_step']} before ready" if outcome["ready_step"] else DRYRUN_NO_STEP_BEFORE_READY]
     trailer += [f"dryrun: last step {outcome['step']}"] if outcome["step"] else []
     output = outcome["output"]
     (directory / f"{check_id}{BASE_LOG}").write_text((output + "\n" if output else "") + "\n".join([*trailer, f"dryrun: {verdict} ({why})"]) + "\n")
@@ -2266,8 +2271,11 @@ def base_passes(text):
             if (check_id := entry_id(entry)) and (m := BASE_PASSES.match(entry["fields"].get("Base", (0, ""))[1]))}
 
 
-def has_step_line(text):
-    return any(STEP_LINE.match(line.strip()) for line in text.splitlines())
+def stepped_before_ready(text):
+    """Whether a base log's trailer, the lines from its last 'dryrun: base', says the script printed a step line on stdout
+    before READY_LINE, so its setup ran under a deadline."""
+    trailer = text[text.rfind("\ndryrun: base ") + 1:]
+    return bool(DRYRUN_STEP_BEFORE_READY.search(trailer))
 
 
 def dry_run_problems(check_id, script, log, allowed):
@@ -2281,9 +2289,10 @@ def dry_run_problems(check_id, script, log, allowed):
         return [f"{check_id}: {log.name} is not a `verify.py dryrun` log; run {again}"], None
     if recorded.group(1) != hashlib.sha256(script.read_bytes()).hexdigest():
         return [f"{check_id}: {script.name} changed since its dry run; run {again}"], None
-    problems = [] if has_step_line(text) else [
-        f"{check_id}: {log.name} holds no '{STEP_FORMAT}' line, so {script.name} reports no progress and a stall waits for the "
-        f"--timeout safety net. Print one, flushed, on entering each step, setup included, then run {again}"]
+    problems = [] if stepped_before_ready(text) else [
+        f"{check_id}: {log.name} shows no '{STEP_FORMAT}' line on stdout before \"{READY_LINE}\", so {script.name} runs its setup "
+        f"with no step deadline and a stall there waits for the --timeout safety net. Print one to stdout, flushed, on entering "
+        f"each step, setup first, then run {again}"]
     graded = verdict.group(1)
     if graded in UNGRADED:
         problems.append(f"{check_id}: it {UNGRADED[graded]} on base: {last_line(log).removeprefix(f'dryrun: {graded} ')}. A script "
