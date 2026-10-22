@@ -1930,10 +1930,10 @@ class DryRun(RepoFixture):
             runner = threading.Thread(target=dryrun)
             runner.start()
             deadline = time.monotonic() + 20
-            while time.monotonic() < deadline and verify.live_scripts(self.where).get("B1", {}).get("step") != "seed":
+            while time.monotonic() < deadline and [e.get("step") for e in verify.live_scripts(self.where)] != ["seed"]:
                 time.sleep(0.05)
             self.assertIn("the dryrun records it STALLED with its step and last line in B1.base.log",
-                          verify.cmd_stop(self.where, mock.Mock(rest=["B1"])))
+                          verify.cmd_stop(self.where, mock.Mock(rest=["B1"], run=None)))
             runner.join(30)
         self.assertRegex(failed["out"], r"\nB1 STALLED \d+\.\ds step seed stopped by `verify.py stop`; last line: seeding\n")
         self.assertIn("dryrun: last step seed\ndryrun: STALLED", (self.where / "B1.base.log").read_text())
@@ -2753,47 +2753,114 @@ class RunGroup(unittest.TestCase):
         self.assertEqual((ok, detail), (False, "timed out after 1s"))
         self.assertTrue(gone(int((self.base / "pid").read_text())))
 
-    def test_stop_ends_a_script_with_its_detached_descendants_records_it_stalled_and_the_run_goes_on(self):
+    def verify_cli(self, directory, *args):
+        return subprocess.run([sys.executable, "-I", str(VERIFY), *args, "--dir", str(directory)], capture_output=True, text=True,
+                              env={**os.environ, "VERIFY_HOME": str(self.base / "home")}, cwd=self.base, timeout=60)
+
+    def start_rerun(self, directory, *args):
+        rerun = subprocess.Popen([sys.executable, "-I", str(VERIFY), "rerun", *args, "--dir", str(directory)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, env={**os.environ, "VERIFY_HOME": str(self.base / "home")},
+                                 cwd=self.base)
+        self.addCleanup(lambda: rerun.poll() is None and rerun.kill())
+        return rerun
+
+    def detach(self, pid_file, linger=0.0):
+        """A command that starts sleep 60 in its own session, writes its pid, and lingers before it exits; once it exits the
+        sleep is reparented to init, a detached process."""
+        code = ("import subprocess, sys, time; p = subprocess.Popen(['sleep', '60'], start_new_session=True); "
+                f"open(sys.argv[1], 'w').write(str(p.pid)); time.sleep({linger})")
+        self.addCleanup(kill_recorded, pid_file)
+        return [sys.executable, "-c", code, str(pid_file)]
+
+    def test_stop_ends_exactly_what_the_script_started_by_lineage_records_it_stalled_and_the_run_goes_on(self):
         directory = self.base / "verification"
         directory.mkdir()
-        pids = {name: self.base / f"{name}.pid" for name in ("child", "own-session", "orphan")}
-        for path in pids.values():
-            self.addCleanup(kill_recorded, path)
-        detach = (f"{shlex.quote(sys.executable)} -c 'import subprocess, sys; p = subprocess.Popen([\"sleep\", \"60\"], "
-                  "start_new_session=True); open(sys.argv[1], \"w\").write(str(p.pid)); sys.argv[2] == \"wait\" and p.wait()'")
+        pids = {name: self.base / f"{name}.pid" for name in ("child", "own-session", "late-orphan", "foreign")}
+        self.addCleanup(kill_recorded, pids["child"])
+        own_session = self.detach(pids["own-session"], linger=60)
+        late_orphan = self.detach(pids["late-orphan"], linger=1.5)
         (directory / "B1.check.sh").write_text(
             'echo "verify: step seed within 0.5"\necho "seeding 3 tasks"\n'
-            f'{detach} {shlex.quote(str(pids["own-session"]))} wait &\n'
-            f'(cd "$VERIFY_DIR" && {detach} {shlex.quote(str(pids["orphan"]))} exit)\n'
+            f'{shlex.join(own_session)} &\n'
+            'until [ -e "$VERIFY_DIR/foreign.started" ] || [ ! -d "$VERIFY_DIR" ]; do sleep 0.05; done\nsleep 1.5\necho "verify: ready"\n'
+            'until [ -e "$VERIFY_DIR/B2.started" ] || [ ! -d "$VERIFY_DIR" ]; do sleep 0.05; done\n'
+            f'(cd "$VERIFY_DIR" && {shlex.join(late_orphan)})\n'
             f'sleep 60 & echo $! > {shlex.quote(str(pids["child"]))}; wait\n')
-        (directory / "B2.check.sh").write_text('echo "verify: step export within 5"\necho "PASS B2"\n')
-        env = {**os.environ, "VERIFY_HOME": str(self.base / "home")}
-
-        def verify_cli(*args):
-            return subprocess.run([sys.executable, "-I", str(VERIFY), *args, "--dir", str(directory)], capture_output=True,
-                                  text=True, env=env, cwd=self.base, timeout=60)
-        self.assertEqual(verify_cli("stop").stdout, f"stop: no script of a rerun or dryrun runs from {directory}\n")
-        rerun = subprocess.Popen([sys.executable, "-I", str(VERIFY), "rerun", "--dir", str(directory)], stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, env=env, cwd=self.base)
-        self.addCleanup(lambda: rerun.poll() is None and rerun.kill())
-        started = [wait_for_file(path) for path in pids.values()]
-        listing = verify_cli("stop").stdout
-        self.assertRegex(listing, r"^B1 rerun running \d+s, step seed, \d+s left of its 15\.5s deadline\n"
-                                  r"Stop one only once you judge it dead: verify.py stop <id>\n$")
-        self.assertIn("no running script B9", verify_cli("stop", "B9").stdout)
-        stopped = verify_cli("stop", "B1")
+        (directory / "B2.check.sh").write_text('touch "$VERIFY_DIR/B2.started"\necho "verify: step export within 30"\n'
+                                               'until [ -e "$VERIFY_DIR/B2.go" ] || [ ! -d "$VERIFY_DIR" ]; do sleep 0.05; done\necho "PASS B2"\n')
+        self.assertEqual(self.verify_cli(directory, "stop").stdout, f"stop: no script of a rerun or dryrun runs from {directory}\n")
+        rerun = self.start_rerun(directory, "--jobs", "2")
+        wait_for_file(pids["own-session"])
+        foreign = self.detach(pids["foreign"])
+        subprocess.run(foreign, cwd=directory, check=True)
+        (directory / "foreign.started").touch()
+        started = [wait_for_file(pids[name]) for name in ("child", "own-session", "late-orphan")]
+        listing = self.verify_cli(directory, "stop").stdout
+        self.assertRegex(listing, rf"^B1 run {rerun.pid}: rerun running \d+s, step seed, past its 15\.5s deadline by \d+s|"
+                                  rf"^B1 run {rerun.pid}: rerun running \d+s, step seed, \d+s left of its 15\.5s deadline\n")
+        self.assertRegex(listing, rf"\nB2 run {rerun.pid}: rerun running \d+s, step export, .*\nStop one only once you judge it dead")
+        self.assertIn("no running script B9", self.verify_cli(directory, "stop", "B9").stdout)
+        stopped = self.verify_cli(directory, "stop", "B1")
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
-        self.assertRegex(stopped.stdout, r"^stopped B1 \(\d+ processes\), rerun running \d+s, step seed, .*; the rerun records it "
-                                         r"STALLED with its step and last line in B1\.rerun\.log\n$")
+        self.assertRegex(stopped.stdout, rf"^stopped B1 of run {rerun.pid} \(\d+ processes\), rerun running \d+s, step seed, .*; the "
+                                         r"rerun records it STALLED with its step and last line in B1\.rerun\.log\n$")
+        self.assertEqual([pid for pid in started if not gone(pid)], [])
+        self.assertFalse(gone(wait_for_file(pids["foreign"]), wait=0.5), "a process the script never started was stopped")
+        (directory / "B2.go").touch()
         out = rerun.communicate(timeout=30)[0]
         self.assertEqual(rerun.returncode, 1, out)
         self.assertRegex(out, r"\nB1 STALLED \d+\.\ds step seed stopped by `verify.py stop`; last line: seeding 3 tasks\nB2 PASS ")
         self.assertIn("rerun: 2 checks, 1 PASS, 0 FAIL, 1 STALLED", out)
-        self.assertTrue(all(gone(pid) for pid in started), started)
         self.assertEqual((directory / "B1.rerun.log").read_text().splitlines()[-1],
                          "rerun: STALLED (step seed stopped by `verify.py stop`; last line: seeding 3 tasks)")
         self.assertEqual(verify.load_ledger(directory)["B1"]["verdict"], "STALLED")
         self.assertFalse((directory / "running.json").exists())
+
+    def test_two_runs_of_one_check_keep_their_own_entries_and_stop_asks_which_run(self):
+        directory = self.base / "verification"
+        directory.mkdir()
+        (directory / "B1.check.sh").write_text('echo "verify: step wait within 30"\necho $$ >> "$VERIFY_DIR/B1.pids"\n'
+                                               'until [ -e "$VERIFY_DIR/B1.go.$$" ] || [ ! -d "$VERIFY_DIR" ]; do sleep 0.05; done\necho "PASS B1"\n')
+
+        def scripts(count):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                with contextlib.suppress(OSError):
+                    if len(pids := (directory / "B1.pids").read_text().split()) >= count:
+                        return pids
+                time.sleep(0.05)
+            self.fail(f"{count} B1 scripts never started")
+        first = self.start_rerun(directory, "--only", "B1")
+        first_script = scripts(1)[0]
+        second = self.start_rerun(directory, "--only", "B1")
+        scripts(2)
+        listing = self.verify_cli(directory, "stop").stdout
+        self.assertRegex(listing, rf"^B1 run {first.pid}: rerun running .*\nB1 run {second.pid}: rerun running .*\nStop one")
+        refused = self.verify_cli(directory, "stop", "B1")
+        self.assertEqual(refused.returncode, 1)
+        self.assertRegex(refused.stdout, rf"B1 runs in 2 runs, so name the one to stop:\n  B1 run {first.pid}: .*\n  B1 run {second.pid}: "
+                                         r".*\nverify.py stop B1 --run <pid>\n$")
+        (directory / f"B1.go.{first_script}").touch()
+        self.assertIn("B1 PASS", first.communicate(timeout=30)[0])
+        self.assertRegex(self.verify_cli(directory, "stop").stdout, rf"^B1 run {second.pid}: rerun running ")
+        self.assertIn("no running script B1 in run 1", self.verify_cli(directory, "stop", "B1", "--run", "1").stdout)
+        self.assertRegex(self.verify_cli(directory, "stop", "B1", "--run", str(second.pid)).stdout, rf"^stopped B1 of run {second.pid} ")
+        self.assertIn("B1 STALLED", second.communicate(timeout=30)[0])
+        self.assertFalse((directory / "running.json").exists())
+
+    def test_a_stopped_script_that_traps_the_signal_and_exits_0_is_still_stalled(self):
+        directory = self.base / "verification"
+        directory.mkdir()
+        (directory / "B1.check.sh").write_text("trap 'echo \"cleaned up\"; exit 0' TERM\n"
+                                               'echo "verify: step seed within 30"\necho "seeding"\nwhile [ -d "$VERIFY_DIR" ]; do sleep 0.1; done\n')
+        rerun = self.start_rerun(directory)
+        deadline = time.monotonic() + 20
+        while "step seed" not in self.verify_cli(directory, "stop").stdout and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertRegex(self.verify_cli(directory, "stop", "B1").stdout, r"^stopped B1 ")
+        out = rerun.communicate(timeout=30)[0]
+        self.assertRegex(out, r"\nB1 STALLED \d+\.\ds step seed stopped by `verify.py stop`; last line: cleaned up\n")
+        self.assertEqual(verify.load_ledger(directory)["B1"]["verdict"], "STALLED")
 
     def detached_holder(self, name):
         """A shell line that starts a process in its own session, holding the script's stdout and stderr where killing the

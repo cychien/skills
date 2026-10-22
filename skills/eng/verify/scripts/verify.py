@@ -10,7 +10,7 @@ usage: verify.py <command> [--dir DIR]
        verify.py units [<base>..<head>] [--test-cmd 'CMD {files}'] [--spec PATH ...] [--timeout SECONDS]
        verify.py dryrun --base <worktree at the base> [--only ID ...] [--jobs N] [-- ARGS ...]
        verify.py rerun [--only ID ...] [--jobs N] [--force] [--full-reason "<why; agreed by whom>"] [-- ARGS ...]
-       verify.py stop [<id> ...]
+       verify.py stop [<id> ... [--run <pid>]]
        verify.py report [--write --author <agent:model> --verifier <agent:model> [--note "<text>" ...]]
        verify.py script-fix <file> --reason "<why it crashed before its predicate>"
        verify.py phases [<plan folder>]
@@ -88,12 +88,19 @@ directory.
               working directory, VERIFY_DRYRUN=1 in its environment, and write <id>.base.log with its output and verdict.
               Scripts start, are supervised, and are requeued on exit 3 the way `rerun` does it, and the compact lines go
               to dryrun.summary. Exits 1 when a script crashed, stalled, or was inconclusive.
-  stop        end a running script of the current rerun or dryrun the lead judged dead: <id> names it, and verify
-              stops its whole process tree, detached descendants included, records it STALLED with the step it was in
-              and its last output line, and lets the run go on with the rest. Without an id it lists the running
-              scripts, each with its step, how long it has run, and whether it is past its step deadline (by how much,
-              and its last output line then), and stops nothing. The running scripts are kept in running.json in the
-              verification directory while a run lasts.
+  stop        end a running script of a rerun or dryrun the lead judged dead: <id> names it, and verify stops what
+              the script started, records it STALLED with the step it was in and its last output line, whatever it
+              exits with, and lets the run go on with the rest. What a script started is known by lineage only: while
+              it runs, its run samples the process table every 0.5 seconds, and a process seen below the script or
+              below one already tracked stays tracked after it is reparented, detached into its own session included;
+              stop adds what runs below those now and the members of the script's process group. It never adopts a
+              process for its start time, group, or working directory alone, and signals a pid only while ps shows it
+              born when the run saw it, so a reused pid is never hit. A process that detaches and loses its parent
+              between two samples is not seen; `leftovers` lists it. Without an id it lists the running scripts, each
+              with its run (the runner's pid), step, how long it has run, and whether it is past its step deadline (by
+              how much, and its last output line then), and stops nothing. When two runs run the same id, stop lists
+              both and asks for --run <pid>. running.json in the verification directory holds the running scripts,
+              each under its check id and its run (the runner's pid and start), while a run lasts.
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match the comparison; the
               report's Head is HEAD or a commit with HEAD's product code (a regrouped history, or later commits that touch
               only the adopted plan folder or the project's verification skills). A PASS is backed by its tier's
@@ -365,6 +372,9 @@ HELD_OUTPUT_NOTE = ("verify: a process the script left running still held its ou
 SUMMARY = ".summary"
 CAPACITY_POLL_S = 15.0
 CAPACITY_WAIT_S = 600.0
+LINEAGE_POLL_S = 0.5
+# ps prints lstart in the locale and time zone it runs under; every reader must see the same text for one process.
+PS_ENV = {"LC_ALL": "C", "TZ": "UTC"}
 # ps rounds elapsed time to the second, so a start can read up to a second early.
 ELAPSED_SLACK_S = 1.0
 ELAPSED = re.compile(r"^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$")
@@ -1926,10 +1936,10 @@ def could_not_run(error):
 def supervised_run(path, args, env, run, cwd=None, directory=None, kind=None):
     """One run of a check script under progress supervision: its exit code, stdout, output, whether it printed READY_LINE,
     the step open on stdout when it did, its last step and output line, the steps that overran their deadlines, and, when
-    the lead stopped it (killed) or verify could not start it, the verdict and reason. With directory, the script is listed
-    in running.json while it runs, so `stop` can find it."""
+    the lead stopped it or verify could not start it, the verdict and reason. With directory, the script is listed in
+    running.json while it runs, with every process seen below it, so `stop` can find it and what it started."""
     progress, seen, at_ready = {"step": None, "last": "", "overruns": []}, threading.Event(), {}
-    check_id = script_id(path)
+    check_id, tracked = script_id(path), object()
 
     def on_ready():
         at_ready.setdefault("step", progress["step"])
@@ -1938,10 +1948,9 @@ def supervised_run(path, args, env, run, cwd=None, directory=None, kind=None):
             run["ready"]()
 
     def on_start(pid):
-        if run:
-            run.update(pid=pid)
         if directory:
             register_running(directory, check_id, kind, pid)
+            LINEAGES.track(tracked, pid, lambda tree: note_tree(directory, check_id, tree))
 
     def on_progress(state):
         if directory:
@@ -1958,8 +1967,9 @@ def supervised_run(path, args, env, run, cwd=None, directory=None, kind=None):
         except Exception as e:
             outcome.update(verdict="CRASH", reason=could_not_run(e))
         finally:
+            LINEAGES.untrack(tracked)
             stopped = directory and (finish_running(directory, check_id) or {}).get("stop")
-        if stopped and outcome["code"] not in EXIT_VERDICTS:
+        if stopped:
             outcome.update(verdict="STALLED", killed=True, reason=f"stopped by `verify.py stop`"
                                                                   + (f"; last line: {progress['last']}" if progress["last"] else ""))
     return {**outcome, "ready": seen.is_set(), "ready_step": at_ready.get("step"), "step": progress["step"], "last": progress["last"],
@@ -2017,7 +2027,7 @@ def write_summary(directory, kind, lines):
 def run_check(directory, path, args, env, concurrent=set, run=None, record=None):
     """(verdict, reason, step, overruns) for one check script; its output, overruns, and verdict go to <id>.rerun.log, and record(path, verdict)
     runs in the same locked step, a script verify could not start included. concurrent() names the checks that ran beside
-    it. run, when given, learns the script's pid and readiness; an ENVIRONMENT run with requeues left records nothing."""
+    it. run, when given, learns the script's readiness; an ENVIRONMENT run with requeues left records nothing."""
     check_id = script_id(path)
     before = file_sizes(directory)
     outcome = supervised_run(path, args, env, run, directory=directory, kind="rerun")
@@ -2027,7 +2037,7 @@ def run_check(directory, path, args, env, concurrent=set, run=None, record=None)
     beside = sorted(concurrent())
     lost = lost_files(before, file_sizes(directory), {check_id, *beside})
     if lost:
-        verdict = "FAIL"
+        verdict = "STALLED" if verdict == "STALLED" else "FAIL"
         culprit = f"files that are not its own were deleted or emptied while it ran beside {', '.join(beside)}" if beside else \
             "deleted or emptied files that are not its own"
         reason = f"{culprit}: {', '.join(lost)}" + (f"; {reason}" if reason else "")
@@ -2099,8 +2109,7 @@ def run_checks(directory, scripts, args, run_one):
                     beside[check_id] = set(running)
                     for other in running:
                         beside[other].add(check_id)
-                    run = {"path": path, "started": time.time(), "pid": None, "is_ready": False,
-                           "last_chance": environment[check_id] >= ENVIRONMENT_REQUEUES}
+                    run = {"path": path, "is_ready": False, "last_chance": environment[check_id] >= ENVIRONMENT_REQUEUES}
                     run["ready"] = lambda run=run: ready(run)
                     running[check_id] = run
                     threading.Thread(target=work, args=(check_id, run), daemon=True).start()
@@ -2128,41 +2137,137 @@ def run_checks(directory, scripts, args, run_one):
     return results, requeued
 
 
-def descendants(table, pid):
-    """pid and every process below it by parent, whatever its session or process group."""
+class Lineages:
+    """The processes each supervised script started, as sampled while it runs. A process seen below a tracked live one is
+    tracked from then on, also after its parent exits and it is reparented, so a detached descendant is known by its
+    lineage and never guessed from its start time, group, or working directory. One sampler serves every script of a run."""
+
+    def __init__(self):
+        self.trees, self.guard, self.sampler = {}, threading.Lock(), None
+
+    def track(self, key, pid, changed):
+        """Track the script pid under key; changed({pid: born}) runs whenever the tracked set changes."""
+        with self.guard:
+            self.trees[key] = {"seen": {pid: None}, "changed": changed}
+            if not self.sampler:
+                self.sampler = threading.Thread(target=self.watch, daemon=True)
+                self.sampler.start()
+        self.sample()
+
+    def untrack(self, key):
+        with self.guard:
+            self.trees.pop(key, None)
+
+    def watch(self):
+        while True:
+            time.sleep(LINEAGE_POLL_S)
+            with self.guard:
+                if not self.trees:
+                    self.sampler = None
+                    return
+            self.sample()
+
+    def sample(self):
+        try:
+            table = process_table()
+        except CannotScan:
+            return
+        with self.guard:
+            changed = [(tree["changed"], dict(tree["seen"])) for tree in self.trees.values()
+                       if grow(table, tree["seen"], os.getpid())]
+        for callback, seen in changed:
+            callback(seen)
+
+
+LINEAGES = Lineages()
+
+
+def grow(table, seen, parent):
+    """Bring seen, {pid: born}, up to date with a process table: drop each process that ended (its pid gone, or now born at
+    another time), learn the start of one tracked before ps listed it while it is still a child of parent, and add every
+    process below a live one until none is new. Returns whether seen changed."""
+    rows = {row["pid"]: row for row in table}
+    before = dict(seen)
+    for pid, start in list(seen.items()):
+        row = rows.get(pid)
+        if not row or start != row["born"] and (start is not None or row["ppid"] != parent):
+            del seen[pid]
+        else:
+            seen[pid] = row["born"]
     children = collections.defaultdict(list)
     for row in table:
-        children[row["ppid"]].append(row["pid"])
-    found, todo = set(), [pid]
+        children[row["ppid"]].append(row)
+    todo = list(seen)
     while todo:
-        current = todo.pop()
-        if current not in found:
-            found.add(current)
-            todo += children[current]
-    return found
+        for row in children[todo.pop()]:
+            if row["pid"] not in seen:
+                seen[row["pid"]] = row["born"]
+                todo.append(row["pid"])
+    return seen != before
 
 
-def stop_tree(directory, pid, started, others, before=None):
-    """Stop a script's whole tree: its process group, every descendant by parent (one detached into its own session
-    included), and the orphans under this run's places (parent init) that started after it and before `before`, outside
-    the process groups of others. Returns how many processes it stopped."""
-    found = []
-    with contextlib.suppress(CannotScan):
-        table = process_table()
-        tree = descendants(table, pid)
-        found = [row for row in table if row["pid"] in tree or row["pgid"] == pid]
-        found += [row for row in find_leftovers(default_roots(directory)) if row["ppid"] == 1 and row["pgid"] not in others
-                  and row["pid"] not in tree and row["started"] is not None and row["started"] >= started - ELAPSED_SLACK_S
-                  and (before is None or row["started"] < before - ELAPSED_SLACK_S)]
-        if found:
-            stop_processes(found)
-    kill_group(pid)
-    return len(found)
+def started_by(table, entry):
+    """{pid: born} of what a running.json entry's script started that still runs: the processes its run saw below it and
+    every process below those now, plus the members of the script's process group while one of them is such a process,
+    because a group never outlives its last member and only the script's own descendants can join it. Never this process
+    or its ancestors."""
+    seen = {int(pid): born for pid, born in entry.get("tree") or [[entry["pid"], None]]}
+    grow(table, seen, entry["runner"])
+    if any(row["pgid"] == entry["pid"] and row["pid"] in seen for row in table):
+        seen.update((row["pid"], row["born"]) for row in table if row["pgid"] == entry["pid"])
+    mine = lineage(table)
+    return {pid: born for pid, born in seen.items() if pid not in mine}
+
+
+def stop_started(entry, table):
+    """SIGTERM, then SIGKILL after KILL_WAIT_S, to exactly what a script started (started_by), each pid signaled only while
+    a fresh ps shows it born when the run saw it; returns how many processes it signaled."""
+    signaled = set()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if sig != signal.SIGTERM:
+            try:
+                table = process_table()
+            except CannotScan:
+                break
+        targets = started_by(table, entry)
+        for pid in targets:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, sig)
+                signaled.add(pid)
+        deadline = time.monotonic() + KILL_WAIT_S
+        while targets and time.monotonic() < deadline:
+            time.sleep(0.1)
+            with contextlib.suppress(CannotScan):
+                live = {row["pid"]: row["born"] for row in process_table() if not row["stat"].startswith("Z")}
+                targets = {pid: born for pid, born in targets.items() if live.get(pid) == born}
+        if not targets:
+            break
+        entry = {**entry, "tree": [[pid, born] for pid, born in targets.items()]}
+    return len(signaled)
+
+
+def this_run():
+    """(pid, born) of this verify process: what names its run in running.json, so a reused pid is never taken for it."""
+    if not hasattr(this_run, "known"):
+        try:
+            this_run.known = os.getpid(), next((row["born"] for row in process_table() if row["pid"] == os.getpid()), None)
+        except CannotScan:
+            return os.getpid(), None
+    return this_run.known
+
+
+def same_script(entry, other):
+    return all(entry.get(key) == other.get(key) for key in ("id", "runner", "runner_born", "pid"))
+
+
+def own_entry(scripts, check_id):
+    runner, born = this_run()
+    return next((e for e in scripts if e["id"] == check_id and e["runner"] == runner and e.get("runner_born") == born), None)
 
 
 @contextlib.contextmanager
 def running_scripts(directory):
-    """running.json, under its own lock: {check id: the script a rerun or dryrun runs now}, for `stop`."""
+    """running.json, under its own lock: [each script a rerun or dryrun runs now, named by its check id and its run]."""
     directory.mkdir(parents=True, exist_ok=True)
     with open(directory / RUNNING_LOCK, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
@@ -2170,7 +2275,8 @@ def running_scripts(directory):
         try:
             scripts = json.loads(path.read_text())
         except (OSError, ValueError):
-            scripts = {}
+            scripts = []
+        scripts = scripts if isinstance(scripts, list) else []
         before = json.dumps(scripts, sort_keys=True)
         yield scripts
         if json.dumps(scripts, sort_keys=True) != before:
@@ -2181,43 +2287,51 @@ def running_scripts(directory):
 
 
 def register_running(directory, check_id, kind, pid):
-    now = time.time()
+    now, (runner, born) = time.time(), this_run()
     with running_scripts(directory) as scripts:
-        scripts[check_id] = {"kind": kind, "runner": os.getpid(), "pid": pid, "started": now, "step": None,
-                             "window": FIRST_STEP_S, "deadline": now + FIRST_STEP_S, "overrun": None, "stop": None}
+        if previous := own_entry(scripts, check_id):
+            scripts.remove(previous)
+        scripts.append({"id": check_id, "kind": kind, "runner": runner, "runner_born": born, "pid": pid, "started": now,
+                        "step": None, "window": FIRST_STEP_S, "deadline": now + FIRST_STEP_S, "overrun": None, "stop": None,
+                        "tree": [[pid, None]]})
 
 
 def note_running(directory, check_id, progress):
     """Record the step a running script is in and, once it passes its deadline, the overrun with the last line then."""
     deadline = time.time() + progress["until"] - time.monotonic()
     with running_scripts(directory) as scripts:
-        if entry := scripts.get(check_id):
+        if entry := own_entry(scripts, check_id):
             entry.update(step=progress["step"], window=progress["window"], deadline=deadline,
                          overrun={"last": progress["overrun"]["last"]} if progress["overrun"] else None)
 
 
-def finish_running(directory, check_id):
-    """Take a script that ended off running.json; returns its entry, whose 'stop' says whether the lead stopped it."""
+def note_tree(directory, check_id, seen):
+    """Record every process a running script started that its run has seen and that still runs."""
     with running_scripts(directory) as scripts:
-        return scripts.pop(check_id, None)
+        if entry := own_entry(scripts, check_id):
+            entry["tree"] = sorted([pid, born] for pid, born in seen.items())
 
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def finish_running(directory, check_id):
+    """Take a script that ended off running.json, and only this run's entry; returns it, whose 'stop' says whether the lead
+    stopped it."""
+    with running_scripts(directory) as scripts:
+        if entry := own_entry(scripts, check_id):
+            scripts.remove(entry)
+        return entry
 
 
 def live_scripts(directory):
-    """running.json without the entries whose run is gone (a rerun killed before it could clean up)."""
+    """running.json without the entries whose run ended before it could clean up: its runner's pid is gone or names a
+    process born at another time. When ps cannot run, no entry is taken for ended."""
+    try:
+        born = {row["pid"]: row["born"] for row in process_table()}
+    except CannotScan:
+        born = None
     with running_scripts(directory) as scripts:
-        for check_id in [i for i, e in scripts.items() if not alive(e["runner"])]:
-            del scripts[check_id]
-        return {i: dict(e) for i, e in scripts.items()}
+        if born is not None:
+            scripts[:] = [e for e in scripts if e["runner"] in born and e.get("runner_born") in (None, born[e["runner"]])]
+        return [dict(e) for e in scripts]
 
 
 def running_state(entry, now):
@@ -2232,38 +2346,53 @@ def running_state(entry, now):
     return f"{entry['kind']} running {now - entry['started']:.0f}s, {where}, {state}"
 
 
+def run_line(entry, now):
+    return f"{entry['id']} run {entry['runner']}: {running_state(entry, now)}"
+
+
+def chosen_scripts(directory, scripts, args, now):
+    """The running.json entry each id names, within --run when given; refuses an id that runs nowhere or in two runs."""
+    chosen = []
+    for check_id in dict.fromkeys(args.rest):
+        found = [e for e in scripts if e["id"] == check_id and args.run in (None, e["runner"])]
+        if not found:
+            within = f" in run {args.run}" if args.run is not None else ""
+            running = ", ".join(sorted(f"{e['id']} (run {e['runner']})" for e in scripts)) or "none"
+            raise Failed(f"no running script {check_id}{within} in {directory}; running now: {running}. `verify.py stop` lists them")
+        if len(found) > 1:
+            raise Failed("\n".join([f"{check_id} runs in {len(found)} runs, so name the one to stop:",
+                                    *(f"  {run_line(e, now)}" for e in sorted(found, key=lambda e: e["started"])),
+                                    f"verify.py stop {check_id} --run <pid>"]))
+        chosen += found
+    return chosen
+
+
 def cmd_stop(directory, args):
     scripts = live_scripts(directory)
     now = time.time()
     if not args.rest:
         if not scripts:
             return f"stop: no script of a rerun or dryrun runs from {directory}"
-        return "\n".join([*(f"{i} {running_state(scripts[i], now)}" for i in sorted(scripts)),
-                          "Stop one only once you judge it dead: verify.py stop <id>"])
-    unknown = [i for i in args.rest if i not in scripts]
-    if unknown:
-        running = ", ".join(sorted(scripts)) or "none"
-        raise Failed(f"no running script {', '.join(unknown)} in {directory}; running now: {running}. `verify.py stop` lists them")
+        return "\n".join([*(run_line(e, now) for e in sorted(scripts, key=lambda e: (e["id"], e["started"]))),
+                          "Stop one only once you judge it dead: verify.py stop <id>, with --run <pid> when two runs run it"])
     lines = []
-    for check_id in args.rest:
-        entry = scripts[check_id]
+    for entry in chosen_scripts(directory, scripts, args, now):
+        table = process_table()
         with running_scripts(directory) as current:
-            still = check_id in current and current[check_id]["pid"] == entry["pid"]
-            if still:
-                current[check_id]["stop"] = time.time()
-        if not still:
-            lines.append(f"{check_id} ended on its own before the stop; its run records how")
+            if mine := next((e for e in current if same_script(e, entry)), None):
+                mine["stop"] = time.time()
+        if not mine:
+            lines.append(f"{entry['id']} of run {entry['runner']} ended on its own before the stop; its run records how")
             continue
-        others = {e["pid"] for i, e in scripts.items() if i != check_id}
-        later = [e["started"] for i, e in scripts.items() if i != check_id and e["started"] > entry["started"]]
-        count = stop_tree(directory, entry["pid"], entry["started"], others, before=min(later, default=None))
+        count = stop_started(mine, table)
         until = time.monotonic() + 2 * KILL_WAIT_S + HELD_OUTPUT_S
-        while check_id in live_scripts(directory) and time.monotonic() < until:
+        while (pending := any(same_script(e, entry) for e in live_scripts(directory))) and time.monotonic() < until:
             time.sleep(PROGRESS_POLL_S)
-        log = f"{check_id}{'.rerun.log' if entry['kind'] == 'rerun' else BASE_LOG}"
-        recorded = ("records it STALLED with its step and last line in" if check_id not in live_scripts(directory)
-                    else "has not recorded it yet; it will show STALLED in")
-        lines.append(f"stopped {check_id} ({count} processes), {running_state(entry, now)}; the {entry['kind']} {recorded} {log}")
+        log = f"{entry['id']}{'.rerun.log' if entry['kind'] == 'rerun' else BASE_LOG}"
+        recorded = ("has not recorded it yet; it will show STALLED in" if pending
+                    else "records it STALLED with its step and last line in")
+        lines.append(f"stopped {entry['id']} of run {entry['runner']} ({count} processes), {running_state(entry, now)}; "
+                     f"the {entry['kind']} {recorded} {log}")
     return "\n".join(lines)
 
 
@@ -2832,16 +2961,22 @@ def started_at(elapsed, now):
 
 
 def process_table():
+    """Every process with its parent, group, state, elapsed time, CPU share, command line, and its start as ps prints it
+    ('born'), which names one process for its whole life, so a reused pid never passes for it."""
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,pcpu=,command="], capture_output=True, text=True, timeout=15).stdout
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,pcpu=,lstart=,command="], capture_output=True, text=True,
+                              timeout=15, env={**os.environ, **PS_ENV})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise CannotScan(f"cannot list processes with ps: {e}")
     now, rows = time.time(), []
-    for line in out.splitlines():
-        parts = line.split(None, 6)
-        if len(parts) == 7 and parts[0].isdigit():
+    for line in done.stdout.splitlines():
+        parts = line.split(None, 11)
+        if len(parts) >= 11 and parts[0].isdigit():
             rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "pgid": int(parts[2]), "stat": parts[3],
-                         "elapsed": parts[4], "started": started_at(parts[4], now), "cpu": float(parts[5]), "command": parts[6]})
+                         "elapsed": parts[4], "started": started_at(parts[4], now), "cpu": float(parts[5]),
+                         "born": " ".join(parts[6:11]), "command": parts[11] if len(parts) > 11 else ""})
+    if done.returncode or not rows:
+        raise CannotScan(f"cannot list processes with ps: exit {done.returncode}: {done.stderr.strip() or 'no rows'}")
     return rows
 
 
@@ -3215,6 +3350,7 @@ def main():
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--running-since", type=float)
+    parser.add_argument("--run", type=int)
     parser.add_argument("rest", nargs="*")
     argv = sys.argv[1:]
     passthrough = argv[argv.index("--") + 1:] if "--" in argv else []
