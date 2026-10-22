@@ -2673,10 +2673,8 @@ class Supervision(unittest.TestCase):
 class RunGroup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.base = pathlib.Path(self.tmp.name).resolve()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def grandchild_command(self):
         return f"sleep 20 & echo $! > {shlex.quote(str(self.base / 'pid'))}; wait"
