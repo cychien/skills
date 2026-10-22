@@ -1583,12 +1583,18 @@ class Watch(unittest.TestCase):
         command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} watch --session {cls.SESSION} --interval 0.2 --initial {initial}"
         (d / "agent.py").write_text(FAKE_AGENT)
         spec = {"dir": str(d), "jobs": jobs, "watch": watch or [command]}
-        agent = subprocess.Popen([sys.executable, str(d / "agent.py"), json.dumps(spec)], env=env, start_new_session=True)
-        pids = json.loads(wait_for(d / "jobs.json"))
-        for name in ack:
-            r = subprocess.run([sys.executable, str(GUARD), "watch", "--ack", str(pids[name]), "--session", cls.SESSION],
-                               capture_output=True, text=True, env=env)
-            assert r.returncode == 0, r.stdout + r.stderr
+        agent = subprocess.Popen([sys.executable, str(d / "agent.py"), json.dumps(spec)], env=env, start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pids = {}
+        try:
+            pids = json.loads(wait_for(d / "jobs.json"))
+            for name in ack:
+                r = subprocess.run([sys.executable, str(GUARD), "watch", "--ack", str(pids[name]), "--session", cls.SESSION],
+                                   capture_output=True, text=True, env=env)
+                assert r.returncode == 0, r.stdout + r.stderr
+        except BaseException:
+            cls.end(agent, pids)
+            raise
         (d / "go").touch()
         return agent, pids, env
 
