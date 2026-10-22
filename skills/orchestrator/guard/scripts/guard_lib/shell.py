@@ -18,6 +18,7 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 SHELL_VALUED = {"-o", "+o", "-O", "+O"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DEPTH = 4
+OPENERS = {"do", "then", "else", "elif", "{", "!"}
 LEADING_CD = re.compile(r"\s*cd\s+((?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^\s;&|'\"\\])+)\s*(?:&&|;)")
 
 
@@ -188,6 +189,33 @@ def workdir(line, cwd):
         directory = os.path.normpath(os.path.join(directory or ".", os.path.expanduser(target)))
         at = found.end()
     return directory
+
+
+def loops(line, depth=0):
+    """The argv of every command inside each while or until loop a shell line runs, condition and body, nested shell
+    programs included."""
+    found, open_loops = [], []
+    for segment in segments(line):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = []
+        while words[:1] and words[0] in OPENERS:
+            words = words[1:]
+        if words[:1] in (["while"], ["until"], ["for"], ["select"]):
+            open_loops.append((words[0], []))
+        tokens = argv(segment)
+        for _, body in open_loops:
+            if tokens and tokens[0] != "done":
+                body.append(tokens)
+        if words[:1] == ["done"] and open_loops:
+            keyword, body = open_loops.pop()
+            if keyword in ("while", "until"):
+                found.append(body)
+        nested = program(tokens)
+        if nested and depth < DEPTH:
+            found += loops(nested, depth + 1)
+    return found + [body for keyword, body in open_loops if keyword in ("while", "until")]
 
 
 def line(words):
