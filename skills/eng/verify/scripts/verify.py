@@ -212,6 +212,7 @@ oracle check <id> also has <id>.expected.json, written by an agent that read onl
 <id>.observed.json, read from the running app.
 """
 import argparse
+import codecs
 import collections
 import contextlib
 import datetime
@@ -219,11 +220,14 @@ import fcntl
 import glob
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
+import locale
 import os
 import pathlib
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -339,6 +343,9 @@ STEP_MARGIN_RATIO = 0.25
 PROGRESS_POLL_S = 0.5
 EXIT_VERDICTS = {0: "PASS", 1: "FAIL", 2: "INCONCLUSIVE", 3: "ENVIRONMENT"}
 ENVIRONMENT_REQUEUES = 2
+HELD_OUTPUT_S = 2.0
+HELD_OUTPUT_NOTE = ("verify: a process the script detached into another session still held its output {seconds:g}s after the "
+                    "script ended, so verify closed the pipes without it\n")
 SUMMARY = ".summary"
 CAPACITY_POLL_S = 15.0
 CAPACITY_WAIT_S = 600.0
@@ -2533,56 +2540,91 @@ def run_in_group(command, timeout, on_start=None, on_ready=None, progress=None, 
     """subprocess.run in its own session, so a timeout kills the command and everything it started. on_start gets the
     pid (the process group), and on_ready runs when stdout prints READY_LINE. With progress, a dict, each STEP_LINE on
     stdout opens a deadline (FIRST_STEP_S until the first), and one that passes kills the group and raises Stalled;
-    progress holds the step, its window, and the last output line."""
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, **kwargs) as proc:
+    progress holds the step, its window, and the last output line. Once the command has exited or been killed, its output
+    is read for at most HELD_OUTPUT_S more, since a process it detached into another session can hold the pipes forever."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, **kwargs) as proc:
         if on_start:
             on_start(proc.pid)
-        out, err = [], []
         if progress is not None:
             progress.update(step=None, window=FIRST_STEP_S, until=time.monotonic() + FIRST_STEP_S, last="")
+        streams = {proc.stdout.fileno(): OutputStream(True), proc.stderr.fileno(): OutputStream(False)}
 
-        def drain(stream, sink, stdout):
-            for line in stream:
-                text = line.rstrip("\n")
-                if stdout and on_ready and text == READY_LINE:
-                    on_ready()
-                    continue
-                sink.append(line)
-                if progress is None or not text.strip():
-                    continue
+        def take(line, stdout):
+            text = line.rstrip("\n")
+            if stdout and on_ready and text == READY_LINE:
+                on_ready()
+                return False
+            if progress is not None and text.strip():
                 progress["last"] = text.strip()
                 if stdout and (m := STEP_LINE.match(text.strip())):
                     window = step_window(float(m.group(2)))
                     progress.update(step=m.group(1), window=window, until=time.monotonic() + window)
+            return True
 
-        readers = [threading.Thread(target=drain, args=(proc.stdout, out, True), daemon=True),
-                   threading.Thread(target=drain, args=(proc.stderr, err, False), daemon=True)]
-        for reader in readers:
-            reader.start()
-        deadline = time.monotonic() + timeout
-        try:
-            while proc.poll() is None or any(reader.is_alive() for reader in readers):
-                now = time.monotonic()
-                if now >= deadline:
-                    raise subprocess.TimeoutExpired(command, timeout)
-                if progress is not None and now >= progress["until"]:
-                    raise Stalled(progress)
-                limit = min(deadline, progress["until"]) if progress is not None else deadline
-                wait = min(PROGRESS_POLL_S, limit - now)
-                if proc.poll() is None:
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        proc.wait(timeout=wait)
-                else:
-                    next((r for r in readers if r.is_alive()), readers[0]).join(wait)
-        except (subprocess.TimeoutExpired, Stalled) as e:
-            kill_group(proc.pid)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=KILL_WAIT_S)
-            for reader in readers:
-                reader.join(KILL_WAIT_S)
-            e.output, e.stderr = "".join(out), "".join(err)
-            raise
-    return subprocess.CompletedProcess(proc.args, proc.returncode, "".join(out), "".join(err))
+        with selectors.DefaultSelector() as selector:
+            for fd in streams:
+                selector.register(fd, selectors.EVENT_READ)
+
+            def read(wait):
+                for key, _ in selector.select(wait):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fd)
+                    streams[key.fd].feed(data, take)
+
+            def finish(until):
+                while selector.get_map() and time.monotonic() < until:
+                    read(min(PROGRESS_POLL_S, until - time.monotonic()))
+                held = bool(selector.get_map())
+                for stream in streams.values():
+                    stream.feed(b"", take)
+                return held
+
+            deadline = time.monotonic() + timeout
+            try:
+                while proc.poll() is None:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    if progress is not None and now >= progress["until"]:
+                        raise Stalled(progress)
+                    wait = min(PROGRESS_POLL_S, min(deadline, progress["until"]) - now if progress is not None else deadline - now)
+                    if selector.get_map():
+                        read(wait)
+                    else:
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            proc.wait(timeout=wait)
+            except (subprocess.TimeoutExpired, Stalled) as e:
+                kill_group(proc.pid)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=KILL_WAIT_S)
+                held = finish(time.monotonic() + HELD_OUTPUT_S)
+                e.output, e.stderr = streams[proc.stdout.fileno()].text(), streams[proc.stderr.fileno()].text(held)
+                raise
+            held = finish(time.monotonic() + HELD_OUTPUT_S)
+            out, err = streams[proc.stdout.fileno()].text(), streams[proc.stderr.fileno()].text(held)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+class OutputStream:
+    """One pipe of a supervised command, decoded the way text=True would, and split into lines as they arrive."""
+
+    def __init__(self, stdout):
+        self.stdout = stdout
+        self.decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder(locale.getpreferredencoding(False))("replace"), True)
+        self.partial, self.lines = "", []
+
+    def feed(self, data, take):
+        """Decode data, hand each finished line to take, and keep it when take says so; empty data ends the stream."""
+        text = self.partial + self.decoder.decode(data, final=not data)
+        *done, self.partial = text.split("\n")
+        done = [f"{line}\n" for line in done]
+        if not data and self.partial:
+            done, self.partial = [*done, self.partial], ""
+        self.lines.extend(line for line in done if take(line, self.stdout))
+
+    def text(self, held=False):
+        return "".join(self.lines) + (HELD_OUTPUT_NOTE.format(seconds=HELD_OUTPUT_S) if held else "")
 
 
 def started_at(elapsed, now):

@@ -2654,6 +2654,37 @@ class RunGroup(unittest.TestCase):
         self.assertIn("timed out after 1s", r.stdout)
         self.assertTrue(gone(int((self.base / "pid").read_text())))
 
+    def detached_holder(self, name):
+        """A shell line that starts a process in its own session, holding the script's stdout and stderr where killing the
+        script's process group cannot reach it; cleanup kills it."""
+        pid = self.base / f"{name}.pid"
+
+        def kill():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pid.read_text()), signal.SIGKILL)
+        self.addCleanup(kill)
+        return (f"{shlex.quote(sys.executable)} -c 'import subprocess, sys; "
+                f"open(sys.argv[1], \"w\").write(str(subprocess.Popen([\"sleep\", \"60\"], start_new_session=True).pid))' "
+                f"{shlex.quote(str(pid))}")
+
+    def test_a_detached_process_holding_the_output_never_holds_the_run_past_a_short_bound(self):
+        stalls = f'{self.detached_holder("a")}; echo "verify: step seed within 0.1"; echo "seeding"; sleep 60'
+        started = time.monotonic()
+        with mock.patch.multiple(verify, STEP_MARGIN_S=0.1, PROGRESS_POLL_S=0.05), self.assertRaises(verify.Stalled) as stalled:
+            verify.run_in_group(["sh", "-c", stalls], 60, progress={})
+        self.assertLess(time.monotonic() - started, verify.HELD_OUTPUT_S + 5)
+        self.assertEqual(stalled.exception.output, "verify: step seed within 0.1\nseeding\n")
+        self.assertIn("still held its output", stalled.exception.stderr)
+
+        started = time.monotonic()
+        r = verify.run_in_group(["sh", "-c", f'{self.detached_holder("b")}; echo "PASS B1"'], 60, progress={})
+        self.assertLess(time.monotonic() - started, verify.HELD_OUTPUT_S + 5)
+        self.assertEqual((r.returncode, r.stdout), (0, "PASS B1\n"))
+        self.assertEqual(r.stderr, verify.HELD_OUTPUT_NOTE.format(seconds=verify.HELD_OUTPUT_S))
+
+        r = verify.run_in_group(["sh", "-c", 'printf "PASS B1\\r\\nno newline"; echo "warn" >&2'], 60, progress={})
+        self.assertEqual((r.stdout, r.stderr), ("PASS B1\nno newline", "warn\n"))
+
     def test_a_scratch_tree_kills_processes_running_in_it_before_removal(self):
         repo = self.base / "repo"
         repo.mkdir()
