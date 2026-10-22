@@ -94,13 +94,15 @@ directory.
               it runs, its run samples the process table every 0.5 seconds, and a process seen below the script or
               below one already tracked stays tracked after it is reparented, detached into its own session included;
               stop adds what runs below those now and the members of the script's process group. It never adopts a
-              process for its start time, group, or working directory alone, and signals a pid only while ps shows it
-              born when the run saw it, so a reused pid is never hit. A process that detaches and loses its parent
-              between two samples is not seen; `leftovers` lists it. Without an id it lists the running scripts, each
-              with its run (the runner's pid), step, how long it has run, and whether it is past its step deadline (by
-              how much, and its last output line then), and stops nothing. When two runs run the same id, stop lists
-              both and asks for --run <pid>. running.json in the verification directory holds the running scripts,
-              each under its check id and its run (the runner's pid and start), while a run lasts.
+              process for its start time, group, or working directory alone, and signals a pid only while ps, read
+              right before the signal, shows it with the start and command line the scan saw, so a reused pid is never
+              hit; where the system has pidfds, the signal goes through one opened before that check. A process that
+              detaches and loses its parent between two samples is not seen; `leftovers` lists it. Without an id it
+              lists the running scripts, each with its run (the runner's pid), step, how long it has run, and whether it
+              is past its step deadline (by how much, and its last output line then), and stops nothing. When two runs
+              run the same id, stop lists both and asks for --run <pid>. running.json in the verification directory
+              holds the running scripts, each under its check id and its run (a token the run makes when it starts,
+              and the runner's pid), while a run lasts.
   report      every plan check has a verdict backed by evidence on disk, and oracle verdicts match the comparison; the
               report's Head is HEAD or a commit with HEAD's product code (a regrouped history, or later commits that touch
               only the adopted plan folder or the project's verification skills). A PASS is backed by its tier's
@@ -255,6 +257,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 CHECK_FIELDS = ("Scenario", "Surface", "Evidence", "Pass")
 PERF_FIELDS = ("Path", "Metric", "Probe", "Baseline", "Rule")
@@ -375,6 +378,7 @@ CAPACITY_WAIT_S = 600.0
 LINEAGE_POLL_S = 0.5
 # ps prints lstart in the locale and time zone it runs under; every reader must see the same text for one process.
 PS_ENV = {"LC_ALL": "C", "TZ": "UTC"}
+RUN = uuid.uuid4().hex
 # ps rounds elapsed time to the second, so a start can read up to a second early.
 ELAPSED_SLACK_S = 1.0
 ELAPSED = re.compile(r"^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$")
@@ -2221,7 +2225,7 @@ def started_by(table, entry):
 
 def stop_started(entry, table):
     """SIGTERM, then SIGKILL after KILL_WAIT_S, to exactly what a script started (started_by), each pid signaled only while
-    a fresh ps shows it born when the run saw it; returns how many processes it signaled."""
+    it is still the process the scan saw (signal_if_same); returns how many processes it signaled."""
     signaled = set()
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if sig != signal.SIGTERM:
@@ -2230,10 +2234,8 @@ def stop_started(entry, table):
             except CannotScan:
                 break
         targets = started_by(table, entry)
-        for pid in targets:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, sig)
-                signaled.add(pid)
+        scanned = {row["pid"]: (row["born"], row["command"]) for row in table}
+        signaled.update(pid for pid in targets if signal_if_same(pid, scanned[pid], sig))
         deadline = time.monotonic() + KILL_WAIT_S
         while targets and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -2246,23 +2248,61 @@ def stop_started(entry, table):
     return len(signaled)
 
 
-def this_run():
-    """(pid, born) of this verify process: what names its run in running.json, so a reused pid is never taken for it."""
-    if not hasattr(this_run, "known"):
+def identity(pid):
+    """(born, command) of pid as ps prints them now, or None when no process has that pid or ps cannot tell."""
+    try:
+        done = subprocess.run(["ps", "-ww", "-o", "lstart=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=15,
+                              env={**os.environ, **PS_ENV})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parts = (done.stdout.splitlines() or [""])[0].split(None, 5)
+    if done.returncode or len(parts) < 5:
+        return None
+    return " ".join(parts[:5]), parts[5] if len(parts) > 5 else ""
+
+
+def signal_if_same(pid, sampled, sig):
+    """Send sig to pid only while it is the process sampled names, (born, command) as a scan saw it; returns whether it was
+    sent. Where the system has pidfds the signal goes through one opened before the check, so it cannot reach a process
+    that took the pid after the check; elsewhere the check runs right before the signal."""
+    pidfd, open_pidfd = None, getattr(os, "pidfd_open", None)
+    if open_pidfd:
         try:
-            this_run.known = os.getpid(), next((row["born"] for row in process_table() if row["pid"] == os.getpid()), None)
-        except CannotScan:
-            return os.getpid(), None
-    return this_run.known
+            pidfd = open_pidfd(pid)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+    try:
+        if identity(pid) != sampled:
+            return False
+        if pidfd is None:
+            os.kill(pid, sig)
+        else:
+            signal.pidfd_send_signal(pidfd, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+def this_run():
+    """This verify process as its running.json entries name it: RUN, a token made when it started that no other run holds,
+    whatever ps answers meanwhile, and its pid and start for the listing and for pruning the entries of a run that ended."""
+    if not hasattr(this_run, "born"):
+        with contextlib.suppress(CannotScan):
+            this_run.born = next((row["born"] for row in process_table() if row["pid"] == os.getpid()), None)
+    return {"run": RUN, "runner": os.getpid(), "runner_born": getattr(this_run, "born", None)}
 
 
 def same_script(entry, other):
-    return all(entry.get(key) == other.get(key) for key in ("id", "runner", "runner_born", "pid"))
+    return all(entry.get(key) == other.get(key) for key in ("id", "run", "runner", "pid"))
 
 
 def own_entry(scripts, check_id):
-    runner, born = this_run()
-    return next((e for e in scripts if e["id"] == check_id and e["runner"] == runner and e.get("runner_born") == born), None)
+    return next((e for e in scripts if e["id"] == check_id and e.get("run") == RUN), None)
 
 
 @contextlib.contextmanager
@@ -2287,11 +2327,11 @@ def running_scripts(directory):
 
 
 def register_running(directory, check_id, kind, pid):
-    now, (runner, born) = time.time(), this_run()
+    now = time.time()
     with running_scripts(directory) as scripts:
         if previous := own_entry(scripts, check_id):
             scripts.remove(previous)
-        scripts.append({"id": check_id, "kind": kind, "runner": runner, "runner_born": born, "pid": pid, "started": now,
+        scripts.append({"id": check_id, "kind": kind, **this_run(), "pid": pid, "started": now,
                         "step": None, "window": FIRST_STEP_S, "deadline": now + FIRST_STEP_S, "overrun": None, "stop": None,
                         "tree": [[pid, None]]})
 
@@ -2964,7 +3004,7 @@ def process_table():
     """Every process with its parent, group, state, elapsed time, CPU share, command line, and its start as ps prints it
     ('born'), which names one process for its whole life, so a reused pid never passes for it."""
     try:
-        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,pcpu=,lstart=,command="], capture_output=True, text=True,
+        done = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,pgid=,stat=,etime=,pcpu=,lstart=,command="], capture_output=True, text=True,
                               timeout=15, env={**os.environ, **PS_ENV})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise CannotScan(f"cannot list processes with ps: {e}")

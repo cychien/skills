@@ -2739,6 +2739,72 @@ class Supervision(unittest.TestCase):
         self.assertFalse((self.dir / "fix-attempts.json").exists())
 
 
+class RunIdentity(unittest.TestCase):
+    """Whom a run's running.json entries and its signals name, with ps failing or a pid changing hands in between."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.directory = pathlib.Path(tmp.name)
+
+    def sleeper(self):
+        sleep = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (sleep.kill(), sleep.wait()))
+        return sleep.pid
+
+    def test_a_run_finds_the_entry_it_registered_whatever_ps_does_in_between(self):
+        with contextlib.suppress(AttributeError):
+            del verify.this_run.known
+        real, calls = verify.process_table(), []
+
+        def table():
+            calls.append(len(calls))
+            if len(calls) == 1:
+                raise verify.CannotScan("cannot list processes with ps: exit 1: ps: sysctl failed")
+            return real
+        pid = self.sleeper()
+        with mock.patch.object(verify, "process_table", side_effect=table):
+            verify.register_running(self.directory, "B1", "rerun", pid)
+            verify.note_tree(self.directory, "B1", {pid: "born"})
+            entry = verify.finish_running(self.directory, "B1")
+        self.assertIsNotNone(entry, "the run lost its own entry")
+        self.assertEqual(entry["tree"], [[pid, "born"]])
+        self.assertFalse((self.directory / verify.RUNNING).exists(), "a stale entry stayed in running.json")
+
+    def test_stop_never_signals_a_pid_that_changed_hands_after_the_scan(self):
+        pid = self.sleeper()
+        table = verify.process_table()
+        earlier = "Thu Jan  1 00:00:00 2026"
+        scanned = [{**row, "born": earlier} if row["pid"] == pid else row for row in table]
+        entry = {"pid": pid, "runner": os.getpid(), "tree": [[pid, earlier]]}
+        self.assertEqual(verify.stop_started(entry, scanned), 0)
+        self.assertTrue(alive(pid), "a process that reused the pid of an ended target was signaled")
+        born = next(row["born"] for row in table if row["pid"] == pid)
+        self.assertEqual(verify.stop_started({**entry, "tree": [[pid, born]]}, table), 1)
+        self.assertTrue(gone(pid))
+
+    def test_a_signal_goes_only_to_the_process_sampled_and_through_a_pidfd_opened_before_the_check_where_one_exists(self):
+        pid = self.sleeper()
+        sampled = verify.identity(pid)
+        self.assertIsNotNone(sampled)
+        with mock.patch.object(verify.os, "pidfd_open", side_effect=OSError(38, "Function not implemented"), create=True):
+            self.assertFalse(verify.signal_if_same(pid, (sampled[0], "another command"), signal.SIGTERM))
+            self.assertFalse(verify.signal_if_same(pid, ("Thu Jan  1 00:00:00 2026", sampled[1]), signal.SIGTERM))
+            self.assertTrue(alive(pid))
+            self.assertTrue(verify.signal_if_same(pid, sampled, signal.SIGTERM))
+        self.assertTrue(gone(pid))
+        calls = mock.Mock()
+        calls.pidfd_open.side_effect = lambda _: os.open(os.devnull, os.O_RDONLY)
+        calls.identity.return_value = ("born", "command")
+        with mock.patch.object(verify.os, "pidfd_open", calls.pidfd_open, create=True), \
+                mock.patch.object(verify.signal, "pidfd_send_signal", calls.send, create=True), \
+                mock.patch.object(verify, "identity", calls.identity), mock.patch.object(verify.os, "kill", calls.kill):
+            self.assertTrue(verify.signal_if_same(4242, ("born", "command"), signal.SIGTERM))
+            self.assertFalse(verify.signal_if_same(4242, ("born", "other"), signal.SIGTERM))
+        self.assertEqual([name for name, *_ in calls.mock_calls], ["pidfd_open", "identity", "send", "pidfd_open", "identity"])
+        calls.kill.assert_not_called()
+
+
 class RunGroup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
