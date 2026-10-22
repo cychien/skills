@@ -2475,7 +2475,7 @@ def premise_row_problems(path, number, row, holds, resolved):
     problems = [] if holds in HOLDS else [
         f"{path}:{number}: Holds must be yes, no, or new (built by this phase), not {row.get('holds', '')!r}"]
     if holds != "new" and (not row.get("evidence", "").strip("-– ") or PLACEHOLDER.search(row.get("evidence", ""))):
-        problems.append(f"{path}:{number}: Evidence is empty; cite the file:line on main that shows whether the premise holds")
+        problems.append(f"{path}:{number}: Evidence is empty; cite the file:line on the base that shows whether the premise holds")
     if holds == "no" and resolved and not row.get("resolution", "").strip("-– "):
         problems.append(f"{path}:{number}: the premise does not hold and has no Resolution; say how the design resolves it "
                         "(build what is missing, change the check, or the user's call)")

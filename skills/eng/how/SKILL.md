@@ -10,7 +10,7 @@ Explore the codebase to answer "how does X work?" questions. Produce architectur
 
 Every spawn reads the repository and never edits its code. Every explorer and explainer writes its findings to a file (in the scratchpad, or where the caller names) and hands back the path with at most 200 words, so give each an agent type with a write tool, never a read-only type, because a type without one returns everything inline into the caller's context. Explorers use an executor model and every explainer a planner model from the orchestrator config (`<project>/.agents/orchestrator/models.json`, falling back to `~/.agents/orchestrator/models.json`): the first entry in that role your agent can run as a subagent. Without a config, or when your agent cannot choose a subagent's model, use its default model.
 
-When the caller gives a verification plan, how also tests every check's premises against current main, per "With a verification plan" below.
+When the caller gives a verification plan, how also tests every check's premises against the base commit the caller names, per "With a verification plan" below.
 
 ## 1. Assess complexity
 
@@ -37,7 +37,7 @@ Present the explainer's output. Light edits for clarity or context from the conv
 
 The feature skill's grounding step passes the plan, the place its files go (the plan's phase folder, else the verification directory), and the base commit the premises are checked at. Then:
 
-- Give every check to at least one explorer, beside its angle: the checks whose scenario runs through its slice. The explorer lists each fact the check assumes already holds on the base (a route exists, a dialog asks before it acts, an adapter queues while offline), whether it holds, and the file and line or the command output that shows it, because a false assumption found before the design costs a line. What the change itself will build is not a premise: the explorer notes it once per check as new, not once per missing piece, because a table full of planned work buries the few assumptions that are actually false.
+- Give every check to at least one explorer, beside its angle: the checks whose scenario runs through its slice, with the base commit. The explorer lists each fact the check assumes already holds on the base (a route exists, a dialog asks before it acts, an adapter queues while offline), whether it holds, and the file and line or the command output that shows it, because a false assumption found before the design costs a line. What the change itself will build is not a premise: the explorer notes it once per check as new, not once per missing piece, because a table full of planned work buries the few assumptions that are actually false.
 - When the caller passes an earlier `grounding.md`, the explorers start from it and look only at what changed since and at the premises.
 - The explainer writes two files there: `grounding.md`, the explanation in the sections below, whole even when it started from an earlier one; and `premises.md`, the table of `../verify/references/plan.md`'s Premises section, one row per premise and at least one per check. Each file starts with the line `Base: <sha>`, the base commit the caller passed, because `verify.py premises` accepts the files only for that base. It checks every `no` row in the code itself before writing it, and leaves every Resolution empty, because the design resolves premises, not how.
 

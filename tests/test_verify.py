@@ -1657,7 +1657,7 @@ class Premises(RepoFixture):
         (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="x").replace("| yes | calc.py:1 |", "| maybe |  |")))
         out = self.premises(ok=False)
         self.assertIn(":5: Holds must be yes, no, or new (built by this phase), not 'maybe'", out)
-        self.assertIn(":5: Evidence is empty; cite the file:line on main", out)
+        self.assertIn(":5: Evidence is empty; cite the file:line on the base that shows whether the premise holds", out)
         (self.folder / "premises.md").write_text(self.based(self.TABLE.format(resolution="x")))
         self.premises()
         base, old = self.rev(), self.git("rev-list", "--max-parents=0", "HEAD")
