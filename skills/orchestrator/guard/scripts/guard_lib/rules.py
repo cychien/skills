@@ -52,9 +52,7 @@ POLL_SLEEP = re.compile(r"\bsleep\b|select\s*\(\s*undef|Start-Sleep")
 POLL_TARGET = re.compile(r"/tasks/[\w.-]+\.output|stop_reason|end_turn")
 POLLING_DENIED = ("Do not wait for a subagent by polling. A subagent finishes with a SubagentHandback tool call (stop_reason tool_use), "
                   "so a loop that greps for end_turn never matches and runs to its cap. ")
-POLLING_INTERACTIVE = "Its hand-back arrives on its own as a message, so end the turn or do other work."
-POLLING_HEADLESS = ("This session is non-interactive, so ending the turn ends the process and kills the subagent. Run the subagent in the "
-                    "foreground (not in the background), so its hand-back is the tool result.")
+POLLING_WAIT = "Its hand-back arrives on its own as a message, so end the turn or do other work."
 SPAWN_TOOLS = {"agent", "task"}
 LEFTOVERS_TIMEOUT = 30
 LEFTOVERS_DENIED = ("Processes from earlier delegates or tasks are still running. Spawning another agent on top of them hides which one "
@@ -96,7 +94,9 @@ HANDED_BACK = ("These delegates handed back, but their work still runs, holding 
 
 
 def headless():
-    """Whether this hook runs under a non-interactive agent, where ending the turn ends the process and its background work."""
+    """Whether this hook runs under a non-interactive agent (`claude -p`, `codex exec`). Measured with claude -p: it waits for
+    the background shells and subagents its stop payload lists and resumes the lead with their results, but it exits when
+    the turn ends with only a scheduled cron left, and it does not wait for a shell a delegate left after its hand-back."""
     if os.environ.get("GUARD_HEADLESS"):
         return os.environ["GUARD_HEADLESS"] == "1"
     try:
@@ -455,7 +455,7 @@ def on_pre_tool(event):
         return PASS
     data = state.load(event.agent, event.session)
     if data.get("spawned") and not event.agent_id and polls_for_subagent(command):
-        return "deny", POLLING_DENIED + (POLLING_HEADLESS if headless() else POLLING_INTERACTIVE)
+        return "deny", POLLING_DENIED + POLLING_WAIT
     skill = data.get("todo_undecided")
     if skill and not event.agent_id and not decides(command) and not reads_a_skill(event):
         return "deny", todo_hint(skill, event)
@@ -738,9 +738,10 @@ def open_item_problems(event, message, data, others):
     if not items or state.held(own):
         return []
     problems = []
-    if not others and event.waiting_on_background and headless():
-        problems.append("This session is non-interactive, so ending the turn ends the process and kills the background work "
-                        "it is waiting on. Wait for that work in the foreground, finish the open items, then end the turn.")
+    if not others and event.waiting_on_background and not event.background_tasks and headless():
+        problems.append("This session is non-interactive: it waits for the background tasks it runs, but it exits when the turn "
+                        "ends with only a scheduled cron left, so the cron never fires. Do that work in this turn, finish the "
+                        "open items, then end the turn.")
     asking = bool(QUESTION_END.search(CODE.sub("", message).strip()))
     if not others and not problems and (asking or event.waiting_on_background):
         return []

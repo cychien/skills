@@ -477,8 +477,7 @@ class Guard(unittest.TestCase):
             self.assertIn("end the turn or do other work", out["permissionDecisionReason"])
         self.env["GUARD_HEADLESS"] = "1"
         reason = self.hook("PreToolUse", poll)["hookSpecificOutput"]["permissionDecisionReason"]
-        self.assertIn("foreground", reason)
-        self.assertNotIn("end the turn or do other work", reason)
+        self.assertIn("end the turn or do other work", reason, "a non-interactive session waits for its subagent too")
         self.env["GUARD_HEADLESS"] = "0"
         self.assertIsNone(self.hook("PreToolUse", server))
         self.assertIsNone(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "sleep 5"}}))
@@ -489,13 +488,16 @@ class Guard(unittest.TestCase):
         self.hook("PostToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(self.skills / "demo" / "SKILL.md")}})
         self.assertEqual(self.hook("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}})["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_a_headless_session_cannot_end_the_turn_on_background_work(self):
+    def test_a_headless_session_ends_the_turn_on_the_tasks_it_waits_for_but_not_on_a_cron_alone(self):
         self.todo("add", "Ship it")
+        cron = {"id": "c1", "schedule": "* * * * *", "recurring": True, "prompt": "check the run"}
         self.env["GUARD_HEADLESS"] = "1"
-        blocked = self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}])
-        self.assertIn("non-interactive", blocked["reason"])
+        self.assertIsNone(self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}],
+                                    session_crons=[cron]))
+        blocked = self.stop("Waiting for the cron.", background_tasks=[], session_crons=[cron])
+        self.assertIn("exits when the turn ends with only a scheduled cron left, so the cron never fires", blocked["reason"])
         self.env["GUARD_HEADLESS"] = "0"
-        self.assertIsNone(self.stop("Waiting for the executor.", background_tasks=[{"id": "t1"}]))
+        self.assertIsNone(self.stop("Waiting for the cron.", background_tasks=[], session_crons=[cron]))
 
     def test_waiting_on_background_work_may_end_the_turn(self):
         self.todo("add", "Implement it")
