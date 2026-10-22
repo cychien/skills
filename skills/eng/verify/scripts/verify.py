@@ -76,11 +76,12 @@ directory.
               Head, with the Head's product tree when no finding is triaged fixed. HEAD must hold Fixed at's product tree,
               so no product change follows the reviewed fixes.
   scripts     every e2e check, perf checks included, has its <id>.check.<ext> script and an <id>.base.log from
-              `dryrun` of that same script that holds a "verify: step <name> within <seconds>" line, reached "verify:
-              ready", and failed a predicate: exit 1 with a FAIL line last on stdout. A script that crashed (no ready
-              line, an exit other than 0 to 3, or no FAIL line), stalled, or was inconclusive fails the gate. One that
-              passes on base fails it too, unless its check carries '- Base: passes: <why>': fix the script or its helper
-              so it fails on base, or revise the plan through `freeze --revision` to add the field.
+              `dryrun` of that same script that printed a "verify: step <name> within <seconds>" line on stdout before
+              "verify: ready", reached that line, and failed a predicate: exit 1 with a FAIL line last on stdout. A
+              script that crashed (no ready line, an exit other than 0 to 3, or no FAIL line), stalled, or was
+              inconclusive fails the gate. One that passes on base fails it too, unless its check carries '- Base:
+              passes: <why>': fix the script or its helper so it fails on base, or revise the plan through `freeze
+              --revision` to add the field.
   dryrun      run each saved check script with --base, a worktree at the phase base whose product files match it, as its
               working directory, VERIFY_DRYRUN=1 in its environment, and write <id>.base.log with its output and verdict.
               Scripts start, are supervised, and are requeued on exit 3 the way `rerun` does it, and the compact lines go
@@ -125,19 +126,21 @@ directory.
               open a log only on FAIL. A check script prints, on stdout and flushed, "verify: step <name> within
               <seconds>" on entering each step, setup included, with the most that step may take; "verify: ready" once
               its instance is up; and a PASS or FAIL line last. Its exit code is its verdict: 0 PASS, 1 FAIL (a predicate
-              failed), 2 INCONCLUSIVE (a premise or blocker named on the last line), 3 ENVIRONMENT (the instance or
-              machine could not support the run: a load refusal, an instance that died, a usage limit); any other exit,
-              or a kill, is CRASH. Runs are supervised by progress: each step line opens a deadline of its seconds plus
-              the larger of 15 s and a quarter of them, and until the first one a 120 s window applies; when the open
-              deadline passes, verify kills the script's process group and records STALLED with the step and the last
-              output line, however long the run has taken before, so a slow run that progresses is never killed.
+              failed, with the FAIL line last on stdout; an exit 1 without it is CRASH), 2 INCONCLUSIVE (a premise or
+              blocker named on the last line), 3 ENVIRONMENT (the instance or machine could not support the run: a load
+              refusal, an instance that died, a usage limit); any other exit, or a kill, is CRASH. Runs are supervised
+              by progress: each step line opens a deadline of its seconds plus the larger of 15 s and a quarter of them,
+              and until the first one a 120 s window applies; when the open deadline passes, verify kills the script's
+              process group and records STALLED with the step and the last output line, however long the run has taken
+              before, so a slow run that progresses is never killed.
               --timeout is only a total safety net, 7200 seconds by default, recorded as CRASH. An ENVIRONMENT run is
               queued again for when `capacity` passes, at most 2 times per run, and is then INCONCLUSIVE with reason
-              environment; it writes no log, records no verdict, and is no fix attempt. Scripts run as parallel as
-              capacity allows: the next
-              starts once every running script has printed the line "verify: ready" (its instance is up; the line stays
-              out of its log), while fewer than --jobs run when it is given, and while `capacity` passes, because the
-              1-minute load lags an instance start; a script that never prints the line runs alone. While capacity is
+              environment; it writes no log, records no verdict, and is no fix attempt. Once a script has ended, verify
+              reads its output for at most 2 seconds more, so a process it detached into another session cannot hold the
+              run. Scripts run as parallel as capacity allows: the next starts once every running script has printed
+              the line "verify: ready" (its instance is up; the line stays out of its log), while fewer than --jobs run
+              when it is given, and while `capacity` passes, because the 1-minute load lags an instance start; a script
+              that never prints the line runs alone. While capacity is
               short a script waits, checking every 15 seconds; after 10 minutes it is REQUEUED behind the rest, and
               after a second such wait it is NOT-RUN, which fails the run. A watchdog samples the load every 3 seconds;
               once it stays above 1.0 x cores for 15 seconds, it stops the most recently started script with its
