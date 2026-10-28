@@ -219,28 +219,42 @@ class Guard(unittest.TestCase):
             self.assertEqual([t for _, t, _, _ in steps(f)], expected, name)
         self.assertIn("todo add", self.todo("from", "rules", ok=False))
 
-    def test_a_timed_out_gate_is_stopped_with_everything_it_started(self):
+    def gates_with_script(self, name, body):
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))
         from guard_lib import gates
         scripts = self.skills / "slow" / "scripts"
-        scripts.mkdir(parents=True)
+        scripts.mkdir(parents=True, exist_ok=True)
         self.write_skill("slow", "---\nname: slow\ndescription: x\n---\n")
+        (scripts / name).write_text(body)
+        return gates, scripts
+
+    def test_a_gate_that_keeps_working_is_never_cut_off(self):
+        gates, _ = self.gates_with_script("busy.py", "import time\nfor i in range(12):\n    print(i, flush=True)\n    time.sleep(0.3)\n")
+        with mock.patch.dict(os.environ, {"GUARD_SKILL_ROOTS": str(self.skills)}), \
+                mock.patch.object(gates, "STALL", 1), mock.patch.object(gates, "POLL", 0.1):
+            started = time.monotonic()
+            self.assertIsNone(gates.run("slow", "busy.py", [], self.tmp.name))
+        self.assertGreater(time.monotonic() - started, 3)
+
+    def test_a_stuck_gate_is_stopped_with_everything_it_started(self):
         pidfile = pathlib.Path(self.tmp.name, "grandchild.pid")
-        (scripts / "hang.py").write_text(
+        gates, scripts = self.gates_with_script("hang.py",
             "import pathlib, subprocess, sys, time\n"
             f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
             f"pathlib.Path({str(pidfile)!r}).write_text(str(child.pid))\n"
             "time.sleep(60)\n")
-        with mock.patch.dict(os.environ, {"GUARD_SKILL_ROOTS": str(self.skills)}), mock.patch.object(gates, "TIMEOUT", 2):
+        with mock.patch.dict(os.environ, {"GUARD_SKILL_ROOTS": str(self.skills)}), \
+                mock.patch.object(gates, "STALL", 2), mock.patch.object(gates, "POLL", 0.1):
             started = time.monotonic()
             why = gates.run("slow", "hang.py", ["go"], self.tmp.name)
         grandchild = int(pidfile.read_text())
         self.addCleanup(lambda: subprocess.run(["kill", "-9", str(grandchild)], capture_output=True))
         self.assertLess(time.monotonic() - started, 20)
-        self.assertIn("did not finish within 2 seconds", why)
+        self.assertIn("is stuck", why)
+        self.assertIn("no output for 2 seconds", why)
+        self.assertIn("tooling failure, not a failing check", why)
         self.assertIn(f"python3 {scripts / 'hang.py'} go", why)
-        self.assertIn("yourself", why)
         self.assertIn("mark the item done again", why)
         for _ in range(50):
             try:

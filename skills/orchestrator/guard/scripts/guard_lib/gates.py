@@ -6,14 +6,20 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from . import skills
 
 GATE = re.compile(r"`\.\./([a-z0-9][a-z0-9-]*)/scripts/([A-Za-z0-9_-]+\.py)((?: -{0,2}[a-z][a-z-]*)*)`")
-TIMEOUT = 300
+STALL = 600
+POLL = 2
 TERM_WAIT = 3
 OUTPUT_LIMIT = 4000
+
+
+class Stalled(Exception):
+    """The gate and everything it started used no CPU and wrote no output for STALL seconds."""
 
 
 def named(text):
@@ -35,17 +41,54 @@ def stop_group(proc):
             time.sleep(0.05)
 
 
+def cpu_seconds(text):
+    """`ps` time, `[[dd-]hh:]mm:ss[.ss]`, as seconds."""
+    days, _, clock = text.rpartition("-")
+    seconds = 0.0
+    for field in clock.split(":"):
+        seconds = seconds * 60 + float(field)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def group_activity(pgid):
+    """How many processes the group has and the CPU seconds they used; None when `ps` cannot say."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pgid=,time="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    rows = [line.split() for line in out.splitlines()]
+    times = [cpu_seconds(row[1]) for row in rows if len(row) == 2 and row[0] == str(pgid)]
+    return len(times), round(sum(times), 2)
+
+
+def drain(stream, chunks):
+    for line in stream:
+        chunks.append(line)
+
+
 def run_in_group(command, cwd):
-    """subprocess.run in its own session, so a timeout stops the gate and every process it started."""
+    """Run the gate in its own session and wait for it however long it works; stop it and everything it started
+    only once the whole group has used no CPU and written no output for STALL seconds."""
     with subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) as proc:
-        try:
-            out, err = proc.communicate(timeout=TIMEOUT)
-        except subprocess.TimeoutExpired:
-            stop_group(proc)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=TERM_WAIT)
-            raise
-    return subprocess.CompletedProcess(command, proc.returncode, out, err)
+        out, err = [], []
+        readers = [threading.Thread(target=drain, args=pair, daemon=True) for pair in ((proc.stdout, out), (proc.stderr, err))]
+        for reader in readers:
+            reader.start()
+        last, quiet_since = None, time.monotonic()
+        while proc.poll() is None or any(reader.is_alive() for reader in readers):
+            mark = (group_activity(proc.pid), len(out), len(err))
+            if mark != last:
+                last, quiet_since = mark, time.monotonic()
+            elif time.monotonic() - quiet_since >= STALL:
+                stop_group(proc)
+                raise Stalled
+            if proc.poll() is None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=POLL)
+            else:
+                for reader in readers:
+                    reader.join(POLL)
+    return subprocess.CompletedProcess(command, proc.returncode, "".join(out), "".join(err))
 
 
 def run(skill, script, args, cwd):
@@ -58,10 +101,11 @@ def run(skill, script, args, cwd):
     command = [sys.executable, str(path), *args]
     try:
         r = run_in_group(command, cwd)
-    except subprocess.TimeoutExpired:
-        return (f"the gate `{shown}` did not finish within {TIMEOUT} seconds, so guard stopped it and everything it started. "
-                f"Run `python3 {shlex.join([str(path), *args])}` yourself, outside the hook, from {cwd}, then mark the item done again; "
-                "a result or stamp it leaves behind lets the gate return at once.")
+    except Stalled:
+        return (f"the gate `{shown}` is stuck: it and everything it started used no CPU and wrote no output for {STALL} seconds, "
+                "so guard stopped them. This is a tooling failure, not a failing check. "
+                f"Run `python3 {shlex.join([str(path), *args])}` yourself from {cwd} to see where it hangs, fix that, "
+                "then mark the item done again.")
     if r.returncode == 0:
         return None
     output = (r.stdout + r.stderr).strip()[-OUTPUT_LIMIT:]

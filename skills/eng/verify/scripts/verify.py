@@ -130,12 +130,14 @@ directory.
               copy in the verification directory, and when none or several do, the gate fails. Only without any plan
               folder does it pass, with a note.
   decisions   the hillclimb decision log is well formed
-  units       every spec file added or changed in <base>..<head> (default: <merge-base with main>..HEAD) fails on
-              base plus that spec and passes at head. The runner is detected (vitest or jest from package.json,
-              else pytest or unittest for .py files), or --test-cmd gives it, with {files} for the spec path.
-              A spec file whose text contains "regression-guard" (in a title or a comment) guards behavior that
-              already works: it must pass at head but may pass on base. Keep guards in their own spec files.
-              Each run records units.json (per spec its verdict and the plan check ids its text names, so a test
+  units       every spec file added or changed in <base>..<head> (default: the adopted phase base, else <merge-base
+              with main>, ..HEAD) fails on base plus that spec and passes at head. The runner is detected (vitest or
+              jest from package.json, else pytest or unittest for .py files), or --test-cmd gives it, with {files} for
+              the spec path. A spec file whose text contains "regression-guard" (in a title or a comment) guards
+              behavior that already works: it must pass at head but may pass on base. Keep guards in their own spec
+              files. A --test-cmd is saved as units.test-cmd in the verification directory and reused by a later run
+              that gives none, so a gate that runs `units` bare uses the project's runner. A passing run recorded for
+              the same base, head tree, specs, and commands is reused instead of run again. Each run records units.json (per spec its verdict and the plan check ids its text names, so a test
               titled "U2: ..." proves unit check U2) and units.log in the verification directory, for `report`.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
               instance id) to each, and print one compact line per check in id order, '<id> <VERDICT> <seconds>s [step
@@ -937,6 +939,7 @@ def cmd_freeze(directory, args):
 
 
 BASE_RECORD = "base.json"
+UNITS_TEST_CMD = "units.test-cmd"
 
 
 def latest_base(branch):
@@ -3260,12 +3263,21 @@ def resolve_range(command, rest):
 
 def cmd_units(directory, args):
     top = pathlib.Path(git("rev-parse", "--show-toplevel"))
-    base, head = resolve_range("units", args.rest)
+    adopted = base_record(directory).get("base")
+    base, head = resolve_range("units", args.rest or ([f"{adopted}..HEAD"] if adopted else []))
+    remembered = directory / UNITS_TEST_CMD
+    if args.test_cmd:
+        directory.mkdir(parents=True, exist_ok=True)
+        remembered.write_text(args.test_cmd + "\n")
+    elif remembered.is_file():
+        args.test_cmd = remembered.read_text().strip()
     specs = args.spec or changed_specs(base, head)
     if not specs:
         raise Failed(f"no spec files were added or changed in {base[:12]}..{head[:12]}. A feature ships with specs that fail without it; "
                      "write them, or name spec files with --spec when the project's test files do not follow the usual naming.")
     commands = {s: spec_command(top, s, args.test_cmd) for s in specs}
+    if reused := reusable_units(directory, base, head, commands):
+        return reused
     texts = {s: git("show", f"{head}:{s}") for s in specs}
     guards = {s for s in specs if GUARD_MARK in texts[s]}
     with scratch_tree(top, base, specs, head) as tree:
@@ -3293,6 +3305,7 @@ def cmd_units(directory, args):
                  f"{tally['vacuous']} pass without the implementation, {tally['broken']} fail at head")
     ids = plan_ids(directory)
     record = {"at": time.time(), "base": base, "head": head, "tree": tree_of(head), "passed": not (tally["vacuous"] or tally["broken"]),
+              "commands": commands,
               "specs": {s: {"verdict": verdicts[s], "checks": named_checks(texts[s], ids)} for s in specs}}
     directory.mkdir(parents=True, exist_ok=True)
     (directory / UNITS_RECORD).write_text(json.dumps(record, indent=2) + "\n")
@@ -3300,6 +3313,18 @@ def cmd_units(directory, args):
     if not record["passed"]:
         raise Failed("\n" + "\n".join(lines))
     return "\n".join(lines)
+
+
+def reusable_units(directory, base, head, commands):
+    """The passing run already recorded for this base, head tree, specs, and commands, so a gate with a time limit returns at once."""
+    record_path, log_path = directory / UNITS_RECORD, directory / UNITS_LOG
+    if not (record_path.is_file() and log_path.is_file()):
+        return None
+    record = json.loads(record_path.read_text())
+    if not (record.get("passed") and record.get("base") == base and record.get("tree") == tree_of(head)
+            and record.get("commands") == commands):
+        return None
+    return log_path.read_text().rstrip("\n") + f"\n(reused the passing run recorded for tree {record['tree'][:12]})"
 
 
 def plan_ids(directory):

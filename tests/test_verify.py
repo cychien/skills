@@ -2124,6 +2124,26 @@ class Units(RepoFixture):
         self.commit("Break the guard")
         self.assertRegex(self.units(ok=False), r"FAILS AT HEAD\s+tests/test_guard.py")
 
+    def test_a_given_test_cmd_is_remembered_for_a_bare_run(self):
+        self.feature(test_mul=self.spec(self.NEW, self.NEW_BODY))
+        marker = pathlib.Path(self.tmp.name) / "ran"
+        command = f"touch {marker} && {sys.executable} -m unittest {{files}}"
+        self.units("--test-cmd", command)
+        self.assertEqual((pathlib.Path(self.verify("where").strip()) / "units.test-cmd").read_text(), command + "\n")
+        marker.unlink()
+        self.put("tests/test_mul.py", self.spec(self.NEW, self.NEW_BODY) + "\n")
+        self.commit("Touch the spec")
+        self.assertRegex(self.units(), r"OK\s+tests/test_mul.py")
+        self.assertTrue(marker.exists())
+
+    def test_a_passing_run_is_reused_until_the_head_tree_changes(self):
+        self.feature(test_mul=self.spec(self.NEW, self.NEW_BODY))
+        self.assertNotIn("reused", self.units())
+        self.assertIn("(reused the passing run recorded for tree", self.units())
+        self.put("README.md", "head moved on\n")
+        self.commit("Move head")
+        self.assertNotIn("reused", self.units())
+
     def test_a_spec_that_fails_at_head_fails_the_gate(self):
         self.feature(test_mul=self.spec(self.NEW, "self.assertEqual(mul(2, 3), 7)"))
         self.assertRegex(self.units(ok=False), r"FAILS AT HEAD\s+tests/test_mul.py")
