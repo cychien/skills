@@ -36,7 +36,7 @@
 
 ## Drive contract
 
-<Written at the design step, before the lock. A phase plan from the plan-feature skill leaves this section and the next out until then.>
+<Written at the design step, before the lock.>
 
 - <kind: test id, accessible name, route, HTTP path, CLI command or flag, wire or event name, or file path>: `<the exact name>`, <what it is and which checks drive it>
 

@@ -35,7 +35,7 @@ Present the explainer's output. Light edits for clarity or context from the conv
 
 ## With a verification plan
 
-The feature skill's grounding step passes the plan, the place its files go (the plan's phase folder, else the verification directory), and the base commit the premises are checked at. Then:
+The caller passes the plan, the place its files go (the plan's phase folder, else the verification directory), and the base commit the premises are checked at. Then:
 
 - Give every check to at least one explorer, beside its angle: the checks whose scenario runs through its slice, with the base commit. The explorer lists each fact the check assumes already holds on the base (a route exists, a dialog asks before it acts, an adapter queues while offline), whether it holds, and the file and line or the command output that shows it, because a false assumption found before the design costs a line. What the change itself will build is not a premise: the explorer notes it once per check as new, not once per missing piece, because a table full of planned work buries the few assumptions that are actually false.
 - When the caller passes an earlier `grounding.md`, the explorers start from it and look only at what changed since and at the premises.

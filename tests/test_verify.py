@@ -1069,6 +1069,22 @@ class Driver(unittest.TestCase):
         (d / "review.md").write_text(review_md("0123456789ab"))
         self.assertIn("review.md reviewed Head 0123456789ab, which is not a commit in this repository", run("review").stdout)
 
+    def test_the_review_gate_holds_head_to_fixed_at_without_a_plan(self):
+        d = pathlib.Path(self.tmp.name) / "verification"
+        d.mkdir()
+        def run(*a):
+            return subprocess.run([sys.executable, "-I", str(VERIFY), *a, "--dir", str(d)], cwd=self.repo, capture_output=True, text=True,
+                                  env={**os.environ, "VERIFY_HOME": str(pathlib.Path(self.tmp.name) / "home")})
+        self.assertIn("no review.md", run("review").stdout)
+        reviewed = self.head()
+        (d / "review.md").write_text(review_md(reviewed))
+        self.assertEqual(run("review").returncode, 0, run("review").stdout)
+        (self.repo / "app.py").write_text("print('unreviewed')\n")
+        self.commit("Change after the fix review")
+        self.assertIn(f"product files changed after the fix review's fixes (Fixed at {reviewed[:12]}): app.py", run("review").stdout)
+        (d / "plan.md").write_text(plan(CHECKS, PERF_NA))
+        self.assertIn("the plan was never frozen", run("review").stdout)
+
     def test_an_e2e_pass_needs_a_passing_run_with_no_later_product_change(self):
         d, report, run = self.reviewed_report()
         self.assertEqual(report().returncode, 0, report().stdout)

@@ -1,16 +1,16 @@
 ---
 name: quick-feature
-description: "Build a small change about as fast as asking an agent to do it: make the change yourself, test it, run it once on the real surface, open a PR. No plan lock, no separate verifier, no review. Use for /quick-feature, or when a switchboard routes a small change here."
+description: "Build a small change about as fast as asking an agent to do it: make the change yourself, test it, run it once on the real surface, open a PR. No design step and no review. Use for /quick-feature, or when a switchboard routes a small change here."
 disable-model-invocation: true
 ---
 
 # Quick feature
 
-**Speed first.** The user picks this skill to iterate fast, so it runs about as fast as asking an agent directly. It drops the plan lock, the separate verifier, the e2e scripts, and the review that the **feature** skill keeps, and keeps only what a careful engineer does anyway: tests for the change and one run on the real surface. Never switch to another playbook on your own, because the user chose this one.
+**Speed first.** The user picks this skill to iterate fast, so it runs about as fast as asking an agent directly. It drops the design step, the oracle and perf checks, the run from a fresh install, and the cross-family review that the **feature** skill keeps, and keeps only what a careful engineer does anyway: tests for the change and one run on the real surface. Never switch to another playbook on your own, because the user chose this one.
 
 Paths like `../open-pr/SKILL.md` point to skills installed beside this one, relative to this file's folder.
 
-**With a plan folder** from the **plan-feature** skill (`../plan-feature/SKILL.md`), build every phase that has not landed, in its order, in this one session. Run the four steps once per phase, starting each phase with a fresh `todo from quick-feature`. The phase's `plan.md` lists what to prove: write a unit test for each unit-tier check, and drive each e2e and walk check once by hand in step 3, with no scripts. Read `spec.md` before each phase, and when the code has to differ from it, change `spec.md` and the later phase plans the change affects, with a line in its `## Change log`, so the next phase builds on what shipped. Open one PR per phase, the first against main and each later one against the phase before it, because plan-feature cut the phases so each lands and reverts alone.
+**With a plan folder** from the **plan-feature** skill (`../plan-feature/SKILL.md`), build every phase that has not landed, in its order, in this one session. Run the four steps once per phase, starting each phase with a fresh `todo from quick-feature`. The Acceptance items the phase's entry in `plan.md` proves list what to prove: write a unit test for each one a unit spec can see, and drive each other one once by hand in step 3. Read `spec.md` before each phase, and when the design has to differ from it, change `spec.md` and the later phase entries the change affects, with a line in its `## Change log`, so the next phase builds on what shipped. Open one PR per phase, the first against main and each later one against the phase before it, because plan-feature cut the phases so each lands and reverts alone.
 
 Open a todolist whose first items are the steps below, copied in verbatim. The `guard` skill's `todo from quick-feature` does this; print each step with guard's `todo show <n>` and close it with the token that prints. Without guard, use your agent's todo tool.
 

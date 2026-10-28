@@ -2,7 +2,7 @@
 
 Write the checks before the design, with the requirements. A pass predicate and a perf budget are product decisions as much as the spec is, and a check or budget written after the code tends to describe the code instead of the requirement. Test each check's premises against the code, then add the Drive contract and the Sensitive paths once the design settles, because they name what the design builds, and lock all of it before any code.
 
-Write it as `plan.md` in the verification directory that `python3 ../scripts/verify.py where` prints (a path beside this file's folder), from `plan-template.md` beside this file. With a plan folder from the plan-feature skill, the plan is the phase's own `plan.md` in its folder, which `verify.py adopt` points the branch at, and no copy exists. `verify.py plan --checks` checks the checks alone, and `verify.py plan` checks the whole plan, so a check without a predicate or a plan without a perf decision cannot reach a verifier.
+Write it as `plan.md` in the verification directory that `python3 ../scripts/verify.py where` prints (a path beside this file's folder), from `plan-template.md` beside this file. A phase folder's own `plan.md` is the plan once `verify.py adopt` points the branch at it, and no copy exists. `verify.py plan --checks` checks the checks alone, and `verify.py plan` checks the whole plan, so a check without a predicate or a plan without a perf decision cannot reach a verifier.
 
 ## Terms
 

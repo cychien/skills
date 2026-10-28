@@ -69,14 +69,14 @@ directory.
               is a recorded revision, and fails for a plan first frozen after code existed.
   oracles     every oracle check has its expected value, computed from the spec after the freeze
   compare     every oracle check's observed value matches its expected value
-  review      review.md, written after the freeze, names its 'Reviewer:' (agent:model) under the title and holds a
-              '## Review' section and a '## Fix review' section, each with its own 'Head:' line, the commit the reviewer
-              read, and nothing else but finding bullets, each triaged ('Triage: fixed | new check | follow-up |
-              pre-existing | dismissed'), or 'none found'; any other line fails. The fix review names its own 'Reviewer:',
-              the review's, unless a 'Relaxed: <reason>' line says why another took it (a quota fallback), and the report
-              lists that. The lead adds 'Fixed at: <sha>' to the fix review once its fixes land: a commit at or after its
-              Head, with the Head's product tree when no finding is triaged fixed. HEAD must hold Fixed at's product tree,
-              so no product change follows the reviewed fixes.
+  review      review.md, written after the freeze when there is a plan, names its 'Reviewer:' (agent:model) under the
+              title and holds a '## Review' section and a '## Fix review' section, each with its own 'Head:' line, the
+              commit the reviewer read, and nothing else but finding bullets, each triaged ('Triage: fixed | new check
+              | follow-up | pre-existing | dismissed'), or 'none found'; any other line fails. The fix review names
+              its own 'Reviewer:', the review's, unless a 'Relaxed: <reason>' line says why another took it (a quota
+              fallback), and the report lists that. The lead adds 'Fixed at: <sha>' to the fix review once its fixes
+              land: a commit at or after its Head, with the Head's product tree when no finding is triaged fixed. HEAD
+              must hold Fixed at's product tree, so no product change follows the reviewed fixes.
   scripts     every e2e check, perf checks included, has its <id>.check.<ext> script and an <id>.base.log from
               `dryrun` of that same script that printed a "verify: step <name> within <seconds>" line on stdout before
               "verify: ready", reached that line, and failed a predicate: exit 1 with a FAIL line last on stdout. A
@@ -137,8 +137,9 @@ directory.
               behavior that already works: it must pass at head but may pass on base. Keep guards in their own spec
               files. A --test-cmd is saved as units.test-cmd in the verification directory and reused by a later run
               that gives none, so a gate that runs `units` bare uses the project's runner. A passing run recorded for
-              the same base, head tree, specs, and commands is reused instead of run again. Each run records units.json (per spec its verdict and the plan check ids its text names, so a test
-              titled "U2: ..." proves unit check U2) and units.log in the verification directory, for `report`.
+              the same base, head tree, specs, and commands is reused instead of run again. Each run records
+              units.json (per spec its verdict and the plan check ids its text names, so a test titled "U2: ..."
+              proves unit check U2) and units.log in the verification directory, for `report`.
   rerun       run every saved <id>.check.<ext> script in the verification directory, passing ARGS (for example an
               instance id) to each, and print one compact line per check in id order, '<id> <VERDICT> <seconds>s [step
               <name>] [<reason>]', then a summary; the same lines go to rerun.summary, so read one line per check and
@@ -2730,9 +2731,11 @@ def cmd_phases(directory, args):
 
 
 def cmd_review(directory, args):
-    _, text, _, _, _ = load_plan(directory)
-    lock = frozen_lock(directory, text)
-    if problems := review_problems(directory, lock["frozen_ts"], head_sha() is not None, fix_head=True):
+    frozen_ts = 0
+    if plan_file(directory).is_file():
+        _, text, _, _, _ = load_plan(directory)
+        frozen_ts = frozen_lock(directory, text)["frozen_ts"]
+    if problems := review_problems(directory, frozen_ts, head_sha() is not None, fix_head=True):
         raise Failed("\n".join(f"{directory / REVIEW}: {p}" for p in problems))
     return "review ok: the review and the fix review name the Head they read and triage every finding"
 

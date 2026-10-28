@@ -11,9 +11,9 @@ Agent skills that work in Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot
 - [eng-do](./skills/eng/eng-do/) - the engineering switchboard: routes engineering work to its playbook
 - [principles](./skills/eng/principles/) - the engineering principles playbooks read before they design or build
 - [code-comments](./skills/eng/code-comments/) - how code is commented in every file a playbook produces
-- [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements, one living spec, phases, and every phase's checks before any code
-- [feature](./skills/eng/feature/) - build big new or changed behavior: clarify, ground and test the checks' premises, design, lock the plan before code, implement beside the e2e scripts, review, prove once, open a PR; builds a plan-feature plan one phase per session, one PR per phase, stacked while an earlier phase is open
-- [quick-feature](./skills/eng/quick-feature/) - build a small change about as fast as asking an agent: do it yourself, test it, run it once, open a PR; no plan lock, verifier, or review
+- [plan-feature](./skills/eng/plan-feature/) - plan a big or vague feature: requirements and what proves them, the riskiest unknowns settled, one living spec and a skeleton, phases
+- [feature](./skills/eng/feature/) - build big new or changed behavior: settle what proves it, design, build with its tests, run it where users meet it and from a fresh install, a cross-family review and one fix review, open a PR; builds every phase of a plan-feature plan in one session, one stacked PR per phase
+- [quick-feature](./skills/eng/quick-feature/) - build a small change about as fast as asking an agent: do it yourself, test it, run it once, open a PR; no design step or review
 - [bug-fix](./skills/eng/bug-fix/) - fix a bug: reproduce on main, find the root cause from runtime evidence, review the fix before one e2e run, land the failing repro before the fix
 - [perf-issue](./skills/eng/perf-issue/) - fix a slowness against a vetted baseline, cheapest performance mantra first
 - [hillclimb](./skills/eng/hillclimb/) - improve one metric against a target: frozen harness, keep or revert, decision log

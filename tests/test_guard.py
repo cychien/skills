@@ -1425,13 +1425,13 @@ def reap(proc):
     proc.wait()
 
 
-FEATURE_V2 = """\
+TEN_STEP_FLOW = """\
 ---
-name: feature
+name: ten-step
 description: x
 ---
 
-# Feature
+# Ten step
 
 1. Clarify the requirements and run the basic checks. Close this step only when `../verify/scripts/verify.py base` and `../verify/scripts/verify.py plan --checks` pass. Mandatory: no skip-with-reason escape.
 2. Ground in the code with the how skill (`../how/SKILL.md`) and check every check's premises. Close this step only when `../verify/scripts/verify.py premises` passes.
@@ -1444,15 +1444,17 @@ description: x
 9. Fix the e2e FAILs, classified first, then one rerun. Skip this step with the reason when nothing failed.
 10. Close, then open the PR with the open-pr skill (`../open-pr/SKILL.md`). Close this step only when `../verify/scripts/verify.py report`, `../verify/scripts/verify.py spec` and `../verify/scripts/verify.py leftovers` pass. Mandatory: no skip-with-reason escape.
 """
-FEATURE_V2_AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
-FEATURE_V2_GATES = {1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
-                    7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
+TEN_STEP_AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [4], 6: [4], 7: [5], 8: [6, 7], 9: [8], 10: [9]}
+TEN_STEP_GATES = {1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"}, 5: {"units"}, 6: {"scripts"},
+                  7: {"review"}, 8: {"oracles"}, 9: set(), 10: {"report", "spec", "leftovers"}}
 REPO_FEATURE = ROOT / "skills" / "eng" / "feature" / "SKILL.md"
+FEATURE_AFTER = {1: [], 2: [1], 3: [2], 4: [3], 5: [3], 6: [4, 5]}
+FEATURE_GATES = {1: set(), 2: set(), 3: set(), 4: set(), 5: {"review"}, 6: {"review"}}
 
 
-class FeatureFlow(unittest.TestCase):
-    """`todo from feature` turns the ten-step flow into ordered, gated items: scripts open with the code, review waits on the code,
-    and the one e2e run waits on both."""
+class GatedFlow(unittest.TestCase):
+    """`todo from` turns a gated flow into ordered items: scripts open with the code, review waits on the code, and the one e2e run
+    waits on both."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1462,9 +1464,9 @@ class FeatureFlow(unittest.TestCase):
         for k in ("AUTORUN_RUN", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             self.env.pop(k, None)
 
-    def items(self, roots):
+    def items(self, roots, name):
         self.env["GUARD_SKILL_ROOTS"] = str(roots)
-        r = subprocess.run([sys.executable, str(GUARD), "todo", "from", "feature", "--session", "claude:s1"], capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
+        r = subprocess.run([sys.executable, str(GUARD), "todo", "from", name, "--session", "claude:s1"], capture_output=True, text=True, env=self.env, cwd=self.tmp.name)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))
@@ -1472,22 +1474,14 @@ class FeatureFlow(unittest.TestCase):
         todo = json.loads(pathlib.Path(self.env["GUARD_HOME"], "sessions", "claude-s1.json").read_text())["todo"]
         return {i["n"]: (i["after"], i["mandatory"], {" ".join(args) for _, _, args in gates.named(i["text"])}) for i in todo}
 
-    def assert_flow(self, items, exact_gates):
-        self.assertEqual(sorted(items), list(range(1, 11)))
-        self.assertEqual({n: after for n, (after, _, _) in items.items()}, FEATURE_V2_AFTER)
-        mandatory = {n for n, (_, m, _) in items.items() if m}
-        self.assertLessEqual({1, 4, 5, 7, 8, 10}, mandatory)
-        self.assertFalse({6, 9} & mandatory)
-        for n, expected in FEATURE_V2_GATES.items():
-            found = items[n][2]
-            self.assertTrue(found == expected if exact_gates else expected <= found, (n, found))
-            self.assertNotIn("report --write", found, n)
-
     def test_the_ten_step_flow_orders_its_items_with_their_gates(self):
-        skill = pathlib.Path(self.tmp.name) / "skills" / "feature" / "SKILL.md"
+        skill = pathlib.Path(self.tmp.name) / "skills" / "ten-step" / "SKILL.md"
         skill.parent.mkdir(parents=True)
-        skill.write_text(FEATURE_V2)
-        self.assert_flow(self.items(skill.parent.parent), exact_gates=True)
+        skill.write_text(TEN_STEP_FLOW)
+        items = self.items(skill.parent.parent, "ten-step")
+        self.assertEqual({n: after for n, (after, _, _) in items.items()}, TEN_STEP_AFTER)
+        self.assertEqual({n for n, (_, m, _) in items.items() if m}, {1, 4, 5, 7, 8, 10})
+        self.assertEqual({n: gates for n, (_, _, gates) in items.items()}, TEN_STEP_GATES)
         verify = skill.parent.parent / "verify"
         (verify / "scripts").mkdir(parents=True)
         (verify / "SKILL.md").write_text("---\nname: verify\ndescription: x\n---\n")
@@ -1495,8 +1489,11 @@ class FeatureFlow(unittest.TestCase):
         r = subprocess.run([sys.executable, str(GUARD), "lint", str(skill)], capture_output=True, text=True, env=self.env)
         self.assertEqual(r.returncode, 0, r.stdout)
 
-    def test_the_repo_feature_skill_orders_its_items_with_their_gates(self):
-        self.assert_flow(self.items(REPO_FEATURE.parent.parent), exact_gates=False)
+    def test_the_repo_feature_skill_reviews_beside_the_real_run_and_opens_the_pr_last(self):
+        items = self.items(REPO_FEATURE.parent.parent, "feature")
+        self.assertEqual({n: after for n, (after, _, _) in items.items()}, FEATURE_AFTER)
+        self.assertEqual({n for n, (_, m, _) in items.items() if m}, {5, 6})
+        self.assertEqual({n: gates for n, (_, _, gates) in items.items()}, FEATURE_GATES)
 
 
 class ShippedPlaybooks(unittest.TestCase):
@@ -1527,28 +1524,23 @@ class ShippedPlaybooks(unittest.TestCase):
         self.assertEqual([gates.named(text) for _, _, text, _ in steps], [[], [], [], []])
         self.assertIn("../open-pr/SKILL.md", steps[-1][2])
 
-    def test_feature_tests_premises_locks_before_code_reviews_before_the_e2e_run_and_gates_the_pr(self):
-        mandatory = self.gated_mandatory_steps("feature")
-        self.assertEqual(mandatory, {
-            1: {"base", "plan --checks"}, 2: {"premises"}, 3: {"plan", "premises --resolved"}, 4: {"lock"},
-            5: {"units"}, 7: {"review"}, 8: {"oracles"}, 10: {"report", "spec", "leftovers"},
-        })
+    def test_feature_cannot_skip_the_cross_family_review_or_open_the_pr_past_it(self):
+        self.assertEqual(self.gated_mandatory_steps("feature"), {5: {"review"}, 6: {"review"}})
 
     def test_e2e_scripts_are_written_beside_the_code_and_gated_on_their_base_dry_run(self):
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))
         from guard_lib import gates, skills
-        for skill, implement in (("feature", 5), ("bug-fix", 6)):
-            steps = skills.steps(ROOT / "skills" / "eng" / skill / "SKILL.md")
-            scripts = [(n, text) for n, _, text, _ in steps if {"scripts"} <= {" ".join(args) for _, _, args in gates.named(text)}]
-            self.assertEqual([n for n, _ in scripts], [implement + 1], skill)
-            self.assertIn(f"in parallel with step {implement}", scripts[0][1], skill)
+        steps = skills.steps(ROOT / "skills" / "eng" / "bug-fix" / "SKILL.md")
+        scripts = [(n, text) for n, _, text, _ in steps if {"scripts"} <= {" ".join(args) for _, _, args in gates.named(text)}]
+        self.assertEqual([n for n, _ in scripts], [7])
+        self.assertIn("in parallel with step 6", scripts[0][1])
 
     def test_the_step_that_opens_the_pr_is_the_one_the_final_run_gates(self):
         sys.path.insert(0, str(GUARD.parent))
         self.addCleanup(sys.path.remove, str(GUARD.parent))
         from guard_lib import gates, skills
-        for skill, final in (("feature", {"report", "spec", "leftovers"}), ("bug-fix", {"report", "leftovers"})):
+        for skill, final in (("feature", {"review"}), ("bug-fix", {"report", "leftovers"})):
             steps = skills.steps(ROOT / "skills" / "eng" / skill / "SKILL.md")
             opening = [n for n, _, text, _ in steps if "../open-pr/SKILL.md" in text]
             last = steps[-1]
@@ -1556,9 +1548,6 @@ class ShippedPlaybooks(unittest.TestCase):
             self.assertTrue(last[3], skill)
             self.assertLessEqual(final, {" ".join(args) for _, _, args in gates.named(last[2])}, skill)
 
-    def test_plan_feature_cannot_hand_back_without_every_phase_plan(self):
-        mandatory = self.gated_mandatory_steps("plan-feature")
-        self.assertEqual(mandatory, {5: {"phases"}})
 
 FAKE_AGENT = """\
 import json, os, subprocess, sys, time
