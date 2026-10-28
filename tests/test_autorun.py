@@ -231,6 +231,35 @@ class AutorunFlow(Harness):
         gate = json.loads(next((self.home / "runs" / run / "gates").glob("g-*.json")).read_text())
         self.assertEqual(gate["status"], "open")
 
+    def test_an_agent_hand_back_or_a_slash_command_is_not_taken_as_an_answer(self):
+        run = self.start_run()
+        self.ask(run, "direction")
+        hand_back = ("Another Claude session sent a message:\n<agent-message from=\"a1\">\n[Subagent hand-back] done\n</agent-message>")
+        self.assertIsNone(self.hook("UserPromptSubmit", {"prompt": hand_back}))
+        skill = self.home / "skills" / "open-pr" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: open-pr\ndescription: x\n---\n")
+        out = self.hook("UserPromptSubmit", {"prompt": "/open-pr feat/x against main"})
+        self.assertIn("does not answer gate", out["hookSpecificOutput"]["additionalContext"])
+        gate = json.loads(next((self.home / "runs" / run / "gates").glob("g-*.json")).read_text())
+        self.assertEqual(gate["status"], "open")
+        self.hook("UserPromptSubmit", {"prompt": "b"})
+        gate = json.loads(next((self.home / "runs" / run / "gates").glob("g-*.json")).read_text())
+        self.assertEqual((gate["status"], gate["answer"]), ("answered", "b"))
+
+    def test_a_question_back_is_not_taken_as_an_answer(self):
+        run = self.start_run()
+        self.ask(run, "direction")
+        for prompt in ("現況如何", "what is the status?", "PR 開了嗎"):
+            out = self.hook("UserPromptSubmit", {"prompt": prompt})
+            self.assertIn("asks something back and does not answer gate", out["hookSpecificOutput"]["additionalContext"])
+        gate = json.loads(next((self.home / "runs" / run / "gates").glob("g-*.json")).read_text())
+        self.assertEqual(gate["status"], "open")
+        answer = "算了，不可逆動作還是我自己來好了。\n\n這樣子還有什麼是我需要處理的嗎？"
+        self.hook("UserPromptSubmit", {"prompt": answer})
+        gate = json.loads(next((self.home / "runs" / run / "gates").glob("g-*.json")).read_text())
+        self.assertEqual((gate["status"], gate["answer"]), ("answered", answer))
+
     def test_child_process_joins_the_run_as_delegate(self):
         run = self.start_run()
         child = textwrap.dedent(f"""
@@ -408,8 +437,48 @@ class AutorunFlow(Harness):
 
 
 class Review(Harness):
-    def reviewer(self, verdict):
-        (self.home / "config.json").write_text(json.dumps({"review_command": f"cat >/dev/null; echo '{json.dumps(verdict)}'"}))
+    def reviewer(self, verdict, irreversible=False):
+        config = {"review_command": f"cat >/dev/null; echo '{json.dumps(verdict)}'", "review_irreversible": irreversible}
+        (self.home / "config.json").write_text(json.dumps(config))
+
+    def test_irreversible_calls_go_to_the_user_unless_reviewer_approval_is_turned_on(self):
+        run = self.start_run()
+        self.reviewer({"verdict": "approve", "class": "4", "reason": "branch this run created"})
+        self.assertIn("ESCALATED", self.ask(run, "irreversible", command="git push --force-with-lease origin run-branch"))
+
+    def test_reviewer_settles_a_bounded_irreversible_call_without_the_user(self):
+        run = self.start_run()
+        drop = {"tool_name": "Bash", "tool_input": {"command": "git push --force-with-lease origin run-branch"}}
+        self.reviewer({"verdict": "approve", "class": "4", "reason": "branch this run created"}, irreversible=True)
+        out = self.ask(run, "irreversible", command="git push --force-with-lease origin run-branch")
+        self.assertIn("APPROVED by independent review", out)
+        self.assertNotIn("ESCALATED", out)
+        self.assertEqual(list((self.home / "runs" / run / "gates").glob("*.json")) if (self.home / "runs" / run / "gates").exists() else [], [])
+        self.assertEqual(self.hook("PreToolUse", drop)["hookSpecificOutput"]["permissionDecision"], "allow")
+        self.assertEqual(self.hook("PreToolUse", drop)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_an_irreversible_call_the_reviewer_will_not_approve_goes_to_the_user(self):
+        run = self.start_run()
+        self.reviewer({"verdict": "escalate", "class": "none", "reason": "writes production"}, irreversible=True)
+        out = self.ask(run, "irreversible", command="psql prod -c 'delete from users'")
+        self.assertIn("ESCALATED", out)
+        gate = json.loads(next((self.home / "runs" / run / "gates").glob("*.json")).read_text())
+        self.assertEqual(gate["review"]["reason"], "writes production")
+        self.reviewer({"verdict": "decide", "pick": "a", "reason": "a question verdict is not an approval"}, irreversible=True)
+        self.assertIn("ESCALATED", self.ask(run, "irreversible", command="psql prod -c 'drop table users'"))
+
+    def test_an_approval_outside_the_bounded_classes_still_goes_to_the_user(self):
+        run = self.start_run()
+        self.reviewer({"verdict": "approve", "class": "none", "reason": "looks fine"}, irreversible=True)
+        self.assertIn("ESCALATED", self.ask(run, "irreversible", command="psql prod -c 'drop table users'"))
+        self.reviewer({"verdict": "approve", "reason": "no class given"}, irreversible=True)
+        self.assertIn("ESCALATED", self.ask(run, "irreversible", command="psql prod -c 'drop table orders'"))
+
+    def test_user_only_actions_never_reach_the_reviewer(self):
+        run = self.start_run()
+        self.reviewer({"verdict": "approve", "class": "3", "reason": "x"}, irreversible=True)
+        for command in ("gh pr merge 12 --squash", "npm publish", "kubectl apply -f prod.yml", "fly deploy"):
+            self.assertIn("ESCALATED", self.ask(run, "irreversible", command=command), command)
 
     def test_reviewer_can_decide_an_escalation(self):
         run = self.start_run()

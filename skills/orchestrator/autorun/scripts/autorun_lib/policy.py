@@ -47,9 +47,14 @@ DEFAULTS = {
     "irreversible_tools": [
         ["sending a message or email", r"(?i)(send_?(message|email|mail)|post_?message|reply_?(to_?)?(message|thread|email))"],
     ],
+    "user_only": [
+        "merging a pull request", "publishing a release", "deleting a repository", "publishing a package", "pushing an image",
+        "a deploy", "changing live infrastructure", "deleting outside the workspace", "sending a message or email",
+    ],
     "stop_idle_limit": 3,
     "notify": None,
     "review": True,
+    "review_irreversible": False,
     "review_command": None,
 }
 
@@ -62,7 +67,8 @@ NOT_THE_USERS_WORDS = re.compile(
     r"<pasted_content\b.*?</pasted_content[^>]*>|```.*?```|`[^`\n]*`|\"[^\"\n]{0,120}\"|“[^”\n]{0,120}”|「[^」\n]{0,120}」|『[^』\n]{0,120}』",
     re.S,
 )
-SYSTEM_PROMPT = re.compile(r"^\s*<(task-notification|system-reminder|local-command|command-name)")
+SYSTEM_PROMPT = re.compile(r"^\s*(?:Another Claude session sent a message[^\n]*\n\s*)?"
+                           r"<(task-notification|system-reminder|local-command|command-name|agent-message|cross-session-message)\b")
 QUESTION_ENDING = re.compile(
     r"([?？]\s*\**\s*$)|(?i:\b(should i|shall i|do you want|would you like|want me to|let me know (if|whether|which))\b)|"
     r"(要不要|需要我|你想要|你希望|請確認|请确认|請告訴我|请告诉我|是否要)"
@@ -70,6 +76,8 @@ QUESTION_ENDING = re.compile(
 
 
 SKILL_COMMAND = re.compile(r"^\s*/([a-z0-9][a-z0-9-]*)\b")
+ASKS_BACK = re.compile(r"([?？]|嗎|吗|呢|如何|怎樣|怎样|怎麼樣|怎么样)\s*$")
+SENTENCE_END = re.compile(r"(?<=[。！!？?])|\n+")
 
 
 def skill_command(prompt, cwd):
@@ -82,6 +90,12 @@ def skill_command(prompt, cwd):
     roots = [pathlib.Path(p) for p in configured.split(os.pathsep)] if configured else \
         [base / ".claude/skills", base / ".agents/skills", home / ".claude/skills", home / ".agents/skills", home / ".codex/skills"]
     return m.group(1) if any((r / m.group(1) / "SKILL.md").is_file() for r in roots) else None
+
+
+def asks_back(prompt):
+    """A message whose every sentence is a question asks something back and answers no gate."""
+    sentences = [x.strip(" ，,") for x in SENTENCE_END.split(users_own_words(prompt or "")) if x.strip(" ，,")]
+    return bool(sentences) and all(ASKS_BACK.search(x) for x in sentences)
 
 
 def config():
@@ -171,6 +185,12 @@ def irreversible(tool, tool_input):
         if tool and re.search(pattern, tool):
             return label, tool
     return None
+
+
+def user_only(command):
+    """The label when a command is irreversible in a way only the user may approve, whatever a reviewer says."""
+    hit = irreversible("Bash", {"command": command or ""})
+    return hit[0] if hit and hit[0] in config()["user_only"] else None
 
 
 def about_usage_limit(*texts):

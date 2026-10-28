@@ -148,6 +148,14 @@ def on_prompt(event):
         if policy.is_system_prompt(prompt):
             return PASS
         waiting = run.gates("open", "asked")
+        if waiting and policy.skill_command(prompt, event.cwd):
+            ids = ", ".join(g["id"] for g in waiting)
+            return "context", (f"This message runs a command and does not answer gate(s) {ids}; they still wait for the user. "
+                               "Do what the command asks, then ask the gate's question again.")
+        if waiting and policy.asks_back(prompt):
+            ids = ", ".join(g["id"] for g in waiting)
+            return "context", (f"This message asks something back and does not answer gate(s) {ids}; they still wait for the user. "
+                               "Answer it, then ask the gate's question again.")
         if waiting:
             answer_gates(run, waiting, prompt)
             ids = ", ".join(g["id"] for g in waiting)
@@ -210,9 +218,9 @@ def on_pre_tool(event, run, role):
     if hit:
         label = hit[0]
         return "deny", (
-            f"Autonomous mode blocks irreversible actions until the user approves them. This looks like {label}. "
+            f"Autonomous mode blocks irreversible actions until the reviewer or the user approves them. This looks like {label}. "
             f"If it is needed, escalate it with --kind irreversible and --command set to exactly the text below; "
-            f"once the user approves, the identical call goes through.\n   {ask_usage(run.id)} --command {shlex.quote(subject)}"
+            f"once it is approved, the identical call goes through.\n   {ask_usage(run.id)} --command {shlex.quote(subject)}"
         )
     return PASS
 

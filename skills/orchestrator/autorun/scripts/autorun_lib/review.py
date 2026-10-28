@@ -41,6 +41,26 @@ It is done only when the request itself is fulfilled. Not done: placeholders suc
 
 Reply with only a JSON object: {{"verdict": "done" or "not_done" or "needs_user", "reason": "<one sentence naming the gap, if any>", "question": "<for needs_user: the question to ask the user>"}}"""
 
+IRREVERSIBLE_PROMPT = """You review one irreversible action in an autonomous agent run, on the user's behalf. The user stepped away and told the agent to finish without them. They asked that a stronger model settle these approvals instead of them, because they would only answer yes to a well-founded, bounded action, and that every other irreversible action still waits for them.
+
+Run goal (the user's request): {goal}
+Done condition: {done}
+Action: {question}
+Exact command, if any: {command}
+Agent's reasoning: {why}
+Earlier decisions in this run:
+{decisions}
+
+Approve only when the action clearly belongs to one of these classes and the agent's reasoning names the concrete evidence for it:
+1. Read-only access to any system, production included, where the agent states how read-only is enforced (a read-only session setting read back, a read-only role, SELECT-only statements). No writes, no schema changes.
+2. Deleting or overwriting resources this run itself created (throwaway test databases, temporary files, worktrees, branches it pushed), named exactly, with how the agent knows the run created them.
+3. Changes to the user's own personal repositories, dotfiles, or tooling (not a company or shared repository), local and recoverable through version control, that the request asks for or that fix tooling blocking the run.
+4. Rewriting or force-pushing a branch this run created and pushed, with --force-with-lease, to carry a change the user asked for.
+
+Escalate everything else: writes or deletes on production or on shared data the run did not create, deploys, publishing, merging, messages or notifications to people, payments, secrets leaving the machine, changes to a shared default branch, and any case where the evidence for a class is missing, vague, or contradicted by earlier decisions.
+
+Reply with only a JSON object: {{"verdict": "approve" or "escalate", "class": "<1-4, or none>", "reason": "<one sentence>"}}"""
+
 PERMISSION_PROMPT = """You review one blocked action in an autonomous agent run. The user told the agent to work to completion without them. The agent's tool call needs permission. Allow it when it is a normal, recoverable step toward the goal: reading or listing files anywhere, editing or deleting files inside the project, running builds and tests, installing dependencies, local git operations. Leave it to the user when it is irreversible or hard to undo: destroying data the user may want, changing files outside the project, reading or sending secrets and credentials, production systems, or messages to other people.
 
 Run goal (the user's request): {goal}
@@ -133,6 +153,16 @@ def review_question(run, question):
         pick=question.get("pick"), why=question.get("why") or "(none)", kind=question["kind"], confidence=question.get("confidence"),
     )
     return review(prompt, data.get("cwd"), {"decide", "escalate"})
+
+
+def review_irreversible(run, question):
+    data = run.data()
+    decisions = "\n".join(f"- {d.get('question')} -> {d.get('pick')} ({d.get('basis')})" for d in run.decisions()[-10:]) or "(none)"
+    prompt = IRREVERSIBLE_PROMPT.format(
+        goal=data.get("prompt") or "(unknown)", done=data.get("done") or "(not set)", decisions=decisions,
+        question=question["question"], command=question.get("command") or "(none)", why=question.get("why") or "(none)",
+    )
+    return review(prompt, data.get("cwd"), {"approve", "escalate"})
 
 
 def review_permission(run, tool, tool_input):

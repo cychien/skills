@@ -198,6 +198,18 @@ def cmd_ask(args):
         if backlog:
             defer(run, question, backlog)
             return
+    if args.kind == "irreversible" and policy.config().get("review_irreversible") and not policy.user_only(args.command):
+        verdict = review.review_irreversible(run, question)
+        if verdict and verdict["verdict"] == "approve" and str(verdict.get("class")) in BOUNDED_CLASSES:
+            run.record_decision({**question, "basis": f"reviewer {verdict['model']} approved, class {verdict.get('class')}: {verdict.get('reason')}"})
+            if args.command:
+                run.add_approval(args.command)
+            then = "run the exact --command now; it goes through once." if args.command else "proceed with it."
+            print(f"APPROVED by independent review ({verdict['model']}): {then}\n"
+                  f"Reviewer: {verdict.get('reason')}\n{LOGGED.format(path=run.decisions_path)}")
+            return
+        if verdict:
+            question["review"] = {"model": verdict["model"], "reason": verdict.get("reason")}
     escalate(run, question)
 
 
@@ -221,6 +233,7 @@ def defer(run, question, backlog):
 
 
 DEFERRED_SECTION = "## Deferred by autonomous runs"
+BOUNDED_CLASSES = {"1", "2", "3", "4"}
 
 
 LOGGED = "Recorded in {path}. List it in your final report; do not stop for it."
